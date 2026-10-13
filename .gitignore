@@ -1,0 +1,30 @@
+# Local operational data; publish only the private directory's README.
+private/
+!/private/
+/private/*
+!/private/README.md
+
+# FHEM configuration, state and key store (including backups).
+fhem.cfg
+fhem.cfg.*
+fhem.save
+fhem.save.*
+uniqueID
+uniqueID.*
+
+# Logs and operator reports, including the previous report location.
+*.log
+*.log.*
+geopresence-test-*.json
+
+# Local environment files and private key/certificate containers.
+.env
+.env.*
+*.key
+*.pem
+*.p12
+*.pfx
+
+# Python bytecode.
+__pycache__/
+*.py[cod]
