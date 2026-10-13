@@ -743,7 +743,7 @@ Ein geordnetes Beenden von FHEM schreibt dessen Zustandsdatei. GeoPresence ruft 
 | Attribut | Standard / Werte | Wirkung |
 |---|---|---|
 | `webhookPath` | `geopresence` | Einfacher Pfadname unter `/fhem/` |
-| `webhookPort` | `8090`; 1024–65535 | Eigener TCP-Listener |
+| `webhookPort` | `8090`; 1024–65535 | Eigener TCP-Listener; ohne Attribut oder nach dessen Löschen gilt der Standard |
 | `webhookBindAddress` | `127.0.0.1` | Konkrete lokale IPv4-Adresse; kein Hostname oder Wildcard |
 | `webhookAllowedPeers` | Loopback, solange nicht anders konfiguriert | 1–16 explizite IPv4-Quelladressen, kommagetrennt |
 | `logFile` | Kein Standard; im Beispiel `./log/geopresence-%Y-%m.log` | Ohne Attribut keine Diagnosedatei; Platzhalter `%Y`, `%m`, `%d`, `%H`, `%M` |

@@ -78,7 +78,7 @@ Die Funktion eines vorhandenen Ortes lässt sich mit `modify Geo.PERSON.ORT loca
 
 ### 3.1 Transport und Authentifizierung
 
-Ein eigener, nicht blockierender IPv4-HTTP-Listener verarbeitet genau `POST /fhem/<webhookPath>`. Der Standardport ist 8090, die Standardadresse `127.0.0.1`, der Standardpfad `geopresence`. Der Eingang ist unabhängig vom FHEMWEB-Befehlsparser. Er ist keine allgemeine FHEM-Schnittstelle.
+Ein eigener, nicht blockierender IPv4-HTTP-Listener verarbeitet genau `POST /fhem/<webhookPath>`. Der Standardport ist 8090, die Standardadresse `127.0.0.1`, der Standardpfad `geopresence`. Ohne das Attribut `webhookPort` oder nach dessen Löschen gilt Port 8090; ein gesetzter ungültiger Wert wird abgewiesen. Der Eingang ist unabhängig vom FHEMWEB-Befehlsparser. Er ist keine allgemeine FHEM-Schnittstelle.
 
 Für einen entfernten Reverse-Proxy werden eine konkrete lokale `webhookBindAddress` und explizite `webhookAllowedPeers` konfiguriert. Der tatsächliche TCP-Absender wird geprüft; weitergereichte IP-Header erteilen keine Rechte. HTTPS wird am Proxy terminiert. Die [nginx-Vorlage](GeoPresence_nginx.conf) leitet nur den exakten Pfad an den eigenen Listener und weist Unterpfade ab.
 

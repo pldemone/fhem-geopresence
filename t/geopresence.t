@@ -90,6 +90,7 @@ sub attribute {
 }
 sub mode { my ($name,$value)=@_; my $error=GeoPresence_Set($defs{$name},$name,'mode',$value); die $error if defined $error; return; }
 sub fixture {
+    my %options=@_;
     %defs=();%attr=();%data=();%keys=();@commands=();@messages=();@reading_events=();@timers=();$on_command=undef;
     $on_log=undef; $on_message=undef; $unicodeEncoding=1;
     $reading_calls=0;
@@ -100,7 +101,7 @@ sub fixture {
     for my $n (1..3) {device("p$n",'PRESENCE');$defs{"p$n"}{INTERVAL_NORMAL}=60;}
     device('door','dummy');device('contact','dummy');device('feedback','DOIF');
     device('garage','dummy');device('gate','dummy');device('upper','dummy');device('lower','dummy');
-    my $c=gp_define('GP','controller'); $attr{GP}={webhookPort=>8090}; GP_StoreMode($defs{GP},'debug');
+    my $c=gp_define('GP','controller'); $attr{GP}=$options{omit_webhook_port} ? {}:{webhookPort=>8090}; GP_StoreMode($defs{GP},'debug');
     gp_define('Geo.Test','resident GP rr_Test');
     $attr{'Geo.Test'}={deviceId=>'DEVICE',webhookUser=>'user',sourceMode=>'geofency_phone',phoneProxies=>'p1,p2,p3',phoneSignalMode=>'measurement',allowDoor=>1,allowGarage=>1}; GP_StoreMode($defs{'Geo.Test'},'active');
     $keys{'GeoPresence_Geo.Test_auth'}='a'x32 . ':'.Digest::SHA::sha256_hex('a'x32 . ':'.'password123456789012345678');
@@ -442,6 +443,34 @@ subtest 'helper waypoint confirms departure without opening' => sub {
     ok($s->{trip}{armed},'helper outside approach arms');is($s->{trip}{scope},'local','helper inside outer stays local');
     is(scalar @{$s->{intents}},0,'helper never opens');advance(90);arrive($s,$cfg);
     is(scalar @{$s->{intents}},1,'door only for local helper');
+};
+
+subtest 'webhook port defaults on initial setup and attribute removal without hiding invalid values' => sub {
+    my ($c)=fixture(omit_webhook_port=>1);
+    ok(!exists $attr{GP}{webhookPort},'initial controller has no explicit port');
+    is(GP_HTTPConfigError($c),undef,'absent port is a valid transport configuration');
+    is($c->{helper}{gp_http}{port},8090,'initial listener uses documented default port');
+    ok($c->{helper}{gp}{ready},'default transport allows resident processing');
+    is_deeply([GP_Validate($c)],[],'otherwise complete configuration validates without a port attribute');
+
+    mode('GP','debug');
+    attribute('GP','webhookPort','8091');GeoPresence_Timer($c);
+    is($c->{helper}{gp_http}{port},8091,'explicit port overrides default');
+    is(GeoPresence_Attr('del','GP','webhookPort',undef),undef,'port attribute can be deleted');
+    delete $attr{GP}{webhookPort};GeoPresence_Timer($c);
+    is($c->{helper}{gp_http}{port},8090,'attribute removal rebinds listener to default port');
+    ok($c->{helper}{gp}{ready},'controller remains ready after restoring the default');
+
+    for my $port ('','0','1023','65536','8090.5','invalid') {
+        local $attr{GP}{webhookPort}=$port;
+        like(GP_HTTPConfigError($c),qr/webhookPort must be an integer from 1024 to 65535/,
+            "explicit invalid port '$port' is rejected rather than defaulted");
+        like(GP_EnsureHTTP($c),qr/webhookPort must be an integer from 1024 to 65535/,
+            "listener setup rejects explicit invalid port '$port'");
+        ok(!$c->{helper}{gp_http},'invalid explicit configuration closes listener');
+    }
+    is(GP_EnsureHTTP($c),undef,'missing attribute restores valid transport after an invalid value');
+    is($c->{helper}{gp_http}{port},8090,'listener recovers on default port');
 };
 
 subtest 'remote proxy binding requires explicit valid IPv4 peers and preserves local defaults' => sub {

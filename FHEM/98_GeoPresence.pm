@@ -19,6 +19,7 @@ our (%FW_webArgs, $FW_ME, $FW_subdir);
 
 # Only controller devices own runtime state. Readings are ordinary FHEM snapshots,
 # never an executable queue. Only qualified unfinished trips may resume.
+my $GP_DEFAULT_WEBHOOK_PORT = 8090;
 my %GP_DEFAULT = (
     action_max_age => 90, future_tolerance => 30, reorder_window => 2,
     departure_grace => 60, minimum_away => 60, phone_absence_window => 180,
@@ -1971,7 +1972,7 @@ sub GP_TickState {
 
 sub GP_HTTPConfigError {
     my ($c)=@_;
-    my $port=GP_Attr($c->{NAME},'webhookPort','');
+    my $port=GP_Attr($c->{NAME},'webhookPort',$GP_DEFAULT_WEBHOOK_PORT);
     return 'webhookPort must be an integer from 1024 to 65535'
         unless $port =~ /\A[0-9]{4,5}\z/ && $port>=1024 && $port<=65535;
     return 'webhookPath must be a simple path component'
@@ -2028,7 +2029,7 @@ sub GP_OpenHTTP {
 sub GP_EnsureHTTP {
     my ($c)=@_;
     if (my $error=GP_HTTPConfigError($c)) { GP_StopHTTP($c); return $error; }
-    my $port=GP_Attr($c->{NAME},'webhookPort','');
+    my $port=GP_Attr($c->{NAME},'webhookPort',$GP_DEFAULT_WEBHOOK_PORT);
     my $http=$c->{helper}{gp_http};
     GP_StopHTTP($c) if $http && ($http->{port} != $port
         || ($http->{address}//'') ne GP_Attr($c->{NAME},'webhookBindAddress','127.0.0.1')
@@ -4050,8 +4051,8 @@ get Geo.PERSON explain debug</pre>
     </li>
     <li><a id="GeoPresence-attr-webhookPort"></a><b>webhookPort</b>
       <p><b>Applies to:</b> Controller<br>
-      <b>Requirement:</b> Required; no default</p>
-      <p>Integer 1024&ndash;65535 for the module's own HTTP listener, separate from FHEMWEB. Forward the two webhook paths from your HTTPS proxy to this port.</p>
+      <b>Default:</b> <code>8090</code></p>
+      <p>Integer 1024&ndash;65535 for the module's own HTTP listener, separate from FHEMWEB. Omitting or deleting the attribute uses port 8090. Forward the exact webhook path from your HTTPS proxy to this port.</p>
       <p><b>Example:</b></p>
       <pre style="white-space: pre-wrap; overflow-wrap: anywhere;">attr System.GeoPresence webhookPort 8090</pre>
     </li>
