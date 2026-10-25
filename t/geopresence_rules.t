@@ -44,6 +44,7 @@ sub def {
     return $d;
 }
 sub advance { $now+=$_[0]; $mono+=$_[0]; }
+sub config_event { GeoPresence_Notify($defs{GP},{NAME=>'global',CHANGED=>[@_]}); }
 sub fixture {
     my ($profile)=@_;
     %defs=(); %attr=(); %data=(); %keys=(); @commands=(); @messages=();
@@ -147,6 +148,7 @@ subtest 'set choices follow resident source profiles and current definitions' =>
     $defs{'Geo.Phone'}={NAME=>'Geo.Phone',TYPE=>'GeoPresence',SUBTYPE=>'resident',CONTROLLER=>'GP'};
     $attr{'Geo.Phone'}={sourceMode=>'phone_only'};
     $defs{'Geo.Other'}={NAME=>'Geo.Other',TYPE=>'GeoPresence',SUBTYPE=>'resident',CONTROLLER=>'Other'};
+    config_event('DEFINED Geo.Phone');
     my $choices=GeoPresence_Set($c,'GP','?');
     like($choices,qr/applyGeometry:select,,Geo.Test(?: |$)/,'learning lists only Geofency residents');
     like($choices,qr/debugPhone:select,,Geo.Phone#present,Geo.Phone#absent(?: |$)/,'phone controls list only phone residents');
@@ -155,6 +157,7 @@ subtest 'set choices follow resident source profiles and current definitions' =>
     like(GeoPresence_Set($defs{'Geo.Phone'},'Geo.Phone','?'),qr/choose one of mode:active,debug,disabled$/,'phone-only resident exposes no password command');
     like(GeoPresence_Set($defs{'Z.Home'},'Z.Home','?'),qr/choose one of $/,'locations expose no set commands');
     delete $defs{'Geo.Test'};
+    config_event('DELETED Geo.Test');
     like(GeoPresence_Set($c,'GP','?'),qr/applyGeometry:textField(?: |$)/,'empty resident selection is still a valid command widget');
     unlike(GeoPresence_Set($c,'GP','?'),qr/Geo.Test/,'deleted resident immediately disappears');
 };
@@ -170,6 +173,7 @@ subtest 'generic schema, selectors and safe in-place location changes' => sub {
     like($defs{'R.Route'}{'.AttrList'},qr/afterExit:.*group:Employment/,'prior exit offers actual groups');
     for my $residents ('Unknown','Geo.Test,Geo.Test',',,') {
         local $attr{'R.Route'}{residents}=$residents;
+        config_event("ATTR R.Route residents $residents");
         like(join(' ',GP_Validate($c)),qr/(?:unknown resident|duplicate resident|residents required)/,
             'invalid selection is caught even when no configured resident matches');
     }
@@ -209,14 +213,17 @@ subtest 'same-time, missing and revoked history cannot satisfy afterExit' => sub
 
 subtest 'individual exit is bounded to this resident and trip' => sub {
     my ($c,$cfg,$s)=rules_fixture();
-    $attr{'R.Route'}{afterExit}='location:Z.Work'; $cfg=GP_Config($c,'Geo.Test',1);
+    $attr{'R.Route'}{afterExit}='location:Z.Work';
+    config_event('ATTR R.Route afterExit location:Z.Work'); $cfg=GP_Config($c,'Geo.Test',1);
     event($s,$cfg,'Work',0);advance(61);event($s,$cfg,'Helper',0);
     is_deeply(plans($s),['R.Route'],'individual exit matches');
     advance(1);event($s,$cfg,'Home',1,'walking');finish($s,$cfg);
     advance(1);event($s,$cfg,'Helper',0);is_deeply(plans($s),[],'completed trip cannot be reused');
     $attr{'R.Route'}{afterExit}='location:missing';
+    config_event('ATTR R.Route afterExit location:missing');
     like(join(' ',GP_Validate($c)),qr/invalid afterExit/,'unknown location reference invalid');
     $attr{'R.Route'}{afterExit}='group:Missing';
+    config_event('ATTR R.Route afterExit group:Missing');
     like(join(' ',GP_Validate($c)),qr/invalid afterExit/,'unknown group reference invalid');
 };
 
@@ -236,6 +243,7 @@ subtest 'vehicle filter is shared by light and notification, with confirmed arri
             my ($c,$cfg,$s)=rules_fixture();
             $cfg->{rules}=[{name=>'Vehicle',trigger=>'arrival',arrivalFilter=>'vehicle',afterExit=>'group:Employment',
                 locations=>[],group=>'',cooldown=>0,type=>$kind,action=>'Generic',params=>{target=>'lamp',command=>'on',message=>'arrival'}}];
+            $cfg->{rule_index}={arrival=>{arrival=>$cfg->{rules}}};
             event($s,$cfg,'Work',0);advance(61);event($s,$cfg,'Home',1,$motion);
             is_deeply(plans($s),[],'no output before confirmation');finish($s,$cfg);
             is_deeply(plans($s),$motion eq 'walking'?[]:['Vehicle'],"$kind uses generic vehicle filter for $motion");
@@ -257,6 +265,7 @@ subtest 'later reentry in the same batch cancels a pending route action' => sub 
 subtest 'Home repetitions preserve group membership, new trips do not reuse distant membership' => sub {
     my ($c,$cfg,$s)=rules_fixture();
     $cfg->{rules}=[{name=>'House',trigger=>'enter',group=>'House',locations=>[],cooldown=>0,action=>'HouseMessage',type=>'notify',params=>{message=>'home'}}];
+    $cfg->{rule_index}={enter=>{'group:House'=>$cfg->{rules}}};
     event($s,$cfg,'Home',1);is_deeply(plans($s),['House'],'first Home entry');
     advance(1);event($s,$cfg,'Home',1);is_deeply(plans($s),[],'duplicate Home remains same group visit');
     advance(1);event($s,$cfg,'Work',1);advance(61);event($s,$cfg,'Home',1);finish($s,$cfg);
@@ -291,6 +300,7 @@ subtest 'shared groups never share residents, and prior exit references are vali
     GP_Process($second,$second_cfg,{kind=>'geo',zone=>'S.Helper',entry=>0,motion=>'unknown',time=>$now,received=>$now},$now,$mono);
     is_deeply(plans($second),['R.Route'],'second resident own exit authorizes their route');
     $attr{'R.Route'}{afterExit}='location:Z.Work';
+    config_event('ATTR R.Route afterExit location:Z.Work');
     like(join(' ',GP_Validate($c)),qr/invalid afterExit for Geo.Second/,'a concrete foreign resident reference is rejected');
 };
 
@@ -298,6 +308,7 @@ subtest 'reentry after arrival confirmation still revokes a queued prerequisite'
     my ($c,$cfg,$s)=rules_fixture();
     $cfg->{rules}=[{name=>'Arrive',trigger=>'arrival',afterExit=>'location:Z.Near',arrivalFilter=>'any',
         locations=>[],group=>'',cooldown=>0,type=>'switch_on',action=>'A.Light',params=>{target=>'lamp',command=>'on'}}];
+    $cfg->{rule_index}={arrival=>{arrival=>$cfg->{rules}}};
     event($s,$cfg,'Outer',0);advance(61);event($s,$cfg,'Near',0);
     advance(1);event($s,$cfg,'Home',1,'walking');finish($s,$cfg);
     my @pending=@{$s->{intents}};is_deeply(plans($s),['Arrive'],'qualified arrival retains the action for dispatch');
@@ -327,6 +338,7 @@ subtest 'missing place geometry is reported without blocking a configured Home' 
     my ($c)=fixture('geofency_phone');
     delete $defs{$_}{READINGS}{gp_geometry} for qw(Z.Work Z.Helper);
     delete $c->{helper}{gp}{geometry};
+    GP_InvalidateConfig($c,'Geo.Test'); # Fixture directly removed both geometry stores.
     my $cfg=GP_Config($c,'Geo.Test',1);
     ok($cfg->{geometry_ready},'Home and outer geometry still satisfy the opening geometry contract');
     my ($validation)=GP_GetData($c,'GP','validate','Geo.Test');
@@ -402,6 +414,7 @@ subtest 'retaining geometry cannot clear conflicts or reuse synthetic clock time
     my ($c,$cfg,$s)=fixture();
     my $rt=$c->{helper}{gp};
     $rt->{geometry}{debug}{'Geo.Test'}{'Z.Work'}{blocked}=1;
+    GP_InvalidateConfig($c,'Geo.Test',1); # Fixture directly injected a conflict.
     like(GeoPresence_Set($c,'GP','debugReset','Geo.Test','keepGeometry'),qr/geometry retained/,'retain conflicted metadata too');
     ok(!GP_Config($c,'Geo.Test',1)->{geometry_ready},'reset cannot remove a geometry conflict');
     my $state=GP_State($c,'Geo.Test',1);

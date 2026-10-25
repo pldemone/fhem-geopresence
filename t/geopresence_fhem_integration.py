@@ -749,11 +749,40 @@ def run(source, encoding="bytestream", help_only=False):
             check(command("attr GP verbose 5") == "", "idle timer also measured with full diagnostics")
             command("{ GeoPresence_Timer($defs{GP}) for 1..20;; return 'ticked' }")
             stats = json.loads(command("get GP timerStats format=json"))
-            check(stats["runs"] >= 20 and stats["last_device_scans"] == 1
-                  and stats["last_config_builds"] == 1, "one catalogue scan and configuration per idle callback")
+            check(stats["runs"] >= 20 and stats["last_device_scans"] == 0
+                  and stats["last_config_builds"] == 0, "idle callbacks reuse catalogue and configuration")
             check(0 <= stats["last_ms"] <= stats["max_ms"] and 0 <= stats["mean_ms"] <= stats["max_ms"],
                   "timer statistics contain consistent measured millisecond durations")
             check(command("{ $main::GP_fixture_user_readings }") == "0", "idle statistics create no debug Reading callbacks")
+            revision = command("{ return GP_ResumeRevision($defs{GP},'Geo.Test',GP_Config($defs{GP},'Geo.Test',1)) }")
+            check(command("attr A.Door room Config.Cache") == "", "cosmetic action attribute accepted")
+            check(command("attr rr_Test alias Cache Probe") == "", "dependent alias changed through FHEM")
+            check(command("{ return GP_Config($defs{GP},'Geo.Test',1)->{label} }") == "Cache Probe",
+                  "global ATTR event refreshes the committed dependent label")
+            command("deleteattr rr_Test alias")
+            check(command("{ return GP_ResumeRevision($defs{GP},'Geo.Test',GP_Config($defs{GP},'Geo.Test',1)) }") == revision,
+                  "fresh configuration preserves checkpoint binding after a room change")
+            params = json.loads(command(
+                "{ my($rule)=grep { $_->{action} eq 'A.Door' } @{GP_Config($defs{GP},'Geo.Test',1)->{rules}};; "
+                "return JSON::PP->new->encode($rule->{params}) }"))
+            check(params["target"] == "door" and "room" not in params and "message" not in params,
+                  "action parameters exclude cosmetic and obsolete fields")
+            modified = json.loads(command(
+                "{ no warnings 'redefine';; my($lists,$inventories)=(0,0);; "
+                "my $list=\\&GP_UpdateAttrLists;; my $inventory=\\&GP_Inventory;; my $error;; "
+                "{ local *GP_UpdateAttrLists=sub { $lists++;; return $list->(@_) };; "
+                "local *GP_Inventory=sub { $inventories++;; return $inventory->(@_) };; "
+                " $error=CommandModify(undef,'Idle.Unrelated.0') };; "
+                "return JSON::PP->new->encode({lists=>$lists,inventories=>$inventories,error=>$error//''}) }"))
+            check(modified == {"lists": 0, "inventories": 0, "error": ""},
+                  "real unrelated modify performs no GeoPresence inventory or widget work")
+            check(command(
+                "{ my $prepared=$defs{GP}{helper}{gp_config};; my $kept=1;; "
+                "for my $key ('debugLog','logFile') { my $old=$attr{GP}{$key};; "
+                "CommandDeleteAttr(undef,'GP '.$key);; $kept&&=($defs{GP}{helper}{gp_config}//0)==$prepared;; "
+                "CommandAttr(undef,'GP '.$key.' '.$old) if defined $old;; "
+                "$kept&&=($defs{GP}{helper}{gp_config}//0)==$prepared };; return $kept }") == "1",
+                  "real deletion and restoration of diagnostic attributes preserve the prepared catalogue")
             # Advancing the controlled module clock within validation models a
             # slow callback without blocking the actual FHEM event loop.
             scheduled = json.loads(command(
@@ -1893,6 +1922,15 @@ def run(source, encoding="bytestream", help_only=False):
                 check(command(f"{{ ReadingsVal('Geo.{suffix}','mode','missing') }}") == "disabled",
                       "a newly defined resident has an explicit disabled mode")
             check(command("set Geo.Debug mode debug") == "", "prepare saved debug resident")
+            check(command("set GP mode debug") == "", "prepare timing persistence regression")
+            administrative_builds = command(
+                "{ no warnings 'redefine';; my $calls=0;; my $original=\\&GP_Catalog;; "
+                "GP_InvalidateConfig($defs{GP});; "
+                "{ local *GP_Catalog=sub { $calls++;; return $original->(@_) };; "
+                "CommandAttr(undef,'GP reorder_window 1');; CommandAttr(undef,'GP action_max_age 2') };; "
+                "return $calls }")
+            check(administrative_builds == "0", "real cold AttrFn callbacks do not compile discarded catalogues")
+            check(command("set GP mode active") == "", "reactivate with a valid short timing pair")
             # Earlier tests advance GP_Now into the future. Future-dated mode
             # readings mask defaults written by Define when fhem.save is loaded:
             # FHEM restores a reading only if its saved timestamp is newer.
@@ -1908,6 +1946,9 @@ def run(source, encoding="bytestream", help_only=False):
             check(command("save").startswith("Wrote configuration"), "save mode readings with ordinary FHEM mechanism")
             saved_config = (root / "test.cfg").read_text()
             saved_state = (root / "log/fhem.save").read_text()
+            check("attr GP action_max_age 2" in saved_config and "attr GP reorder_window 1" in saved_config
+                  and saved_config.index("attr GP action_max_age 2") < saved_config.index("attr GP reorder_window 1"),
+                  "FHEM saves the valid pair in the formerly failing alphabetical order")
             check(not re.search(r"^attr (?:GP|Geo\.\S+) (?:operatingMode|mode) ", saved_config, re.M), "configuration contains no mode attributes")
             check(all(re.search(r"^setstate " + re.escape(name) + r" \S+ \S+ mode " + mode + r"$", saved_state, re.M)
                       for name, mode in saved_modes.items()),
@@ -1928,6 +1969,9 @@ def run(source, encoding="bytestream", help_only=False):
                 time.sleep(.1)
             else:
                 raise AssertionError("Private FHEM failed to restart")
+            check(command("{ AttrVal('GP','action_max_age',0) }") == "2"
+                  and command("{ AttrVal('GP','reorder_window',0) }") == "1",
+                  "real restart preserves both saved timing values instead of replacing age by 90")
             check(command("{ ReadingsVal('GP','mode','') }") == "active", "restart restores active controller")
             check(command("{ ReadingsVal('Geo.PERSON','mode','') }") == "active", "restart restores active resident")
             check(command("{ ReadingsVal('Geo.Test','mode','') }") == "disabled", "restart never resumes transient learning")
@@ -1950,6 +1994,9 @@ def run(source, encoding="bytestream", help_only=False):
             check(command("set GP mode debug") == "", "prepare controller debug precedence for rereadcfg")
             command("{ $defs{GP}{READINGS}{mode}{TIME}='" + saved_mode_time + "';; return 'dated' }")
             check(command("rereadcfg") == "", "reload saved configuration through the real core")
+            check(command("{ AttrVal('GP','action_max_age',0) }") == "2"
+                  and command("{ AttrVal('GP','reorder_window',0) }") == "1",
+                  "real rereadcfg preserves the complete valid timing pair")
             check(command("{ ReadingsVal('GP','mode','') }") == "debug", "rereadcfg restores debug controller")
             check(command("{ ReadingsVal('Geo.PERSON','mode','') }") == "active", "rereadcfg retains personal active request")
             check_resident_status(command, http_request, admin_port, check, "Geo.PERSON", "debug")
@@ -1961,6 +2008,8 @@ def run(source, encoding="bytestream", help_only=False):
                     restored = json.loads(command(f"get GP explain {name} {view} format=json"))
                     check(not restored["state"].get("trip") and not restored["state"].get("arrival")
                           and not restored["state"].get("intents"), "mode restoration creates no opening plan")
+            check(command("deleteattr GP action_max_age") == "", "restore default age for recovery scenarios")
+            check(command("deleteattr GP reorder_window") == "", "restore default reorder window for recovery scenarios")
             # Real state-file recovery: use past observations before the first
             # shutdown, then reboot the Perl process without preserving clocks.
             # Every output device in this scenario is a newly defined dummy.

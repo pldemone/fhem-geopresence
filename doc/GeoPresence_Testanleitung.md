@@ -1,6 +1,6 @@
 # GeoPresence – Testanleitung
 
-**Version 4.11 · Stand 13.10.2026 · Handbuch 2.15 · Architektur 0.53**
+**Version 4.12 · Stand 25.10.2026 · Handbuch 2.16 · Architektur 0.54**
 
 Diese Anleitung beschreibt die Prüfung einer eingerichteten GeoPresence-Anlage. Die Testanwendung simuliert Alltagswege und prüft deren neue Diagnosezeilen; gezielte App-Tests prüfen eigene Orts- und Gruppenregeln. Einrichtung, Begriffe und Parameter stehen im [Handbuch](GeoPresence_Handbuch.md).
 

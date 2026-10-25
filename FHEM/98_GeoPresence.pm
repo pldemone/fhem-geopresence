@@ -164,6 +164,7 @@ sub GeoPresence_Initialize {
     # FHEM calls Initialize on reload; old callbacks may still be queued.
     for my $d (values %defs) {
         next unless ($d->{TYPE} // '') eq 'GeoPresence' && ($d->{SUBTYPE} // '') eq 'controller';
+        GP_InvalidateDevices($d);
         GP_ResetController($d,'resume');
     }
 }
@@ -416,23 +417,155 @@ sub GP_Controller {
 }
 sub GP_Residents {
     my ($c) = @_;
-    return grep { ($defs{$_}{SUBTYPE} // '') eq 'resident' } GP_DeviceNames($c);
+    return @{$c ? GP_Inventory($c)->{residents} : []};
 }
 
 sub GP_DeviceNames {
     my ($c)=@_;
-    # The catalogue is local to one timer callback, never retained between ticks.
-    # External device/attribute changes must remain visible on the next check.
-    my $work=$c->{helper}{gp_work};
-    if ($work && ($work->{runtime}//0)!=($c->{helper}{gp}//0)) {
-        delete $work->{devices};
-        $work->{runtime}=$c->{helper}{gp};
+    return @{$c ? GP_Inventory($c)->{devices} : []};
+}
+
+# Membership is independent of attributes. Administrative callers must not
+# compile adapters, rules or validation just to enumerate residents.
+sub GP_Inventory {
+    my ($c)=@_;
+    return $c->{helper}{gp_devices} if $c->{helper}{gp_devices};
+    my $inventory={devices=>[],residents=>[],members=>{},kinds=>{}};
+    for my $name (sort keys %defs) {
+        my $d=$defs{$name};
+        next unless ($d->{TYPE}//'') eq 'GeoPresence' && ($d->{CONTROLLER}//'') eq $c->{NAME};
+        push @{$inventory->{devices}},$name;
+        $inventory->{members}{$name}=1;
+        push @{$inventory->{kinds}{$d->{SUBTYPE}//''}},$name;
     }
-    return @{$work->{devices}} if $work && $work->{devices};
-    my @names=sort grep { ($defs{$_}{TYPE}//'') eq 'GeoPresence'
-        && ($defs{$_}{CONTROLLER}//'') eq $c->{NAME} } keys %defs;
-    if ($work) { $work->{devices}=\@names; $work->{device_scans}++; }
-    return @names;
+    $c->{helper}{gp_work}{device_scans}++ if $c->{helper}{gp_work};
+    $inventory->{residents}=$inventory->{kinds}{resident}//[];
+    return $c->{helper}{gp_devices}=$inventory;
+}
+
+# This index is needed before an edit is committed to protect affected active
+# residents. It contains references only, never executable adapter parameters.
+sub GP_Dependencies {
+    my ($c)=@_;
+    my $inventory=GP_Inventory($c);
+    return $inventory->{dependencies} if $inventory->{dependencies};
+    my $index={dependents=>{},target_residents=>{}};
+    for my $r (@{$inventory->{residents}}) {
+        my $rr=$defs{$r}{ROOMMATE}//'';
+        $index->{dependents}{$_}{$r}=1 for ($r,$rr,GP_List(GP_Attr($r,'phoneProxies','')));
+        (my $suffix=$rr)=~s/^rr_//;
+        $index->{dependents}{$_}{$r}=1 for ("People.Loc.$suffix","People.handler.$suffix.enter");
+    }
+    for my $n (@{$inventory->{kinds}{location}//[]}) {
+        $index->{dependents}{$n}{$defs{$n}{PARENT}}=1;
+    }
+    my %references;
+    for my $n (@{$inventory->{kinds}{action}//[]}) {
+        my $type=$defs{$n}{ACTIONTYPE}//'';
+        $references{$n}={map {$_=>GP_Attr($n,$_,'')} grep {
+            /\A(?:target|contact|feedbackDevice|stateDevice|upperContact|lowerContact)\z/
+        } @{$GP_ACTION_ATTRS{$type}//[]}};
+    }
+    for my $n (@{$inventory->{kinds}{rule}//[]}) {
+        my $a=GP_Attr($n,'action','');
+        my $refs=$references{$a}//{};
+        my @names=($n,$a,GP_List(GP_Attr($n,'locations','')),grep {length} values %$refs);
+        push @names,$1 if GP_Attr($n,'afterExit','') =~ /\Alocation:(.+)\z/;
+        # Disabled rules still participate in administrative dependency guards.
+        for my $r (GP_List(GP_Attr($n,'residents',''))) {
+            $index->{dependents}{$_}{$r}=1 for @names;
+            $index->{target_residents}{$refs->{target}}{$r}=1 if length($refs->{target}//'');
+        }
+    }
+    for my $a (keys %references) {
+        my $res=$index->{target_residents}{$references{$a}{target}//''}//{};
+        $index->{dependents}{$a}{$_}=1 for keys %$res;
+    }
+    return $inventory->{dependencies}=$index;
+}
+
+# Configuration is immutable between configuration changes. Runtime readings,
+# transport availability and geometry observation times do not belong here.
+sub GP_Catalog {
+    my ($c)=@_;
+    return $c->{helper}{gp_config} if $c->{helper}{gp_config};
+    my $inventory=GP_Inventory($c);
+    my $catalog={%{GP_Dependencies($c)},actions=>{},rules=>{},locations=>{},users=>{},common_errors=>[],
+        rule_errors=>{},target_errors=>{},config=>{},views=>{},errors=>{}};
+    my (%devices,%users,%roommates,%signatures);
+    for my $r (@{$inventory->{residents}}) {
+        my $rr=$defs{$r}{ROOMMATE}//'';
+        push @{$catalog->{common_errors}},"Duplicate ROOMMATE for $r" if $roommates{$rr}++;
+        next unless GP_UsesSource(GP_Attr($r,'sourceMode','geofency_phone'),'geo');
+        for my $spec ([deviceId=>\%devices],[webhookUser=>\%users]) {
+            my $v=lc GP_Attr($r,$spec->[0],'');
+            push @{$catalog->{common_errors}},"Duplicate $spec->[0] for $r" if length($v) && $spec->[1]{$v}++;
+        }
+        push @{$catalog->{users}{GP_Attr($r,'webhookUser','')}},$r;
+    }
+    for my $n (@{$inventory->{kinds}{location}//[]}) {
+        my $r=$defs{$n}{PARENT};
+        push @{$catalog->{locations}{$r}},$n;
+    }
+    for my $n (@{$inventory->{kinds}{action}//[]}) {
+        my $type=$defs{$n}{ACTIONTYPE}//'';
+        my $params={map {$_=>$attr{$n}{$_}} grep {exists $attr{$n}{$_}} @{$GP_ACTION_ATTRS{$type}//[]}};
+        my $action=$catalog->{actions}{$n}={name=>$n,type=>$type,params=>$params};
+        $action->{errors}=[GP_ValidateAction($action)];
+        next if $type eq 'notify' || !length($params->{target}//'');
+        my $target=$params->{target};
+        my $signature=$GP_JSON->encode({type=>$type,params=>{%$params,
+            (GP_IsOpening($type) ? (positionSignalMode=>$params->{positionSignalMode}//'state'):())}});
+        $catalog->{target_errors}{$target}="Conflicting action definitions for $target"
+            if exists($signatures{$target}) && $signatures{$target} ne $signature;
+        $signatures{$target}=$signature;
+    }
+    for my $n (@{$inventory->{kinds}{rule}//[]}) {
+        my @res=GP_List(GP_Attr($n,'residents',''));
+        my $a=GP_Attr($n,'action','');
+        my $action=$catalog->{actions}{$a}//{type=>'',params=>{}};
+        next unless GP_Attr($n,'enabled',1);
+        my @errors; my %seen;
+        push @errors,"$n: residents required" unless @res;
+        for my $r (@res) {
+            push @errors,"$n: unknown resident $r" unless GP_Field($r,'TYPE','') eq 'GeoPresence' && GP_Field($r,'SUBTYPE','') eq 'resident'
+                && GP_Field($r,'CONTROLLER','') eq $c->{NAME};
+            push @errors,"$n: duplicate resident $r" if $seen{$r}++;
+        }
+        $catalog->{rule_errors}{$n}=\@errors;
+        my $rule={name=>$n,trigger=>GP_Attr($n,'trigger',''),group=>GP_Attr($n,'locationGroup',''),
+            locations=>[GP_List(GP_Attr($n,'locations',''))],afterExit=>GP_Attr($n,'afterExit',''),
+            arrivalFilter=>GP_Attr($n,'arrivalFilter','any'),cooldown=>0+GP_Attr($n,'cooldown',300),
+            action=>$a,type=>$action->{type},params=>$action->{params}};
+        push @{$catalog->{rules}{$_}},$rule for sort keys %seen;
+    }
+    my $transport_error=GP_HTTPConfigError($c);
+    push @{$catalog->{common_errors}},$transport_error if $transport_error;
+    push @{$catalog->{common_errors}},'reorder_window must be smaller than action_max_age'
+        if GP_Attr($c->{NAME},'reorder_window',$GP_DEFAULT{reorder_window})
+            >=GP_Attr($c->{NAME},'action_max_age',$GP_DEFAULT{action_max_age});
+    push @{$catalog->{common_errors}},"$c->{NAME}: remove obsolete attribute $_; use set mode"
+        for grep {exists $attr{$c->{NAME}}{$_}} qw(mode operatingMode);
+    return $c->{helper}{gp_config}=$catalog;
+}
+
+sub GP_InvalidateConfig {
+    my ($c,$r,$debug)=@_;
+    return unless $c;
+    unless (defined $r) {
+        delete $c->{helper}{gp_config};
+        delete $c->{helper}{gp_devices}{dependencies} if $c->{helper}{gp_devices};
+        return;
+    }
+    my $catalog=$c->{helper}{gp_config} or return;
+    delete $catalog->{views}{$_}{$r} for defined($debug) ? ($debug?'debug':'prod') : qw(prod debug);
+}
+
+sub GP_InvalidateDevices {
+    my ($c)=@_;
+    return unless $c;
+    delete $c->{helper}{gp_devices};
+    GP_InvalidateConfig($c);
 }
 
 sub GP_Mode {
@@ -488,26 +621,17 @@ sub GP_AffectedResidents {
     my $kind=$d->{SUBTYPE}//''; my $name=$d->{NAME};
     return GP_Residents($c) if $kind eq 'controller';
     return ($name) if $kind eq 'resident';
-    my %res;
+    my $index=GP_Dependencies($c);
+    my %res=%{$index->{dependents}{$name}//{}};
     $res{$d->{PARENT}}=1 if $kind eq 'location';
     if ($kind eq 'rule') {
         $res{$_}=1 for GP_List(GP_Attr($name,'residents',''));
         $res{$_}=1 for GP_List($change->{residents}//'');
     }
-    my %actions=($name=>1);
     if ($kind eq 'action') {
-        my %targets=map {$_=>1} grep {length} (GP_Attr($name,'target',''),$change->{target}//'');
-        for my $other (GP_DeviceNames($c)) {
-            $actions{$other}=1 if GP_Field($other,'SUBTYPE','') eq 'action' && $targets{GP_Attr($other,'target','')};
+        for my $target (grep {length} (GP_Attr($name,'target',''),$change->{target}//'')) {
+            $res{$_}=1 for keys %{$index->{target_residents}{$target}//{}};
         }
-    }
-    for my $rule (GP_DeviceNames($c)) {
-        next unless GP_Field($rule,'SUBTYPE','') eq 'rule';
-        my $uses=$kind eq 'action' && $actions{GP_Attr($rule,'action','')};
-        # Deleting a location referenced by a shared rule affects every member.
-        $uses ||= $kind eq 'location' && (grep {$_ eq $name} GP_List(GP_Attr($rule,'locations','')));
-        $uses ||= $kind eq 'location' && GP_Attr($rule,'afterExit','') eq 'location:'.$name;
-        $res{$_}=1 for $uses ? GP_List(GP_Attr($rule,'residents','')) : ();
     }
     return sort grep {GP_Field($_,'SUBTYPE','') eq 'resident' && GP_Field($_,'CONTROLLER','') eq $c->{NAME}} keys %res;
 }
@@ -525,11 +649,16 @@ sub GP_ConfigChangeError {
 sub GP_ConfigChanged {
     my ($c,$d,$change)=@_;
     return unless $c;
+    # INITIALIZED/REREADCFG resets the complete restored session once. Loading
+    # individual lines needs no intermediate dependency or mode rebuilding.
+    unless ($init_done) { GP_InvalidateConfig($c); return; }
     return GP_ResetController($c) if ($d->{SUBTYPE}//'') eq 'controller';
     my @affected=GP_AffectedResidents($c,$d,$change//{});
-    delete $c->{helper}{gp_work}{devices} if $c->{helper}{gp_work};
     GP_ResetResident($c,$_) for @affected;
     GP_UpdateModes($c);
+    # AttrFn has not committed its value yet. Publish the next catalogue only
+    # when a later caller reads the committed definitions and attributes.
+    GP_InvalidateConfig($c);
 }
 
 sub GeoPresence_Define {
@@ -587,9 +716,12 @@ sub GeoPresence_Define {
     GP_StoreMode($hash,'disabled') if $init_done && ($kind eq 'controller' || $kind eq 'resident');
     if ($kind eq 'controller') {
         $hash->{CONTROLLER} = $name;
+        GP_InvalidateDevices($hash);
         GP_ResetController($hash);
     } else {
-        GP_ConfigChanged(GP_Controller($hash),$hash);
+        my $c=GP_Controller($hash);
+        GP_InvalidateDevices($c);
+        GP_ConfigChanged($c,$hash);
     }
     GP_UpdateAttrLists($hash);
     return;
@@ -604,12 +736,11 @@ sub GP_ResetController {
         # Capture a live qualified trip when updating from a version which did
         # not yet publish checkpoints. Never preserve a queued output adapter.
         for my $r (keys %{$previous->{prod}//{}}) {
-            GP_Checkpoint($c,$r,GP_Config($c,$r,0),$previous->{prod}{$r});
+            GP_Checkpoint($c,$r,undef,$previous->{prod}{$r});
         }
     } elsif ($init_done) {
         GP_ClearCheckpoint($_,'Controller configuration changed') for GP_Residents($c);
     }
-    delete $c->{helper}{gp_work}{devices} if $c->{helper}{gp_work};
     GP_StopHTTP($c);
     # A reload must also remove the old FHEMWEB registration. This cannot make
     # that FHEMWEB server safe: the operator must remove it and retarget the proxy.
@@ -634,6 +765,7 @@ sub GP_ResetController {
         ? 'New session; saved qualified trips await validation; pending actions discarded'
         : 'New session; opening permissions revoked'});
     GP_UpdateModes($c);
+    GP_InvalidateConfig($c);
     GP_ScheduleTimer($c,0.1) if defined &InternalTimer;
 }
 
@@ -645,6 +777,7 @@ sub GP_ResetResident {
     delete $rt->{prod}{$r}; delete $rt->{debug}{$r};
     delete $rt->{geometry}{debug}{$r}; delete $rt->{geometry}{prod}{$r};
     delete $rt->{geometry_dirty}{$r};
+    GP_InvalidateConfig($c,$r);
     delete $rt->{learning}{$r} unless $keep eq 'learning';
     delete $rt->{learned}{$r} if !$keep && !($rt->{learned}{$r}//{})->{confirmed};
     GP_StoreMode($defs{$r},'disabled') if $keep ne 'learning' && GP_Mode($r) eq 'learning';
@@ -665,12 +798,14 @@ sub GeoPresence_Undef {
             delete $data{FWEXT}{$path} if ($data{FWEXT}{$path}{GP_OWNER} // '') eq $hash->{NAME};
         }
         delete $hash->{helper}{gp};
+        GP_InvalidateDevices($hash);
         delete $hash->{helper}{gp_timer_due};
     } else {
         my $error=GP_ConfigChangeError($c,$hash); return $error if $error;
         delete $c->{helper}{gp}{learned}{$hash->{NAME}}
             if $c && ($hash->{SUBTYPE}//'') eq 'resident';
         GP_ConfigChanged($c,$hash);
+        GP_InvalidateDevices($c);
     }
     return;
 }
@@ -684,6 +819,7 @@ sub GeoPresence_Delete {
 
 sub GeoPresence_Attr {
     my ($cmd, $name, $key, $value) = @_;
+    $key//=''; # FHEM omits the key when deleteattr removes all attributes.
     my $d = $defs{$name} or return;
     return $cmd eq 'del' ? undef : 'Use set '.$name.' mode active|debug|disabled; mode attributes are not supported'
         if $key eq 'mode' || $key eq 'operatingMode';
@@ -744,6 +880,15 @@ sub GeoPresence_Attr {
         if ($kind eq 'resident' && $key =~ /\A(?:deviceId|webhookUser)\z/) {
             return "$key already belongs to another resident" if grep {$_ ne $name && lc GP_Attr($_,$key,'') eq lc($value)} GP_Residents($c);
         }
+    }
+    if ($init_done && ($key eq 'reorder_window' || $key eq 'action_max_age')) {
+        # Loading applies attributes one at a time, possibly in sorted order.
+        # Validate their relationship only once that complete configuration is
+        # available. Interactive edits still validate the proposed pair here.
+        my $proposed=$cmd eq 'set' ? $value:$GP_DEFAULT{$key};
+        my $window=$key eq 'reorder_window' ? $proposed:GP_Attr($name,'reorder_window',$GP_DEFAULT{reorder_window});
+        my $age=$key eq 'action_max_age' ? $proposed:GP_Attr($name,'action_max_age',$GP_DEFAULT{action_max_age});
+        return 'reorder_window must be smaller than action_max_age' if $window >= $age;
     }
     # Results belong to this phone identity. Returning to an old ID must not
     # revive a previous phone's setup data; same-ID spelling changes are harmless.
@@ -865,6 +1010,7 @@ sub GP_UpdateGeometry {
         $c->{helper}{gp}{geometry_dirty}{$r}{$e->{zone}}=1 unless $debug;
     }
     if ($changed) {
+        GP_InvalidateConfig($c,$r,$debug);
         # Geometry is evaluated before GP_Process. Attribute its reset to this
         # webhook, not to the last phone poll or an earlier location event.
         local $s->{trace_context}={source=>'geo',zone=>$e->{zone},entry=>$e->{entry},
@@ -978,167 +1124,158 @@ sub GP_ApplyGeometry {
 
 sub GP_Config {
     my ($c, $r, $debug) = @_;
+    my $catalog=GP_Catalog($c);
+    my $pool=$debug ? 'debug':'prod';
+    return $catalog->{views}{$pool}{$r} if $catalog->{views}{$pool}{$r};
     $c->{helper}{gp_work}{config_builds}++ if $c->{helper}{gp_work};
+    my $base=GP_BaseConfig($c,$r);
+    my $cfg={%$base,zones=>{}};
+    for my $n (keys %{$base->{zones}}) {
+        my $g=GP_Geometry($c,$r,$n,$debug);
+        $cfg->{zones}{$n}={%{$base->{zones}{$n}},(map {$_=>$g->{$_}} qw(lat lon radius)),blocked=>$g->{blocked}//0};
+    }
+    $cfg->{geometry_errors}=[GP_GeometryErrors($cfg)];
+    $cfg->{geometry_ready}=!@{$cfg->{geometry_errors}} ? 1:0;
+    return $catalog->{views}{$pool}{$r}=$cfg;
+}
+
+sub GP_BaseConfig {
+    my ($c,$r)=@_;
+    my $catalog=GP_Catalog($c);
+    return $catalog->{config}{$r} if $catalog->{config}{$r};
     my $source_mode=GP_Attr($r,'sourceMode','geofency_phone');
     my $phone=GP_UsesSource($source_mode,'phone');
-    my $cfg = { resident => $r, roommate => $defs{$r}{ROOMMATE}, zones => {}, roles => {}, groups => {}, rules => [],
+    my $cfg = { resident => $r, roommate => $defs{$r}{ROOMMATE}, zones => {}, roles => {}, groups => {},
+        zone_ids=>{},rules=>$catalog->{rules}{$r}//[],rule_index=>{},
         allowDoor => GP_Attr($r,'allowDoor',0), allowGarage => GP_Attr($r,'allowGarage',0),
         sourceMode => $source_mode,
         phoneSignalMode => $phone ? GP_Attr($r,'phoneSignalMode','state') : 'disabled',
         proxies => $phone ? [GP_List(GP_Attr($r,'phoneProxies',''))] : [],
         label => GP_Attr($defs{$r}{ROOMMATE},'alias',$defs{$r}{ROOMMATE}) };
     $cfg->{$_} = 0+GP_Attr($c->{NAME},$_,$GP_DEFAULT{$_}) for keys %GP_DEFAULT;
-    for my $n (GP_DeviceNames($c)) {
-        my $d = $defs{$n};
-        if (($d->{SUBTYPE} // '') eq 'location' && $d->{PARENT} eq $r) {
-            my $geometry=GP_Geometry($c,$r,$n,$debug);
-            my $z = { name=>$n, role=>$d->{ROLE}, id=>lc GP_Attr($n,'zoneId',''),
-                lat=>$geometry->{lat}, lon=>$geometry->{lon}, radius=>$geometry->{radius},
-                blocked=>$geometry->{blocked}//0, label=>GP_Attr($n,'label',$d->{ROLE} eq 'place' ? $n:$d->{ROLE}), groups=>[GP_List(GP_Attr($n,'groups',''))] };
-            $cfg->{zones}{$n} = $z;
-            push @{$cfg->{roles}{$z->{role}}}, $n;
-            push @{$cfg->{groups}{$_}},$n for @{$z->{groups}};
-        }
-        if (($d->{SUBTYPE} // '') eq 'rule' && GP_Attr($n,'enabled',1)
-            && grep { $_ eq $r } GP_List(GP_Attr($n,'residents',''))) {
-            my $a = GP_Attr($n,'action','');
-            push @{$cfg->{rules}}, { name=>$n, trigger=>GP_Attr($n,'trigger',''), group=>GP_Attr($n,'locationGroup',''),
-                locations=>[GP_List(GP_Attr($n,'locations',''))], afterExit=>GP_Attr($n,'afterExit',''),
-                arrivalFilter=>GP_Attr($n,'arrivalFilter','any'),
-                cooldown=>0+GP_Attr($n,'cooldown',300), action=>$a,
-                type=>GP_Field($a,'ACTIONTYPE',''), params=>{%{$attr{$a}//{}}} };
-        }
+    for my $n (@{$catalog->{locations}{$r}//[]}) {
+        my $d=$defs{$n};
+        my $z = { name=>$n, role=>$d->{ROLE}, id=>lc GP_Attr($n,'zoneId',''),
+            label=>GP_Attr($n,'label',$d->{ROLE} eq 'place' ? $n:$d->{ROLE}), groups=>[GP_List(GP_Attr($n,'groups',''))] };
+        $cfg->{zones}{$n} = $z;
+        push @{$cfg->{zone_ids}{$z->{id}}},$n;
+        push @{$cfg->{roles}{$z->{role}}}, $n;
+        push @{$cfg->{groups}{$_}},$n for @{$z->{groups}};
     }
-    $cfg->{geometry_errors}=[GP_GeometryErrors($cfg)];
-    $cfg->{geometry_ready}=!@{$cfg->{geometry_errors}} ? 1:0;
-    return $cfg;
+    for my $rule (@{$cfg->{rules}}) {
+        my @selectors=$rule->{trigger} eq 'arrival' ? ('arrival') : length($rule->{group})
+            ? ('group:'.$rule->{group}) : map {'location:'.$_} @{$rule->{locations}};
+        push @{$cfg->{rule_index}{$rule->{trigger}}{$_}},$rule for @selectors;
+        $cfg->{notify_required}=1 if $rule->{type} eq 'notify';
+    }
+    return $catalog->{config}{$r}=$cfg;
 }
 
 sub GP_ConfigRevision {
     my ($cfg)=@_;
-    # Only event diagnostics need the fingerprint; idle validation must not
-    # serialize the complete configuration every second. It belongs to this
-    # immutable snapshot and is never reused for a later configuration build.
-    $cfg->{revision}//=sha256_hex($GP_JSON->encode($cfg));
+    # Keep lookup indexes and memoized values out of the semantic fingerprint.
+    # Adapter params contain only their allowed fields, shared by every rule.
+    # Version 1 included a null revision through //= autovivification. Preserve
+    # that encoding so ordinary existing checkpoints keep the same binding.
+    $cfg->{revision}//=sha256_hex($GP_JSON->encode({revision=>undef,map {$_=>$cfg->{$_}}
+        (qw(resident roommate zones roles groups rules allowDoor allowGarage sourceMode phoneSignalMode proxies label
+            geometry_errors geometry_ready),keys %GP_DEFAULT)}));
     return $cfg->{revision};
 }
 
 sub GP_Validate {
     my ($c, $only, $activation, $prepared_cfg) = @_;
     return ('Controller missing') unless $c;
-    my @errors;
+    my $catalog=GP_Catalog($c);
+    my @errors=@{$catalog->{common_errors}};
     my @res = defined($only) ? ($only) : GP_Residents($c);
     @res = grep { GP_Mode($_) eq 'active' } @res if $activation && !defined($only);
-    for my $name ($c->{NAME},@res) {
-        push @errors,"$name: remove obsolete attribute $_; use set mode" for grep {exists $attr{$name}{$_}} qw(mode operatingMode);
-    }
-    my $transport_error=GP_HTTPConfigError($c);
-    push @errors,$transport_error if $transport_error;
     push @errors,$c->{helper}{gp_http_error} if $c->{helper}{gp_http_error};
-    my (%devices, %users, %roommates);
-    for my $r (GP_Residents($c)) {
-        for my $spec ([deviceId=>\%devices], [webhookUser=>\%users]) {
-            next unless GP_UsesSource(GP_Attr($r,'sourceMode','geofency_phone'),'geo');
-            my $v = lc GP_Attr($r,$spec->[0],'');
-            push @errors, "Duplicate $spec->[0] for $r" if length($v) && $spec->[1]{$v}++;
-        }
-        push @errors, "Duplicate ROOMMATE for $r" if $roommates{$defs{$r}{ROOMMATE}}++;
-    }
     for my $r (@res) {
-        unless (GP_Field($r,'SUBTYPE','') eq 'resident' && GP_Field($r,'CONTROLLER','') eq $c->{NAME}) {
+        unless (GP_Field($r,'TYPE','') eq 'GeoPresence' && GP_Field($r,'SUBTYPE','') eq 'resident' && GP_Field($r,'CONTROLLER','') eq $c->{NAME}) {
             push @errors, "Unknown resident $r"; next;
         }
-        my $cfg = $prepared_cfg && $prepared_cfg->{resident} eq $r ? $prepared_cfg : GP_Config($c,$r);
-        push @errors, "$r: invalid sourceMode" unless grep {$_ eq $cfg->{sourceMode}} @{$GP_ENUMS{sourceMode}};
-        if (GP_UsesSource($cfg->{sourceMode},'phone')) {
-            push @errors, "$r: phoneSignalMode must be state or measurement"
-                unless $cfg->{phoneSignalMode} =~ /\A(?:state|measurement)\z/;
-            my %proxy = map {$_=>1} @{$cfg->{proxies}};
-            push @errors, "$r: phoneProxies must list the house sensors without duplicates"
-                unless @{$cfg->{proxies}} && keys(%proxy)==@{$cfg->{proxies}};
-            for my $p (@{$cfg->{proxies}}) {
-                push @errors, "$r: invalid PRESENCE proxy $p" unless GP_Field($p,'TYPE','') eq 'PRESENCE';
-            }
-        }
-        if (GP_UsesSource($cfg->{sourceMode},'geo')) {
-            push @errors, "$r: deviceId and webhookUser required" unless GP_Id(GP_Attr($r,'deviceId','')) && GP_Id(GP_Attr($r,'webhookUser',''));
-            my ($err, $secret) = GP_Auth($r);
-            push @errors, "$r: set webhookPassword first" unless !$err && defined($secret) && $secret =~ /\A[0-9a-f]{32}:[0-9a-f]{64}\z/;
-            for my $role (qw(home outer)) {
-                my @locations=@{$cfg->{roles}{$role}//[]};
-                if (@locations!=1) {
-                    my $detail=@locations ? 'found '.scalar(@locations).': '.join(', ',@locations)
-                        : 'found 0; execute the define/attr commands returned by locationCommands';
-                    push @errors, "$r: exactly one $role location required ($detail)";
-                }
-            }
-            push @errors, "$r: at most one approach location allowed" if @{$cfg->{roles}{approach}//[]}>1;
-        }
-        my %ids;
-        for my $n (sort keys %{$cfg->{zones}}) {
-            next unless GP_UsesSource($cfg->{sourceMode},'geo');
-            my $z = $cfg->{zones}{$n};
-            push @errors, "$n: invalid location function; use home, outer, approach or place" unless $z->{role} =~ /\A(?:home|outer|approach|place)\z/;
-            my %tags;
-            push @errors, "$n: invalid or duplicate groups" if @{$z->{groups}}>16 || grep {!GP_Group($_) || $tags{$_}++} @{$z->{groups}};
-            push @errors, "$n: valid unique zoneId required" if !GP_Id($z->{id}) || $ids{$z->{id}}++;
-        }
-        if ($activation && GP_Mode($c->{NAME}) eq 'active') {
-            my $rr = $defs{$r}{ROOMMATE};
-            push @errors, "$rr: remove rr_geofenceUUIDs before activation" if length GP_Attr($rr,'rr_geofenceUUIDs','');
-            push @errors, "$rr: rr_locationUnderway must be underway" unless GP_Attr($rr,'rr_locationUnderway','') eq 'underway';
-            (my $suffix=$rr) =~ s/^rr_//;
-            for my $old ("People.Loc.$suffix", "People.handler.$suffix.enter") {
-                push @errors, "$old: disable legacy action before activation" if exists($defs{$old}) && !GP_Attr($old,'disable',0);
-            }
-        }
-        for my $rule (@{$cfg->{rules}}) {
-            push @errors, GP_ValidateRule($c,$rule,$r,$cfg);
-        }
+        my $cfg = $prepared_cfg && $prepared_cfg->{resident} eq $r ? $prepared_cfg : GP_BaseConfig($c,$r);
+        $catalog->{errors}{$r}//=[GP_ValidateResident($c,$r,$cfg,$catalog)];
+        push @errors,@{$catalog->{errors}{$r}};
+        # Function availability and listener errors can change without a
+        # configuration event. Sensor health is checked by the source adapters.
+        push @errors,'pushMsg is not loaded' if $cfg->{notify_required} && !defined &pushMsg;
+        push @errors,@{$catalog->{activation_errors}{$r}} if $activation && GP_Mode($c->{NAME}) eq 'active';
     }
-    my %relevant_targets;
-    if (defined($only) || $activation) {
-        my %selected=map {$_=>1} @res;
-        for my $rule (GP_DeviceNames($c)) {
-            next unless GP_Field($rule,'SUBTYPE','') eq 'rule' && GP_Attr($rule,'enabled',1);
-            next unless grep {$selected{$_}} GP_List(GP_Attr($rule,'residents',''));
-            my $target=GP_Attr(GP_Attr($rule,'action',''),'target','');
-            $relevant_targets{$target}=1 if length $target;
-        }
+    if (!defined($only) && !$activation) {
+        push @errors,@{$catalog->{rule_errors}{$_}} for sort keys %{$catalog->{rule_errors}};
+        push @errors,$catalog->{target_errors}{$_} for sort keys %{$catalog->{target_errors}};
     }
-    my %targets;
-    for my $name (GP_DeviceNames($c)) {
-        my $d=$defs{$name};
-        if (($d->{SUBTYPE}//'') eq 'rule' && GP_Attr($name,'enabled',1)) {
-            my @selected=GP_List(GP_Attr($name,'residents','')); my %seen;
-            next if (defined($only) || $activation) && !grep {my $r=$_; grep {$_ eq $r} @res} @selected;
-            push @errors, "$name: residents required" unless @selected;
-            for my $resident (@selected) {
-                push @errors,"$name: unknown resident $resident" unless GP_Field($resident,'SUBTYPE','') eq 'resident'
-                    && GP_Field($resident,'CONTROLLER','') eq $c->{NAME};
-                push @errors,"$name: duplicate resident $resident" if $seen{$resident}++;
-            }
-        }
-        next unless ($d->{SUBTYPE}//'') eq 'action' && $d->{ACTIONTYPE} ne 'notify';
-        my $target = GP_Attr($d->{NAME},'target','');
-        next unless length $target;
-        next if (defined($only) || $activation) && !$relevant_targets{$target};
-        my $signature = join('|',$d->{ACTIONTYPE}, GP_Attr($d->{NAME},'positionSignalMode','state'),
-            map {GP_Attr($d->{NAME},$_,'')} qw(command contact feedbackDevice stateDevice upperContact lowerContact));
-        push @errors, "Conflicting action definitions for $target" if exists($targets{$target}) && $targets{$target} ne $signature;
-        $targets{$target}=$signature;
-    }
-    # Shared rules are checked for each affected resident. Report an identical
-    # problem once per validation without discarding different residents' errors.
     my %seen;
     return grep {!$seen{$_}++} @errors;
+}
+
+sub GP_ValidateResident {
+    my ($c,$r,$cfg,$catalog)=@_;
+    my @errors;
+    push @errors,"$r: remove obsolete attribute $_; use set mode" for grep {exists $attr{$r}{$_}} qw(mode operatingMode);
+    push @errors,"$r: missing or invalid ROOMMATE $cfg->{roommate}" unless GP_Field($cfg->{roommate},'TYPE','') eq 'ROOMMATE';
+    push @errors, "$r: invalid sourceMode" unless grep {$_ eq $cfg->{sourceMode}} @{$GP_ENUMS{sourceMode}};
+    if (GP_UsesSource($cfg->{sourceMode},'phone')) {
+        push @errors, "$r: phoneSignalMode must be state or measurement"
+            unless $cfg->{phoneSignalMode} =~ /\A(?:state|measurement)\z/;
+        my %proxy = map {$_=>1} @{$cfg->{proxies}};
+        push @errors, "$r: phoneProxies must list the house sensors without duplicates"
+            unless @{$cfg->{proxies}} && keys(%proxy)==@{$cfg->{proxies}};
+        for my $p (@{$cfg->{proxies}}) {
+            push @errors, "$r: invalid PRESENCE proxy $p" unless GP_Field($p,'TYPE','') eq 'PRESENCE';
+        }
+    }
+    if (GP_UsesSource($cfg->{sourceMode},'geo')) {
+        push @errors, "$r: deviceId and webhookUser required" unless GP_Id(GP_Attr($r,'deviceId','')) && GP_Id(GP_Attr($r,'webhookUser',''));
+        my ($err, $secret) = GP_Auth($r);
+        push @errors, "$r: set webhookPassword first" unless !$err && defined($secret) && $secret =~ /\A[0-9a-f]{32}:[0-9a-f]{64}\z/;
+        for my $role (qw(home outer)) {
+            my @locations=@{$cfg->{roles}{$role}//[]};
+            if (@locations!=1) {
+                my $detail=@locations ? 'found '.scalar(@locations).': '.join(', ',@locations)
+                    : 'found 0; execute the define/attr commands returned by locationCommands';
+                push @errors, "$r: exactly one $role location required ($detail)";
+            }
+        }
+        push @errors, "$r: at most one approach location allowed" if @{$cfg->{roles}{approach}//[]}>1;
+    }
+    my %ids;
+    for my $n (sort keys %{$cfg->{zones}}) {
+        next unless GP_UsesSource($cfg->{sourceMode},'geo');
+        my $z = $cfg->{zones}{$n};
+        push @errors, "$n: invalid location function; use home, outer, approach or place" unless $z->{role} =~ /\A(?:home|outer|approach|place)\z/;
+        my %tags;
+        push @errors, "$n: invalid or duplicate groups" if @{$z->{groups}}>16 || grep {!GP_Group($_) || $tags{$_}++} @{$z->{groups}};
+        push @errors, "$n: valid unique zoneId required" if !GP_Id($z->{id}) || $ids{$z->{id}}++;
+    }
+    my (%actions,%targets);
+    for my $rule (@{$cfg->{rules}}) {
+        push @errors,@{$catalog->{rule_errors}{$rule->{name}}//[]};
+        push @errors, GP_ValidateRule($c,$rule,$r,$cfg);
+        $actions{$rule->{action}}=1;
+        $targets{$rule->{params}{target}}=1 if length($rule->{params}{target}//'');
+    }
+    push @errors,@{$catalog->{actions}{$_}{errors}//[]} for sort keys %actions;
+    push @errors,$catalog->{target_errors}{$_} for grep {$catalog->{target_errors}{$_}} sort keys %targets;
+    my $rr=$cfg->{roommate}; my @activation;
+    push @activation,"$rr: remove rr_geofenceUUIDs before activation" if length GP_Attr($rr,'rr_geofenceUUIDs','');
+    push @activation,"$rr: rr_locationUnderway must be underway" unless GP_Attr($rr,'rr_locationUnderway','') eq 'underway';
+    (my $suffix=$rr)=~s/^rr_//;
+    for my $old ("People.Loc.$suffix","People.handler.$suffix.enter") {
+        push @activation,"$old: disable legacy action before activation" if exists($defs{$old}) && !GP_Attr($old,'disable',0);
+    }
+    $catalog->{activation_errors}{$r}=\@activation;
+    return @errors;
 }
 
 sub GP_ValidateRule {
     my ($c,$rule,$resident,$cfg) = @_;
     my @err; my $name=$rule->{name};
     my $a = $defs{$rule->{action}};
-    return ("$name: action missing or in another controller") unless $a && ($a->{SUBTYPE}//'') eq 'action' && ($a->{CONTROLLER}//'') eq $c->{NAME};
+    return ("$name: action missing or in another controller") unless $a && ($a->{TYPE}//'') eq 'GeoPresence'
+        && ($a->{SUBTYPE}//'') eq 'action' && ($a->{CONTROLLER}//'') eq $c->{NAME};
     push @err, "$name: invalid trigger; choose arrival, enter or exit" unless $rule->{trigger} =~ /\A(?:arrival|enter|exit)\z/;
     push @err, "$name: invalid arrivalFilter" unless ($rule->{arrivalFilter}//'any') =~ /\A(?:any|vehicle)\z/;
     for my $key (keys %{$attr{$name}//{}}) {
@@ -1152,7 +1289,7 @@ sub GP_ValidateRule {
         if (@{$rule->{locations}}) {
             my %seen;
             for my $z (@{$rule->{locations}}) {
-                push @err, "$name: invalid or duplicate location $z" unless GP_Field($z,'SUBTYPE','') eq 'location'
+                push @err, "$name: invalid or duplicate location $z" unless GP_Field($z,'TYPE','') eq 'GeoPresence' && GP_Field($z,'SUBTYPE','') eq 'location'
                     && GP_Field($z,'CONTROLLER','') eq $c->{NAME} && !$seen{$z}++;
                 push @err,"$name: location $z belongs to a resident outside this rule"
                     unless grep {$_ eq GP_Field($z,'PARENT','')} GP_List(GP_Attr($name,'residents',''));
@@ -1168,23 +1305,30 @@ sub GP_ValidateRule {
             unless defined($ref) && (($kind eq 'location' && exists($cfg->{zones}{$ref}))
                 || ($kind eq 'group' && GP_Group($ref) && @{$cfg->{groups}{$ref}//[]}));
     }
-    my $p = $rule->{params};
-    if ($rule->{type} eq 'notify') {
-        push @err, "$rule->{action}: safe message required" unless GP_SafeText($p->{message}//'');
-        push @err, 'pushMsg is not loaded' unless defined &pushMsg;
-    } elsif ($rule->{type} eq 'switch_on') {
-        push @err, "$rule->{action}: missing target device" unless GP_Name($p->{target}) && exists($defs{$p->{target}});
-        push @err, "$rule->{action}: command must be on" unless ($p->{command}//'') eq 'on';
-    } else {
-        push @err, "$rule->{action}: positionSignalMode must be state or measurement"
-            unless ($p->{positionSignalMode}//'state') =~ /\A(?:state|measurement)\z/;
+    if (GP_IsOpening($rule->{type})) {
         push @err, "$name: opening actions require confirmed arrival" unless $rule->{trigger} eq 'arrival';
         push @err, "$name: garage action requires arrivalFilter vehicle" if $rule->{type} eq 'garage_open' && $rule->{arrivalFilter} ne 'vehicle';
-        my @refs = $rule->{type} eq 'door_open' ? qw(target contact feedbackDevice) : qw(target stateDevice upperContact lowerContact);
-        push @err, "$rule->{action}: missing $_ device" for grep {!GP_Name($p->{$_}) || !exists($defs{$p->{$_}})} @refs;
-        my $command = $rule->{type} eq 'door_open' ? 'lock unlocked' : 'on';
-        push @err, "$rule->{action}: command must be $command" unless ($p->{command}//'') eq $command;
     }
+    return @err;
+}
+
+sub GP_ValidateAction {
+    my ($a)=@_;
+    my ($name,$type,$p)=@{$a}{qw(name type params)};
+    my @err;
+    if ($type eq 'notify') {
+        push @err,"$name: safe message required" unless GP_SafeText($p->{message}//'');
+    } elsif ($type eq 'switch_on') {
+        push @err,"$name: missing target device" unless GP_Name($p->{target}) && exists($defs{$p->{target}});
+        push @err,"$name: command must be on" unless ($p->{command}//'') eq 'on';
+    } elsif (GP_IsOpening($type)) {
+        push @err,"$name: positionSignalMode must be state or measurement"
+            unless ($p->{positionSignalMode}//'state') =~ /\A(?:state|measurement)\z/;
+        my @refs=$type eq 'door_open' ? qw(target contact feedbackDevice) : qw(target stateDevice upperContact lowerContact);
+        push @err,"$name: missing $_ device" for grep {!GP_Name($p->{$_}) || !exists($defs{$p->{$_}})} @refs;
+        my $command=$type eq 'door_open' ? 'lock unlocked':'on';
+        push @err,"$name: command must be $command" unless ($p->{command}//'') eq $command;
+    } else { push @err,"$name: invalid action type"; }
     return @err;
 }
 
@@ -1468,12 +1612,9 @@ sub GP_ExitEvidence {
 
 sub GP_Rules {
     my ($s,$cfg,$trigger,$e,$now,$mono)=@_;
-    for my $rule (@{$cfg->{rules}}) {
-        next unless $rule->{trigger} eq $trigger;
-        if ($trigger ne 'arrival') {
-            next if length($rule->{group}//'') ? ($e->{group}//'') ne $rule->{group}
-                : length($e->{group}//'') || !grep {$_ eq ($e->{zone}//'')} @{$rule->{locations}};
-        }
+    my $selector=$trigger eq 'arrival' ? 'arrival' : length($e->{group}//'')
+        ? 'group:'.$e->{group} : 'location:'.($e->{zone}//'');
+    for my $rule (@{($cfg->{rule_index}{$trigger}//{})->{$selector}//[]}) {
         my $skip=sub {GP_Trace($s,$now,$_[0],{rule=>$rule->{name},decision=>'suppressed'})};
         my $after=$rule->{afterExit}//'';
         my $exit=length($after) ? GP_ExitEvidence($s,$after,$e->{time}):undef;
@@ -1499,7 +1640,7 @@ sub GP_Rules {
             my $key=join('|',$s->{trip}{id},$type,$rule->{params}{target}//'');
             if ($s->{trip}{actions}{$key}++) { $skip->('action already consumed in this trip'); next; }
             push @{$s->{intents}}, {kind=>$type,key=>$key,trip=>$s->{trip}{id},rule=>$rule->{name},%history,
-                params=>{%{$rule->{params}}},e=>{%$e},generation=>$s->{generation}};
+                params=>$rule->{params},e=>{%$e},generation=>$s->{generation}};
         } else {
             my $visit=$trigger eq 'arrival' || length($after) ? $s->{trip}{id}
                 : length($e->{group}//'') ? ($s->{group_visits}{$e->{group}}//0) : ($s->{zone_visits}{$e->{zone}}//0);
@@ -1512,7 +1653,7 @@ sub GP_Rules {
             $s->{notify_seen}{$key}=1; $s->{notify_last}{$rule->{action}}=$now;
             push @{$s->{notify_order}}, $key;
             delete $s->{notify_seen}{shift @{$s->{notify_order}}} while @{$s->{notify_order}}>2000;
-            push @{$s->{intents}}, {kind=>$type,key=>$key,rule=>$rule->{name},params=>{%{$rule->{params}}},%history,
+            push @{$s->{intents}}, {kind=>$type,key=>$key,rule=>$rule->{name},params=>$rule->{params},%history,
                 e=>{%$e},generation=>$s->{generation}};
         }
     }
@@ -2173,6 +2314,7 @@ sub GP_Checkpoint {
     return if defined($s->{checkpoint_sequence}) && $s->{checkpoint_sequence}==($s->{trace_sequence}//0)
         && ($s->{checkpoint_value}//'') eq GP_Read($r,'gp_trip_checkpoint','');
     my $t=$s->{trip};
+    $cfg//=GP_Config($c,$r,0) if $t && $t->{armed} && !$s->{conflict};
     if ($t && $t->{armed} && !$s->{conflict} && GP_UsesSource($cfg->{sourceMode},'geo')
         && $cfg->{geometry_ready} && $s->{phase} =~ /\A(?:away|leaving|returning)\z/) {
         my $checkpoint={version=>1,status=>'qualified',saved_at=>GP_Now(),
@@ -2349,7 +2491,7 @@ sub GP_Normalize {
     my ($time,$canonical)=GP_ParseTime($p->{date});
     return (undef,'Invalid original event date') unless defined $time;
     return (undef,'Invalid location id') unless GP_Id($p->{id});
-    my @zones=grep {lc($p->{id}//'') eq $_->{id}} values %{$cfg->{zones}};
+    my @zones=map {$cfg->{zones}{$_}} @{$cfg->{zone_ids}{lc $p->{id}}//[]};
     return (undef,'Unknown location id; use set resident mode learning and send an isTest=true webhook') unless @zones==1 || $learning;
     my $z=$zones[0];
     return (undef,'Invalid location name') if defined($p->{name}) && length($p->{name})>200;
@@ -2482,6 +2624,10 @@ sub GP_LearnConfirm {
     }
     $learned->{confirmed}=1;
     $rt->{learned}{$r}=$learned;
+    # A synchronous attribute callback may have queried debug geometry before
+    # confirmation. It must not hide the newly confirmed setup metadata.
+    delete $rt->{geometry}{debug}{$r};
+    GP_InvalidateConfig($c,$r,1);
     GP_Log($c,3,'learning_confirmed',{resident=>$r,mode=>'learning',reason=>'Device identifier and captured locations confirmed; resident remains disabled'});
     return 'Learning confirmed; deviceId '.$learned->{device}.' configured; resident disabled; create locations and applyGeometry before testing';
 }
@@ -2553,8 +2699,7 @@ sub GP_HandleHTTP {
     return (401,'Authentication required') unless $auth =~ /\ABasic ([A-Za-z0-9+\/=]+)\z/;
     my ($user,$password)=split /:/,decode_base64($1),2;
     return (401,'Authentication required') unless defined($password) && length($password)<=256;
-    my @res=grep {GP_Attr($_,'webhookUser','') eq $user
-        && GP_UsesSource(GP_Attr($_,'sourceMode','geofency_phone'),'geo')} GP_Residents($c);
+    my @res=@{GP_Catalog($c)->{users}{$user}//[]};
     return (401,'Authentication required') unless @res==1;
     my $r=$res[0];
     my ($err,$stored)=GP_Auth($r);
@@ -2863,7 +3008,7 @@ sub GeoPresence_Timer {
     my $due=delete $c->{helper}{gp_timer_due};
     my $lag=defined($due) && $mono>$due ? ($mono-$due)*1000 : 0;
     my $rt=$c->{helper}{gp};
-    local $c->{helper}{gp_work}={runtime=>$rt,device_scans=>0,config_builds=>0};
+    local $c->{helper}{gp_work}={device_scans=>0,config_builds=>0};
     GP_Profile($c,'timer_registry','remove',sub {RemoveInternalTimer($c,'GeoPresence_Timer')});
     GP_Profile($c,'processing',$c->{NAME},sub {GP_TimerStep($c,$rt,$now,$mono)}) if $init_done;
     my $duration=GP_Mono()-$mono;
@@ -3080,8 +3225,39 @@ sub GeoPresence_Notify {
             }
             GP_UpdateAttrLists();
             GP_ResetController($c,'resume');
-        } elsif ($init_done && grep {/\A(?:DEFINED|DELETED|RENAMED) /} @$events) {
-            GP_UpdateAttrLists();
+        } elsif ($init_done) {
+            for my $event (@$events) {
+                my $catalog=$c->{helper}{gp_config};
+                my $inventory=$c->{helper}{gp_devices};
+                if ($event =~ /\A(DEFINED|DELETED|RENAMED|MODIFIED) (\S+)(?: (\S+))?/) {
+                    my $operation=$1; my @names=grep {defined} ($2,$3);
+                    my $own=grep {
+                        ($inventory && $inventory->{members}{$_}) || (GP_Field($_,'TYPE','') eq 'GeoPresence'
+                            && GP_Field($_,'CONTROLLER','') eq $c->{NAME})
+                    } @names;
+                    if ($own && $operation ne 'MODIFIED') {
+                        GP_InvalidateDevices($c);
+                    } elsif ($own || ($catalog && grep {$catalog->{dependents}{$_}} @names)) {
+                        GP_InvalidateConfig($c);
+                    }
+                    # modify keeps names/types; GeoPresence's own Modify path
+                    # already updates its widgets. Only membership changes can
+                    # affect global choices, including PRESENCE devices.
+                    GP_UpdateAttrLists() if $operation ne 'MODIFIED';
+                } elsif ($inventory && $event =~ /\A(ATTR|DELETEATTR) (\S+)(?: (\S+))?/) {
+                    my ($operation,$name,$key)=($1,$2,$3//'');
+                    # Cosmetic action attributes never enter a descriptor or
+                    # its fingerprint. Source attributes remain live in the
+                    # source adapters; dependent edits also refresh labels and
+                    # static reference checks after FHEM committed the change.
+                    next if $key =~ /\A(?:room|group|icon|verbose|comment|debugLog|logFile)\z/;
+                    my $own=$inventory->{members}{$name};
+                    GP_InvalidateConfig($c) if $own
+                        ? ($operation eq 'DELETEATTR' || $GP_ALLOWED{$key}
+                            || $key =~ /\A(?:mode|operatingMode|role|condition)\z/)
+                        : $catalog && $catalog->{dependents}{$name};
+                }
+            }
         }
         return;
     }
@@ -3178,6 +3354,7 @@ sub GeoPresence_Set {
         return $error if $error;
         delete $GP_AUTH{$name}; delete $c->{helper}{gp}{learned}{$name};
         GP_ResetResident($c,$name); GP_UpdateModes($c);
+        GP_InvalidateConfig($c);
         return 'Webhook password stored in the FHEM key store';
     }
     return 'Unknown argument, choose one of '.GP_SetList($hash)
@@ -3209,6 +3386,7 @@ sub GeoPresence_Set {
         # their timestamps and conflict flags intact; all journey state and
         # queued observations are discarded even when geometry is retained.
         delete $rt->{geometry}{debug}{$r} unless $keep_geometry;
+        GP_InvalidateConfig($hash,$r,1) unless $keep_geometry;
         $rt->{debug}{$r}=GP_NewState(GP_Now()-31,GP_Mono()-31,$rt->{epoch}.':debug:'.$r.':'.GP_Now(),GP_Attr($r,'sourceMode','geofency_phone'));
         @{$rt->{queue}}=grep {!($_->{debug} && $_->{resident} eq $r)} @{$rt->{queue}};
         return $keep_geometry ? 'Debug session reset; geometry retained; no productive changes' : 'Debug session reset; no productive changes';
@@ -3521,7 +3699,7 @@ sub GP_ReportResident {
 }
 
 sub GP_GetReport {
-    my ($hash,$command,$args,$value,$limit)=@_;
+    my ($hash,$command,$args,$value,$limit,$prepared_cfg)=@_;
     my $c=GP_Controller($hash);my $now=GP_Now();
     my $report={title=>'GeoPresence · '.$command,sections=>[]};
     if ($command eq 'validate') {
@@ -3590,7 +3768,7 @@ sub GP_GetReport {
         my $r=$args->[0]// $hash->{NAME};
         my $debug=$value->{view} eq 'debug';
         my $s=$value->{state};
-        my $cfg=GP_Config($c,$r,$debug);
+        my $cfg=$prepared_cfg;
         $report=GP_ReportResident($c,$r,$s,$cfg,$debug,$value->{errors},
             $value->{snapshot_at},GP_Mono()+($debug?($s->{debug_offset}//0):0),$value);
     }
@@ -3638,7 +3816,7 @@ sub GeoPresence_Get {
             if @positional>2 || (@positional>1 && $positional[1] !~ /\A(?:prod|debug)\z/);
     }
     $format//= $web?'html':'text';
-    my ($value,$data_error)=$error ? (undef,$error):GP_GetData($hash,$name,$command,@positional);
+    my ($value,$data_error,$cfg)=$error ? (undef,$error):GP_GetData($hash,$name,$command,@positional);
     if ($data_error) {
         return GP_ReportJSON({error=>$data_error},$web) if $format eq 'json';
         my $text=$web || $format eq 'html' ? GP_RenderReport({title=>'GeoPresence',lead=>$data_error},1) : $data_error;
@@ -3650,7 +3828,7 @@ sub GeoPresence_Get {
     if ($format eq 'json') {
         return GP_ReportJSON($value,$web);
     }
-    my $report=GP_GetReport($hash,$command,\@positional,$value,$limit);
+    my $report=GP_GetReport($hash,$command,\@positional,$value,$limit,$cfg);
     my $text= $command eq 'locationCommands' && $format eq 'text' ? join("\n",@{$value->{commands}})
         : GP_RenderReport($report,$format eq 'html');
     # Explicit text in FHEMWEB still needs a safe, wrapping preformatted block.
@@ -3767,7 +3945,7 @@ sub GP_GetData {
         geometry_ready=>$cfg->{geometry_ready},geometry_errors=>$cfg->{geometry_errors},missing_geometry=>[GP_MissingGeometry($cfg)],
         ($debug?(debug_ready=>@blockers?0:1,debug_blockers=>\@blockers):()),
         test_webhook_isolation=>1,debug_reset_keep_geometry=>1,
-        session_started_at=>$rt->{resident_start}{$r}//$rt->{start},pending_actors=>[sort keys %{$rt->{actors}//{}}],errors=>\@errors});
+        session_started_at=>$rt->{resident_start}{$r}//$rt->{start},pending_actors=>[sort keys %{$rt->{actors}//{}}],errors=>\@errors},undef,$cfg);
 }
 
 1;
@@ -4101,7 +4279,7 @@ get Geo.PERSON explain debug</pre>
       <b>Default:</b> <code>90</code> seconds<br>
       <b>Range:</b> greater than 0 through 172800</p>
       <p>Maximum age of an observation for current decisions and action dispatch. Delayed retries cannot perform an old opening.</p>
-      <p>This limits observations, not the lifetime of an otherwise valid remote trip.</p>
+      <p>This limits observations, not the lifetime of an otherwise valid remote trip. It must be greater than reorder_window.</p>
       <p><b>Example:</b></p>
       <pre style="white-space: pre-wrap; overflow-wrap: anywhere;">attr System.GeoPresence action_max_age 90</pre>
     </li>
@@ -4117,7 +4295,7 @@ get Geo.PERSON explain debug</pre>
       <p><b>Applies to:</b> Controller<br>
       <b>Default:</b> <code>2</code> seconds<br>
       <b>Range:</b> greater than 0 through 172800</p>
-      <p>Buffer incoming observations briefly before evaluating them in event-time order and checking conflicts. Larger values increase response latency.</p>
+      <p>Buffer incoming observations briefly before evaluating them in event-time order and checking conflicts. Larger values increase response latency. The value must be smaller than action_max_age, including when an attribute is deleted and its default applies. Interactive edits check the proposed pair; startup and rereadcfg check the relationship only after all saved attributes have been loaded.</p>
       <p><b>Example:</b></p>
       <pre style="white-space: pre-wrap; overflow-wrap: anywhere;">attr System.GeoPresence reorder_window 2</pre>
     </li>
@@ -4514,7 +4692,7 @@ get Geo.PERSON explain debug</pre>
   <h4>Readings and logs</h4>
   <p>Production resident readings prefixed with gp_ show snapshots such as phase, location, trip and door/garage results. Locations store production geometry in gp_geometry. These readings are diagnostic and do not restore executable permissions. Debug uses get explain with debug, get debugTrace and the separate diagnostic file instead of updating readings.</p>
   <p>The normal FHEM log contains English production area transitions, phone presence changes, opening requests and feedback, switch requests and messages handed to pushMsg. A message handoff is not a delivery receipt and door pulse confirmation is not proof that the door is physically open. Configured aliases, labels and message text are kept verbatim. The standard verbose attribute controls this normal output; detailed structured diagnostics go exclusively to logFile according to debugLog, even at verbose 5.</p>
-  <p>Timer statistics and diagnostic files are never used to restore permissions. Logging failures do not change webhook acceptance or decision state. The timer rechecks current configuration and schedules its next tick one second after completion; statistics distinguish callback work from delays caused elsewhere in FHEM.</p>
+  <p>Timer statistics and diagnostic files are never used to restore permissions. Logging failures do not change webhook acceptance or decision state. The timer reuses prepared configuration and static validation until relevant configuration changes; current source health and transport errors remain live. Unchanged idle ticks report zero device scans and configuration builds. The next tick is scheduled one second after completion; statistics distinguish callback work from delays caused elsewhere in FHEM.</p>
 </div>
 
 =end html

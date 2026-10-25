@@ -12,6 +12,7 @@ sub setReadingsVal { $_[0]{READINGS}{$_[1]}={VAL=>$_[2],TIME=>$_[3]}; }
 sub InternalTimer { }
 sub RemoveInternalTimer { }
 sub setNotifyDev { }
+sub deviceEvents { $_[0]{CHANGED}; }
 sub Log3 { }
 sub CommandSet { push @commands,$_[1]; return; }
 sub pushMsg { push @messages,[@_]; }
@@ -43,6 +44,7 @@ sub def {
     return $d;
 }
 sub advance { $now+=$_[0]; $mono+=$_[0]; }
+sub config_event { GeoPresence_Notify($defs{GP},{NAME=>'global',CHANGED=>[@_]}); }
 sub fixture {
     my ($profile)=@_;
     %defs=(); %attr=(); %data=(); %keys=(); @commands=(); @messages=();
@@ -108,8 +110,10 @@ subtest 'source requirements and defaults' => sub {
         }
     }
     my ($c)=fixture(); delete $attr{'Geo.Test'}{deviceId};
+    config_event('DELETEATTR Geo.Test deviceId');
     like(join(' ',GP_Validate($c)),qr/deviceId and webhookUser required/,'geo-only identity remains mandatory');
     $attr{'Geo.Test'}{sourceMode}='invalid';
+    config_event('ATTR Geo.Test sourceMode invalid');
     like(join(' ',GP_Validate($c)),qr/invalid sourceMode/,'unknown profile fails closed');
 };
 

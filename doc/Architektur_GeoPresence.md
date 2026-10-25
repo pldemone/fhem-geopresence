@@ -1,6 +1,6 @@
 # GeoPresence – Architektur
 
-**Version 0.53 · Stand 13.10.2026 · Handbuch 2.15**
+**Version 0.54 · Stand 25.10.2026 · Handbuch 2.16**
 
 Diese Beschreibung spezifiziert den aktuellen Aufbau von `FHEM/98_GeoPresence.pm`. Einrichtung und Bedienung stehen im [Handbuch](GeoPresence_Handbuch.md); Prüfabläufe und Testprogramm sind in der [Testanleitung](GeoPresence_Testanleitung.md) beschrieben. Gerätenamen wie `Geo.PERSON` und `Geo.PERSON.ORT` sind austauschbare Beispiele.
 
@@ -73,6 +73,20 @@ Die Funktion eines vorhandenen Ortes lässt sich mit `modify Geo.PERSON.ORT loca
 | `phone_only` | Nur PRESENCE-Sensoren | Nur Statusführung, keine Geo-Öffnungen, keine Geofency-Identität und kein Ortslernen |
 
 `geofency_phone` ist der Standard. Inaktive Quellen werden weder ausgewertet noch für Validierung, Geometrie oder Simulation vorausgesetzt. Quellenwechsel verändern den Öffnungsvertrag und setzen den Laufzeitzustand zurück. Vorhandene, nun unpassende Attribute werden nicht stillschweigend gelöscht; sie müssen ausdrücklich bereinigt werden.
+
+### 2.4 Aufbereitete Konfiguration
+
+Ein kleiner Bestandsindex hält Gerätenamen und Gerätetypen des Controllers vor. Bewohnerlisten und Modusanzeigen verwenden ausschließlich diesen Index. Ein getrennt und bei Bedarf aufgebauter Abhängigkeitsindex enthält Personenreferenzen und Hardwareziele für die Schutzprüfung von Konfigurationsänderungen. Diese Verwaltungszugriffe bereiten weder Aktorparameter noch ausführbare Regeln oder statische Validierungen auf. Attributänderungen erhalten den Gerätebestand und entwerten nur die davon abhängigen Ableitungen. Während des Einlesens werden Zwischenstände lediglich entwertet; die vollständige Sitzung wird nach der Wiederherstellung einmal zurückgesetzt.
+
+Die vollständige Konfiguration wird erst für Verarbeitung, Validierung oder einen Bericht aufbereitet. Pro Aktion werden ausschließlich die Parameter ihres festen Adapters übernommen. Regeln, Bewohner und geplante Aktionen referenzieren denselben Parameterdatensatz. Nachschlagewerke ordnen Webhook-Benutzer, Ortskennungen, Gruppen sowie Regeln nach Bewohner, Auslöser und Ortsauswahl direkt zu.
+
+Gerätesuche, gemeinsame Identitäts- und Hardwarekonfliktprüfungen sowie statische Personen-, Regel- und Aktivierungsprüfungen werden zwischen relevanten Änderungen wiederverwendet. Definitionen, Änderungen, Löschungen, Umbenennungen und Attribute referenzierter Geräte entwerten die betroffenen Ableitungen. Ein unbeteiligtes `MODIFIED` erzeugt keine Bestands- oder Oberflächenaufbereitung. `DEFINED`, `DELETED` und `RENAMED` aktualisieren weiterhin die Geräteauswahl einschließlich der PRESENCE-Geräte. Diagnose- und reine Oberflächenattribute wie `room` erfordern weder beim gezielten Setzen noch beim gezielten Löschen einen Neuaufbau. Das Löschen aller Attribute oder eines Musters mit Fachattributen entwertet die Konfiguration weiterhin.
+
+Der Attributcallback prüft interaktive Änderungen vor der Übernahme; erst ein späterer Verarbeitungspunkt baut die vollständige Konfiguration aus den tatsächlich übernommenen Werten auf. Abgelehnte Änderungen ersetzen keinen laufenden Stand. Beim Start und bei `rereadcfg` erfolgen Einzelwertprüfungen sofort, Beziehungen wie `reorder_window < action_max_age` dagegen erst am vollständig eingelesenen Stand. Damit bleiben gültige gespeicherte Werte unabhängig von der alphabetischen Attributreihenfolge erhalten. Ein ungültiger Gesamtstand sperrt die Verarbeitung und wird nicht durch stillschweigend verwendete Standardwerte ersetzt. INITIALIZED, REREADCFG und Modulreload verwerfen den aufbereiteten Stand ebenfalls.
+
+Produktive und simulierte Geometrie besitzen getrennte abgeleitete Ansichten. Neue Koordinaten, Radien oder Konfliktmarkierungen erneuern nur die Ansicht der betroffenen Person und des betroffenen Bereichs. Ein neuer Beobachtungszeitstempel bei unveränderten Kreisen löst weder eine erneute Regelaufbereitung noch eine erneute Prüfung der Kreisverschachtelung aus. Moduswechsel und Debug-Reset verwerfen die jeweils betroffenen Ansichten entsprechend ihrem Geometrievertrag.
+
+Sensorwerte, Quellenstörungen, Scanintervalle, aktuelle Aktorrückmeldungen, die Verfügbarkeit von `pushMsg` und Listenerfehler bleiben Laufzeitdaten und werden weiterhin aktuell ausgewertet. Berichtsaufbereitung und Darstellung verwenden denselben Konfigurationsstand. Die Konfigurationsbindung übernimmt ausschließlich verwendete Adapterparameter; `room` und ungenutzte Aktorattribute beeinflussen deshalb keinen neuen Checkpoint. Ältere Checkpoints, deren Fingerabdruck noch solche zusätzlichen Aktorattribute enthält, werden beim ersten Versionswechsel sicher verworfen; danach ist ein neuer Abwesenheitsnachweis erforderlich.
 
 ## 3. Webhook und Lernen
 
@@ -348,7 +362,7 @@ Neue Personen und deren eigene Orte lassen sich bei produktivem Betrieb anderer 
 
 ## 12. Ausführung und Prüfung
 
-Der Controller benutzt einen einzelnen periodischen FHEM-Timer, verarbeitet kurze Ereignisbündel, prüft qualifizierte Telefonzustände, Ankunftsfristen und Aktorabschlüsse und aktualisiert relevante Readings. Konfiguration und Gerätelisten werden pro Durchlauf wiederverwendet. Die Diagnose `timerStats` trennt Ausführungsdauer von verspätetem Timerbeginn; die bloße Nennung in einer Freezemon-Kandidatenliste beweist keine lange Modulrechnung.
+Der Controller benutzt einen einzelnen periodischen FHEM-Timer, verarbeitet kurze Ereignisbündel, prüft qualifizierte Telefonzustände, Ankunftsfristen und Aktorabschlüsse und aktualisiert relevante Readings. Konfiguration, Gerätelisten und statische Prüfergebnisse werden auch über mehrere Durchläufe hinweg wiederverwendet, bis sie entwertet werden. Bei unveränderter vorbereiteter Konfiguration melden `last_device_scans` und `last_config_builds` jeweils 0; reine Zugriffe zählen nicht als Neuaufbau. Die Diagnose `timerStats` trennt Ausführungsdauer von verspätetem Timerbeginn; die bloße Nennung in einer Freezemon-Kandidatenliste beweist keine lange Modulrechnung.
 
 Eine passive Messung erfasst Verarbeitungsschritte einschließlich synchroner Aktor-, ROOMMATE-, Nachrichten-, Reading- und Logaufrufe. Unteraufrufe werden mit inklusiver Dauer und exklusiver Eigenzeit erfasst, damit externe Callbacks nicht zusätzlich dem aufrufenden Verarbeitungsschritt als Eigenzeit zugerechnet werden. Die abschließende Gesamtdauer umfasst die Diagnoseausgabe und die Registrierung des nächsten Timers. Perl-Aufrufkontext, Rückgabewerte und Fehlerweitergabe bleiben erhalten; die Messung erzeugt keine Readings oder Ereignisse und verändert keine Aktions- oder Fristenentscheidung.
 
@@ -365,6 +379,13 @@ Regressionstests prüfen eine Radiusänderung beim Home-Austritt mit zuvor quali
 Laufzeittests unterscheiden einen fremden blockierenden Timer von einem synchronen, absichtlich verzögerten Notify am Dummy-Aktor. Weitere Prüfungen decken Reading-Callbacks, Dateiausgabe einschließlich der eigenen Slow-Run-Diagnose, begrenzte Historien, unveränderte Ausführung und die Trennung inklusiver und exklusiver Messzeiten ab.
 
 ## 13. Änderungen seit der letzten Version
+
+Änderungen von Version 0.53 auf 0.54:
+
+- [[#2.4 Aufbereitete Konfiguration|Abschnitt 2.4]]: Gemeinsamer Katalog, direkte Nachschlagewerke, zwischengespeicherte statische Prüfungen und getrennte Geometrieansichten ersetzen wiederholte Aufbereitung im Timer und in Berichten.
+- Aktorparameter werden einmal je Aktion ausgewählt und gemeinsam verwendet. Oberflächen- und ungenutzte Aktorattribute beeinflussen die Wiederherstellungsbindung nicht mehr.
+- Relevante FHEM-Änderungsereignisse entwerten die aufbereiteten Daten; aktuelle Sensor- und Transportzustände bleiben davon unabhängig.
+- `reorder_window` muss kleiner als `action_max_age` sein. Die Prüfung berücksichtigt auch das Löschen eines Attributs und dessen Standardwert.
 
 Änderungen von Version 0.52 auf 0.53:
 

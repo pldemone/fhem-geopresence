@@ -72,6 +72,7 @@ sub reading { $defs{$_[0]}{READINGS}{$_[1]}={VAL=>$_[2],TIME=>stamp($_[3])}; }
 sub device {
     my ($name,$type)=@_;
     $defs{$name}={NAME=>$name,TYPE=>$type,READINGS=>{}};
+    config_event("DEFINED $name") if $init_done && $type ne 'GeoPresence';
     return $defs{$name};
 }
 sub gp_define {
@@ -86,8 +87,10 @@ sub attribute {
     my $err=GeoPresence_Attr('set',$name,$key,$value);
     die "attr $name $key: $err" if defined $err;
     $attr{$name}{$key}=$value;
+    config_event("ATTR $name $key $value") if $init_done;
     return;
 }
+sub config_event { GeoPresence_Notify($defs{GP},{NAME=>'global',CHANGED=>[@_]}); }
 sub mode { my ($name,$value)=@_; my $error=GeoPresence_Set($defs{$name},$name,'mode',$value); die $error if defined $error; return; }
 sub fixture {
     my %options=@_;
@@ -171,6 +174,7 @@ sub house_fixture {
     my ($c)=fixture();
     for my $n (4,5) {device("p$n",'PRESENCE');$defs{"p$n"}{INTERVAL_NORMAL}=60;}
     $attr{'Geo.Test'}{phoneProxies}='p1,p2,p3,p4,p5';
+    config_event('ATTR Geo.Test phoneProxies p1,p2,p3,p4,p5');
     return ($c,GP_Config($c,'Geo.Test'),GP_State($c,'Geo.Test',0));
 }
 sub house_samples {
@@ -292,7 +296,9 @@ subtest 'diagnostic logs are bounded, private and independent of debug state' =>
 
 subtest 'validated configuration and no hardcoded actions' => sub {
     my ($c,$cfg)=fixture();is_deeply([GP_Validate($c,'Geo.Test',1)],[],'valid full configuration');
-    local $c->{helper}{gp}{geometry}{prod}{'Geo.Test'}{'Z.Home'}{radius}=300;
+    advance(40);
+    GP_UpdateGeometry($c,'Geo.Test',0,GP_State($c,'Geo.Test',0),
+        {kind=>'geo',zone=>'Z.Home',time=>$now,received=>$now,geometry=>{lat=>0,lon=>0,radius=>300}},$cfg,$now);
     like(join(' ',@{GP_Config($c,'Geo.Test')->{geometry_errors}}),qr/not contained/,'invalid nested circles block opening');
 };
 
@@ -570,6 +576,8 @@ subtest 'work role merges overlapping places and waypoint remembers this trip on
         action=>'exit',type=>'notify',params=>{message=>'left work'}};
     push @{$cfg->{rules}}, {name=>'place',trigger=>'exit',locations=>['Z.Sternensteg'],afterExit=>'group:Work',cooldown=>0,
         action=>'halfway',type=>'notify',params=>{message=>'halfway'}};
+    push @{$cfg->{rule_index}{exit}{'group:Work'}},$cfg->{rules}[-2];
+    push @{$cfg->{rule_index}{exit}{'location:Z.Sternensteg'}},$cfg->{rules}[-1];
     my $s=new_state();advance(40);process($s,$cfg,'Work',1);
     is(scalar @{$s->{intents}},1,'first work enter notifies');
     advance(10);process($s,$cfg,'Work2',1);is(scalar @{$s->{intents}},0,'overlap enter has no duplicate role notification');
@@ -640,21 +648,25 @@ subtest 'geometry changes are adopted and old retries cannot restore the previou
 subtest 'active configuration validation and invalid references have no side effects' => sub {
     my ($c,$cfg)=fixture();my @before=sort keys %defs;
     local $attr{'R.Door'}{action}='missing';
+    config_event('ATTR R.Door action missing');
     like(join(' ',GP_Validate($c,'Geo.Test',1)),qr/action missing/,'unknown action explained');
     is_deeply([sort keys %defs],\@before,'validation never creates a missing device');
     like(GeoPresence_Attr('set','Z.Home','radius',60),qr/received from Geofency/,'manual geometry is not configuration');
     device('People.Loc.Test','notify');
     like(join(' ',GP_Validate($c,'Geo.Test',1)),qr/disable legacy/,'legacy action must be disabled');
     $attr{rr_Test}{rr_geofenceUUIDs}='DEVICE';
+    config_event('ATTR rr_Test rr_geofenceUUIDs DEVICE');
     like(join(' ',GP_Validate($c,'Geo.Test',1)),qr/remove rr_geofenceUUIDs/,'old input binding must be removed');
 };
 
 subtest 'disabled rules and duplicate rules do not add hidden actions' => sub {
     my ($c,$cfg)=fixture();$attr{'R.Early'}{enabled}=0;$attr{'R.Late'}{enabled}=0;
+    config_event('ATTR R.Late enabled 0');
     $cfg=GP_Config($c,'Geo.Test');my $s=new_state();advance(40);process($s,$cfg,'Work',0);advance(90);arrive($s,$cfg);
     is_deeply([map {$_->{kind}} @{$s->{intents}}],['door_open'],'no hidden garage rule');
     my ($door)=grep {$_->{type} eq 'door_open'} @{$cfg->{rules}};
     push @{$cfg->{rules}}, {%$door,name=>'anotherRule'};
+    push @{$cfg->{rule_index}{arrival}{arrival}},$cfg->{rules}[-1];
     $s=new_state();advance(40);process($s,$cfg,'Work',0);advance(90);arrive($s,$cfg);
     is(scalar @{$s->{intents}},1,'same actor deduplicated independently of rule name');
 };
@@ -1397,6 +1409,7 @@ subtest 'manual home also revokes previously qualified phone absence' => sub {
 subtest 'DriveIn is optional for jitter protection, walks, remote trips and phone arrival' => sub {
     my ($c)=fixture();
     delete $defs{'Z.Drive'}; delete $attr{'Z.Drive'}; delete $defs{'R.Early'}; delete $attr{'R.Early'};
+    config_event('DELETED Z.Drive','DELETED R.Early');
     GP_ResetController($c);GeoPresence_Timer($c);my $cfg=GP_Config($c,'Geo.Test');
     is_deeply([GP_Validate($c,'Geo.Test',1)],[],'Home and outer validate without approach');
     my $s=new_state();advance(40);process($s,$cfg,'Home',0);advance(90);arrive($s,$cfg);
@@ -1417,7 +1430,7 @@ subtest 'DriveIn is optional for jitter protection, walks, remote trips and phon
 
 subtest 'learning works before location registration and returns safe manual commands only' => sub {
     my ($c,$cfg)=fixture();mode('GP','debug');
-    for my $n (grep {/^Z\./} keys %defs) {delete $defs{$n};delete $attr{$n};}
+    for my $n (grep {/^Z\./} keys %defs) {delete $defs{$n};delete $attr{$n};config_event("DELETED $n");}
     GP_ResetController($c);GeoPresence_Timer($c);advance(40);
     my @before=sort keys %defs;my $before_calls=$reading_calls;
     like(GeoPresence_Set($defs{'Geo.Test'},'Geo.Test','mode','learning'),qr/Learning for 15/,'explicit learning starts without locations');
@@ -1555,7 +1568,7 @@ subtest 'invalid nesting and stale geometry do not poison or authorize the curre
     ok(GP_State($c,'Geo.Test',0)->{trip}{armed},'stale geometry cannot invalidate a current trip');
 };
 
-subtest 'idle timer builds each configuration once and still detects changed activation guards' => sub {
+subtest 'idle timer reuses configuration and still detects changed activation guards' => sub {
     my ($c)=fixture();
     for (1..808) {device("Idle.Unrelated.$_",'dummy');}
     $defs{GP}{READINGS}{mode}{VAL}='debug';$attr{GP}{verbose}=5;
@@ -1568,27 +1581,29 @@ subtest 'idle timer builds each configuration once and still detects changed act
         local *GP_Validate=sub {$validations++;return $validate->(@_)};
         for (1..10) {advance(1);GeoPresence_Timer($c);}
     }
-    is($builds,10,'one configuration build per idle tick, including validation');
-    is($validations,10,'validation is not skipped or cached across ticks');
+    is($builds,10,'one prepared configuration lookup per idle tick');
+    is($validations,10,'runtime validation remains active across ticks');
     my $response=GeoPresence_Get($c,'GP','timerStats','format=json');
     my $stats=eval {JSON::PP::decode_json($response)};
     ok(ref($stats) eq 'HASH','read-only timer statistics available');
     if (ref($stats) eq 'HASH') {
-        is($stats->{last_device_scans},1,'at most one full device catalogue scan in a tick');
-        is($stats->{last_config_builds},1,'statistics show one configuration build');
+        is($stats->{last_device_scans},0,'no full device catalogue scan in an idle tick');
+        is($stats->{last_config_builds},0,'statistics show no idle configuration build');
         cmp_ok($stats->{runs},'>=',11,'statistics count measured callbacks');
     }
-    ok(!defined($c->{helper}{gp_work}),'callback catalogue is not retained between timer runs');
+    ok(!defined($c->{helper}{gp_work}),'profiling context is not retained between timer runs');
     my ($readings_before,$commands_before,$messages_before)=($reading_calls,scalar @commands,scalar @messages);
     GeoPresence_Get($c,'GP','timerStats','format=json');
     is_deeply([$reading_calls,scalar @commands,scalar @messages],[$readings_before,$commands_before,$messages_before],
         'statistics getter produces no readings, commands or messages');
     $defs{GP}{READINGS}{mode}{VAL}='active';
     $attr{rr_Test}{rr_geofenceUUIDs}='external-change';
+    config_event('ATTR rr_Test rr_geofenceUUIDs external-change');
     advance(1);GeoPresence_Timer($c);
     like(join(' ',@{$c->{helper}{gp}{errors}{'Geo.Test'}}),qr/remove rr_geofenceUUIDs/,
         'next tick notices a changed external ROOMMATE guard without a GeoPresence attribute callback');
     delete $attr{rr_Test}{rr_geofenceUUIDs};
+    config_event('DELETEATTR rr_Test rr_geofenceUUIDs');
     advance(1);GeoPresence_Timer($c);
     is_deeply($c->{helper}{gp}{errors}{'Geo.Test'},[],'next tick revalidates repaired external configuration');
 };
@@ -1676,6 +1691,7 @@ subtest 'idle validation skips fingerprint serialization and event snapshots ret
     like($revision,qr/\A[0-9a-f]{64}\z/,'event snapshot can produce a full fingerprint');
     is(GP_ConfigRevision($cfg),$revision,'same immutable snapshot has stable revision');
     $attr{'Geo.Test'}{allowDoor}=0;
+    config_event('ATTR Geo.Test allowDoor 0');
     my $changed=GP_Config($c,'Geo.Test',1);
     isnt(GP_ConfigRevision($changed),$revision,'new snapshot reflects a changed permission');
     advance(40);my $s=new_state();advance(40);
@@ -1735,18 +1751,22 @@ subtest 'switch_on is bounded, deduplicated, validated and suppressed in debug' 
     $defs{GP}{READINGS}{mode}{VAL}='debug';
     for my $bad ('on; set door lock unlocked','off','{ exit }') {
         local $attr{'A.Light'}{command}=$bad;
+        config_event("ATTR A.Light command $bad");
         like(join(' ',GP_Validate($c)),qr/command must be on/,'unbounded command rejected');
     }
     {
         local $attr{'A.Light'}{target}='garage';
+        config_event('ATTR A.Light target garage');
         like(join(' ',GP_Validate($c)),qr/Conflicting action definitions/,'light cannot share an opening target');
     }
     {
         local $attr{'R.Light'}{trigger}='arrival';
+        config_event('ATTR R.Light trigger arrival');
         like(join(' ',GP_Validate($c)),qr/locations is not applicable/,'arrival rules reject an irrelevant location selector');
     }
     {
         local $attr{'A.Light'}{target}='missing';
+        config_event('ATTR A.Light target missing');
         like(join(' ',GP_Validate($c)),qr/missing target device/,'undefined target rejected');
     }
 };
@@ -1824,6 +1844,7 @@ subtest 'three resident policies retain door, garage and phone arrival contracts
             # her explicit permission must still veto remote/automotive arrivals.
             my ($garage)=grep {$_->{type} eq 'garage_open'} @{GP_Config($c,'Geo.Lumo')->{rules}};
             push @{$cfg->{rules}},$garage;
+            push @{$cfg->{rule_index}{arrival}{arrival}},$garage;
             my $s=new_state();advance(40);
             GP_Process($s,$cfg,{kind=>'geo',zone=>$outer,entry=>0,time=>$now,received=>$now},$now,$mono);
             advance(90);
@@ -2160,10 +2181,12 @@ subtest 'full reports, uninitialized views and resident dropdowns are read only'
     my $before=JSON::PP->new->canonical->encode($c->{helper}{gp});
     $defs{'Geo.Second'}={NAME=>'Geo.Second',TYPE=>'GeoPresence',SUBTYPE=>'resident',CONTROLLER=>'GP'};
     $defs{'Geo.Other'}={NAME=>'Geo.Other',TYPE=>'GeoPresence',SUBTYPE=>'resident',CONTROLLER=>'Other'};
+    config_event('DEFINED Geo.Second');
     $menu=GeoPresence_Get($c,'GP','?');
     like($menu,qr/Geo\.Second#debug/,'new resident appears without a controller restart');
     unlike($menu,qr/Geo\.Other/,'another controller resident is not offered');
     delete $defs{'Geo.Second'}; delete $defs{'Geo.Test'};
+    config_event('DELETED Geo.Second','DELETED Geo.Test');
     like(GeoPresence_Get($c,'GP','?'),qr/\bexplain:textField\b/,'empty controller retains usable command discovery');
     is(JSON::PP->new->canonical->encode($c->{helper}{gp}),$before,'dropdown lookup does not allocate state');
     is(scalar @commands,0,'no actuator or ROOMMATE commands'); is(scalar @messages,0,'no notifications');
@@ -2172,6 +2195,7 @@ subtest 'full reports, uninitialized views and resident dropdowns are read only'
 subtest 'Telnet uses separate fields without wrapping text or truncating identifiers' => sub {
     my ($c)=fixture(); my $s=GP_State($c,'Geo.Test',0); $s->{phase}='away'; $s->{door_result}='uncertain';
     delete $attr{'Geo.Test'}{deviceId};
+    config_event('DELETEATTR Geo.Test deviceId');
     my $text=GeoPresence_Get($c,'GP','explain','Geo.Test');
     like($text,qr/Configuration invalid/,'configuration problem visible in complete report');
     like($text,qr/deviceId and webhookUser required/,'actual configuration finding is included');
@@ -2212,6 +2236,7 @@ subtest 'recent phone decisions retain their actual source without inheriting st
 
 subtest 'changed Home exit survives as a new suspicion and needs full new phone qualification' => sub {
     my ($c,$cfg)=fixture(); $attr{'Geo.Test'}{phoneSignalMode}='state';
+    config_event('ATTR Geo.Test phoneSignalMode state');
     my $dir=tempdir(CLEANUP=>1); $attr{GP}{logFile}="$dir/geo.log"; $attr{GP}{debugLog}=1;
     $cfg=GP_Config($c,'Geo.Test'); my $s=GP_State($c,'Geo.Test',0);
     my $negative=sub {for my $p (qw(p1 p2 p3)) {reading($p,'state','absent',$now);reading($p,'presence','absent',$now);} };

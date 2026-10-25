@@ -10,8 +10,10 @@ sub setReadingsVal { $_[0]{READINGS}{$_[1]}={VAL=>$_[2],TIME=>$_[3]}; }
 sub InternalTimer { }
 sub RemoveInternalTimer { }
 sub Log3 { }
+sub deviceEvents { $_[0]{CHANGED}; }
 sub getKeyValue { return (undef, ('a' x 32) . ':' . ('b' x 64)); }
 require "$FindBin::Bin/../FHEM/98_GeoPresence.pm";
+sub config_event { GeoPresence_Notify($defs{GP},{NAME=>'global',CHANGED=>[@_]}); }
 
 sub define_geo {
     my ($name, $definition) = @_;
@@ -56,6 +58,7 @@ subtest 'both existing source modes validate without an aggregation device' => s
     my $c = fixture();
     for my $mode (qw(geofency_phone phone_only)) {
         $attr{'Geo.Test'}{sourceMode} = $mode;
+        config_event("ATTR Geo.Test sourceMode $mode");
         is_deeply([GP_Validate($c)], [], "$mode accepts individual PRESENCE sources alone");
         local $defs{GP}{READINGS}{mode}{VAL} = 'active';
         is_deeply([GP_Validate($c, undef, 1)], [], "$mode can activate without a dummy aggregate");
@@ -67,12 +70,16 @@ subtest 'cleanup does not relax requirements on the actual phone sources' => sub
     my $c = fixture();
     for my $mode (qw(geofency_phone phone_only)) {
         $attr{'Geo.Test'}{sourceMode} = $mode;
+        config_event("ATTR Geo.Test sourceMode $mode");
         for my $list ('', 'p1,p1') {
             local $attr{'Geo.Test'}{phoneProxies} = $list;
+            config_event("ATTR Geo.Test phoneProxies $list");
             like(join('\n', GP_Validate($c)), qr/phoneProxies must list the house sensors without duplicates/,
                 "$mode rejects missing or duplicate sources");
         }
+        config_event('ATTR Geo.Test phoneProxies p1,p2');
         local $defs{p2}{TYPE} = 'dummy';
+        config_event('MODIFIED p2');
         like(join('\n', GP_Validate($c)), qr/invalid PRESENCE proxy p2/,
             "$mode still requires a real PRESENCE device for each source");
     }

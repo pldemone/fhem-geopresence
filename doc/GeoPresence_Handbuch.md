@@ -1,6 +1,6 @@
 # GeoPresence – Handbuch
 
-**Version 2.15 · Stand 13.10.2026 · Architektur 0.53**
+**Version 2.16 · Stand 25.10.2026 · Architektur 0.54**
 
 GeoPresence ist eine Anwesenheits- und Ortssteuerung für FHEM. Es wertet aus, wer zu Hause ist, wer das Haus verlassen hat und wer zurückkehrt, und verbindet diese Informationen mit konfigurierbaren Automationen. So lässt sich beispielsweise beim Betreten eines Gartenbereichs ein Licht einschalten, beim Erreichen eines Arbeitsortes eine Nachricht senden oder bei einer berechtigten Heimkehr die vorhandene Tür- und Garagensteuerung ansprechen. Ziel ist, solche Aktionen passend zur Situation auszuführen und Fehlreaktionen auf einzelne unzuverlässige Meldungen zu vermeiden.
 
@@ -721,6 +721,8 @@ Ein Neustart während deiner Abwesenheit kann den bereits bestätigten Ausflug f
 
 Nach Neustart, rereadcfg oder Modulreload prüft GeoPresence den gespeicherten Stand. Identität, Kennwortbindung, Quellenprofil, relevante Konfiguration und Geometrie müssen passen; eine spätere lokale Anwesenheit oder ein späteres ROOMMATE `home` widerspricht dem Ausflug. Die ursprüngliche Abwesenheitsbestätigung darf standardmäßig höchstens 48 Stunden alt sein. `trip_resume_max_age` am Controller legt diese Grenze in Sekunden fest; Speichern oder wiederholtes Neustarten erneuert den Nachweis nicht.
 
+Reine Oberflächenattribute wie `room` an einer Aktion gehören nicht zur Bindung neuer Checkpoints. Ein Wechsel der Raumzuordnung verhindert deren Wiederherstellung daher nicht. Beim erstmaligen Wechsel auf Architektur 0.54 können ältere Checkpoints mit solchen zusätzlichen Aktorattributen verworfen werden, weil ihr bisheriger Fingerabdruck abweicht. Dann ist ein neuer Abwesenheitsnachweis erforderlich; es wird keine Öffnung nachgeholt.
+
 **Beispiel:** Du verlässt Home, deine Telefonabwesenheit qualifiziert den Spaziergang, und FHEM startet währenddessen neu. Der Ausflug wird wieder als `away` geführt. Dein anschließender neuer Home-Eintritt startet die normale Fußweg-Ankunftsfrist; danach kann die Tür öffnen. Ein gespeicherter Fernausflug kann bei einer neuen berechtigten Fahrzeugankunft zusätzlich die Garage erlauben. Fehlende neue Bewegungsdaten machen einen alten Fahrzeugnachweis nicht automatisch frisch; die üblichen Fahrzeug- und Fußwegregeln gelten weiterhin.
 
 Beim Start selbst gibt es keine Öffnung oder nachgeholte Nachricht. Bereits begonnene Ankunftswartezeiten und wartende Befehle werden verworfen; für eine Öffnung ist eine neue gültige Rückkehrmeldung nötig. Bei erfolgreich übernommenem Checkpoint kann eine Home-Beobachtung direkt nach dem neuen Sitzungsbeginn verarbeitet werden, ohne zusätzlich 30 Sekunden Anlaufzeit abzuwarten. Vor oder beim Start entstandene Meldungen bleiben ausgeschlossen; die normale bewegungsabhängige Ankunftsfrist gilt weiterhin. Ohne gültigen Checkpoint bleibt der bisherige Anlaufschutz bestehen. Bei abgeschlossener Heimkehr wird der Checkpoint vor den Gerätebefehlen entwertet. Moduswechsel, relevante Konfigurationsänderungen, Uhrsprünge, manuelle Heimkehr oder widersprüchliche Nachweise widerrufen ihn ebenfalls.
@@ -749,7 +751,9 @@ Ein geordnetes Beenden von FHEM schreibt dessen Zustandsdatei. GeoPresence ruft 
 | `logFile` | Kein Standard; im Beispiel `./log/geopresence-%Y-%m.log` | Ohne Attribut keine Diagnosedatei; Platzhalter `%Y`, `%m`, `%d`, `%H`, `%M` |
 | `debugLog` | `auto`, `0`, `1`; Standard `auto` | Diagnose bei Simulation und Lernen, aus oder zusätzlich produktiv |
 
-Alle folgenden Zeiten sind Sekunden; `departure_margin` ist eine Entfernung in Metern. Numerische Controllerwerte müssen größer als 0 und höchstens 172800 sein; Ankunftsfristen und `arrival_motion_max_age` zusätzlich höchstens 300.
+Alle folgenden Zeiten sind Sekunden; `departure_margin` ist eine Entfernung in Metern. Numerische Controllerwerte müssen größer als 0 und höchstens 172800 sein; Ankunftsfristen und `arrival_motion_max_age` zusätzlich höchstens 300. `reorder_window` muss kleiner als `action_max_age` sein, damit Meldungen nach der Sortierfrist noch für Aktionen verwendbar sein können. Das gilt auch für die Standardwerte nach dem Löschen eines Attributs.
+
+Interaktive Änderungen prüfen diese Beziehung vor der Übernahme. Bei Neustart und `rereadcfg` werden die Attribute zunächst einzeln eingelesen und anschließend als vollständiger Stand geprüft. So bleibt beispielsweise `reorder_window 1` zusammen mit `action_max_age 2` auch bei alphabetischer Speicherreihenfolge erhalten. Ein insgesamt ungültiges Wertepaar sperrt die Verarbeitung; die gespeicherten Werte werden nicht stillschweigend durch Standardwerte ersetzt.
 
 | Attribut | Standard | Wirkung |
 |---|---:|---|
