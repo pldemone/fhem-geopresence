@@ -1,6 +1,6 @@
 # GeoPresence – Architektur
 
-**Version 0.57 · Stand 26.10.2026 · Handbuch 2.19**
+**Version 0.62 · Stand 26.10.2026 · Handbuch 2.24**
 
 Diese Beschreibung spezifiziert den aktuellen Aufbau von `FHEM/98_GeoPresence.pm`. Einrichtung und Bedienung stehen im [Handbuch](GeoPresence_Handbuch.md); Prüfabläufe und Testprogramm sind in der [Testanleitung](GeoPresence_Testanleitung.md) beschrieben. Gerätenamen wie `Geo.PERSON` und `Geo.PERSON.ORT` sind austauschbare Beispiele.
 
@@ -146,9 +146,19 @@ Veraltete Geometrie überschreibt keine neuere Geometrie. Unterschiedliche Geome
 
 ### 4.2 Reihenfolge und Frische
 
-GeoPresence speichert Beobachtungszeit und Empfangszeit getrennt. Eine kurze Warteschlange von standardmäßig zwei Sekunden ordnet Ereignisse je Person und Betriebsbereich nach ihrer Beobachtungszeit. Identische Wiederholungen werden dedupliziert. Zeitgleiche widersprüchliche Kreisbeobachtungen sperren die betroffenen Aktionspläne.
+GeoPresence speichert Beobachtungszeit und Empfangszeit getrennt. Eine kurze Warteschlange von standardmäßig zwei Sekunden ordnet Ereignisse je Person und Betriebsbereich nach ihrer Beobachtungszeit. Der erste Empfang bestimmt die feste Bündelfrist anhand der monotonen Uhr. Sobald eine Meldung dieses Kontexts fällig ist, verarbeitet der nächste Timerlauf alle bis dahin vorliegenden Meldungen dieses Kontexts gemeinsam. Spätere Eingänge verlängern die Frist nicht; Produktiv- und Debug-Bereich sowie unterschiedliche Personen besitzen jeweils eigene Bündel. Ein leerer Geo-Puffer hält Telefonereignisse und fällige Ankunftsbestätigungen nicht zurück.
+
+Vor der Geometrieauswertung werden Geo-Meldungen chronologisch sortiert. Die Konfliktvorprüfung übernimmt diese Reihenfolge und prüft Frische, Sitzungsgrenze und bisherige Position einmal je Meldung. Paarvergleiche erfolgen nur innerhalb gleicher Beobachtungszeitpunkte; bei unterschiedlichen Zeitstempeln entfallen sie vollständig. Ein erkannter Konflikt beendet die Vorprüfung. Gleichzeitige Meldungen können weiterhin Paarvergleiche innerhalb ihrer Gruppe benötigen. Identische Wiederholungen werden dedupliziert; zeitgleiche widersprüchliche Kreisbeobachtungen sperren die betroffenen Aktionspläne.
+
+Eine fällige Ankunft wird erst nach der vollständigen Auswertung des fälligen Bündels bestätigt. Das schließt jüngere Gegenbeobachtungen ein, deren eigener Empfang noch keine volle Sortierfrist zurückliegt. Eine erst später begonnene, noch nicht fällige Sammlung hält die Ankunft weiterhin bis zur gemeinsamen Auswertung zurück.
 
 Liefert eine Wiederholung desselben Home- oder Annäherungseintritts erstmals eine Bewegungsart, darf sie fehlende Transportdaten im noch aktuellen Ankunftsabschnitt ergänzen. Bereits bekannte Bewegungsarten werden dadurch nicht ersetzt. Wiederholungen innerhalb desselben Bündels werden vor dessen Reiseauswertung zusammengeführt, damit auch eine anschließende Telefonbestätigung den Fußwegnachweis berücksichtigt. Bei einer noch wartenden Rückkehr wird die passende Ankunftsfrist weiterhin vom ersten Empfang gerechnet; der ursprüngliche Beobachtungszeitpunkt bestimmt die Bewegungsfrische. Bereits abgeschlossene oder unterbrochene Ankünfte werden nicht erneut ausgeführt, Regeln und Besuche nicht wiederholt. Eine Ergänzung in einem späteren Timerlauf erscheint als `duplicate event enriched with motion`.
+
+Während einer offenen Ankunft werden die bereits akzeptierten Eintritte im bestehenden Duplikatspeicher ihrer Ankunft zugeordnet. Beim ersten Home-Eintritt wird auch der Schlüssel der bis dahin aktuellen Annäherungsbeobachtung übernommen; dafür hält der vorhandene Annäherungskontext neben seiner monotonen Ablaufzeit den Schlüssel und den ursprünglichen Beobachtungszeitpunkt. Dieser Zeitpunkt wird als `origin_time` in die Home-Vormerkung übernommen und begrenzt die noch gültigen Bewegungsursprünge. Gleiche Beobachtungszeiten von Annäherung und Home sind zulässig. Ein Austritt, eine neue Abwesenheit oder der Ablauf des Annäherungskontexts verhindert die Übernahme. Der gemeinsame Prüfschritt `GP_MotionOrigin` verwendet Zuordnung und Zeitgrenze sowohl im Geometrie-Vorfilter als auch vor der eigentlichen Ergänzung. Ein neuerer Home-Eintritt ohne Bewegung entwertet deshalb keinen noch frischen Nachtrag eines früher akzeptierten Eintritts derselben Ankunft. Reise, Sitzung und Ankunft müssen weiterhin übereinstimmen; außerhalb einer wartenden Ankunft bleibt nur die Ergänzung der aktuellen Annäherungsbeobachtung möglich.
+
+Ein frischer verspäteter Home-, Annäherungs- oder Outer-Austritt mit unveränderter Geometrie unterbricht den Annäherungsabschnitt auch dann, wenn eine neuere Ortsmeldung bereits die Position fortgeschrieben hat. `GP_InterruptsArrival` prüft dafür dieselbe Ursprungszeit im Vorfilter und im Fachablauf. Position, Mitgliedschaften und Besuche werden nicht zurückgesetzt. Trifft die Unterbrechung erst nach Home ein, liegt aber zeitlich vor dessen erstem Eintritt, bleibt die bestehende Home-Vormerkung erhalten. Die Ursprungsgrenze wird auf diesen Home-Eintritt gesetzt; frühere Bewegungsdaten werden entfernt. Nur wenn dadurch Bewegungsdaten entfallen, wird deren Bewertung mit `GP_UpdateArrivalMotion` angepasst. Für die Frische der verbliebenen Daten gilt dabei der gespeicherte Bewertungszeitpunkt `motion_evaluated_at`, damit eine zuvor gültige Home-Fußwegsperre nicht allein durch spätere Verarbeitung verfällt. Home-Ereignis, Empfangsanker und neuester Home-Nachweis werden nicht neu aufgebaut. Ein Austritt während der Home-Frist erfordert weiterhin einen neueren Home-Eintritt mit eigener vollständiger Frist. Austritte vor dem aktuellen Annäherungseintritt verwerfen diesen nicht.
+
+Bei einem älteren Nachtrag muss die mitgelieferte Geometrie weiterhin mit dem aktuellen Ortsstand übereinstimmen. Die Ergänzung aktualisiert ausschließlich die fehlende Bewegung und deren Ankunftsbewertung. Ortsposition, Mitgliedschaften, Besuchszähler und der neueste Home-Nachweis werden nicht auf den älteren Stand zurückgesetzt. Neuere brauchbare Bewegung hat Vorrang. Beobachtungszeit, erster Empfang und monotoner Empfangsbezug bleiben erhalten. Die Mindestabwesenheit und der Beginn der Home-Frist richten sich weiterhin nach dem ursprünglichen Home-Eintritt, auch wenn die Annäherung schon vor erfüllter Mindestabwesenheit beobachtet wurde. Insbesondere sperrt ein gültiger Fußwegnachtrag den bisherigen Fernbereichs-Ersatz für die Garage auch nach neueren bewegungslosen Home-Meldungen und vor einer anschließenden Telefonbestätigung.
 
 Standardmäßig dürfen Beobachtungen für neue Aktionen höchstens 90 Sekunden alt und höchstens 30 Sekunden in der Zukunft liegen. Die Zeit der ursprünglichen Meldung bleibt auch während einer vorgesehenen Ankunftsfrist erhalten; nur diese kontrollierte Frist erweitert das Ausführungsbudget. Ein Timerstau oder ein verspäteter Retry macht alte Daten nicht neu.
 
@@ -227,7 +237,7 @@ Eine Wiederholung ohne neue Bewegungsangabe startet die Frist nicht erneut und e
 
 `arrivalFilter vehicle` verwendet den Bewegungskontext des aktuellen Ankunftsabschnitts. Ein frischer `automotive`-Nachweis qualifiziert; kurze Schritte nach dem Parken heben diesen nicht sofort auf. Ohne solchen Nachweis schließt frisches walking, running oder cycling eine Fahrzeugankunft aus. Fehlen verwendbare Bewegungsdaten, darf ein bestätigter Fernausflug als Ersatznachweis dienen.
 
-Die Entscheidung wird bei vorgemerkter Rückkehr festgehalten. Das Ablaufen eines Fußwegnachweises während der Wartezeit darf ihn nicht nachträglich in eine Garagenberechtigung umwandeln. Der Filter ist eine Regelbedingung und kann auch für Licht oder Nachricht eingesetzt werden; er ist kein Aktortyp.
+Die Entscheidung wird bei vorgemerkter Rückkehr festgehalten. Das Ablaufen eines Fußwegnachweises während der Wartezeit darf ihn nicht nachträglich in eine Garagenberechtigung umwandeln. Das gilt auch bei einem verspäteten Austritt vor dem weiterhin gültigen Home-Eintritt und bei `motion_max_age` unterhalb der Home-Frist, etwa 20 Sekunden. Muss ein früherer Automotive-Nachweis entfernt werden, wird die Wirkung der verbliebenen Bewegung anhand ihres ursprünglichen Bewertungszeitpunkts bestimmt. Neue ausdrückliche Bewegungsdaten werden dagegen zur aktuellen Verarbeitungszeit bewertet und können die Entscheidung ändern. Dieser Bewertungsbezug erneuert weder Beobachtungszeiten noch das Aktionsbudget. Der Filter ist eine Regelbedingung und kann auch für Licht oder Nachricht eingesetzt werden; er ist kein Aktortyp.
 
 ## 8. Ortsgruppen und Regeln
 
@@ -406,7 +416,47 @@ Weitere Regressionen prüfen Aliasänderungen und Aliaslöschungen innerhalb des
 
 Die Nachprüfung ergänzt verschiedene Aliaslöschmuster am ROOMMATE bei warmen und kalten Caches sowie die Erneuerung gespeicherter Fehler nach der Musterlöschung von Altattributen. Reale FHEM-Befehle prüfen dabei sowohl den weiter ausgegebenen Garagenbefehl als auch eine erfolgreiche Validierung und Aktivierung nach der Bereinigung.
 
+Die erste Etappe von R-03 prüft einen kontinuierlichen Webhook-Strom, unabhängige Produktiv- und Debug-Fristen sowie jüngere Gegenbeobachtungen vor der Ankunftsbestätigung. Für 64 frische Geo-Meldungen mit unterschiedlichen Beobachtungszeiten begrenzt die Regression die insgesamt verbleibenden Konfliktaufrufe auf höchstens 64; der vorherige Ablauf erzeugte 2.079. Die reale FHEM-Integration prüft dieselbe Bündelverarbeitung über HTTP. Diese Aufrufzähler sind keine Messung eines zeitlichen oder prozentualen Leistungsgewinns.
+
+Die F-11-Regressionen ergänzen ältere akzeptierte Eintritte nach mehreren neueren Home-Meldungen. Sie prüfen ursprüngliche Zeitanker, unveränderte Mitgliedschaften und Besuchszähler, den Vorrang neuerer Bewegung sowie den Ausschluss unbekannter Ursprünge, geänderter alter Geometrie und abgebrochener Ankünfte. Eine verspätete Austrittsmeldung muss weiterhin beim tatsächlich neuesten Home-Eintritt eine neue vollständige Frist beginnen. Die reale FHEM-Integration prüft den späten Fußwegnachtrag über HTTP mit regulärer Timerbestätigung und mit vorzeitiger Telefonbestätigung; Diagnose und Dummy-Aktoren belegen jeweils genau eine Türanforderung und keine Garagenanforderung.
+
+GP-F11-001 ergänzt den Übergang einer zuvor akzeptierten Annäherung zu Home mit gleicher und mit späterer Home-Beobachtungszeit, jeweils mit Timer- und Telefonbestätigung. Der verspätete Fußwegnachtrag muss die Garage sperren, ohne den Home-Zeitanker zu ändern. Weitere Gegenproben schließen vor Home unterbrochene, abgelaufene oder durch eine neuere Annäherung ersetzte Ursprünge aus. Eine vor erfüllter Mindestabwesenheit beobachtete Annäherung darf eine danach berechtigt begonnene Home-Frist durch ihren Nachtrag nicht vorzeitig bestätigen oder verwerfen.
+
+GP-F11-002 prüft verspätete Home-, Annäherungs- und Outer-Austritte nach einer neueren nahen Ortsmeldung, jeweils bei Empfang vor und nach Home. Ein nachgereichter Automotive-Ursprung vor der Unterbrechung darf die Garage nicht freigeben. Gegenproben erhalten neuere Home-Bewegung, einen späteren gültigen Annäherungseintritt und den aktuellen Ursprung bei einem noch älteren Austritt. Eine abweichende alte Geometrie wird weiterhin verworfen. Weitere Austritte während der Home-Frist müssen den tatsächlich neuesten Home-Nachweis verwenden. Die reale FHEM-Integration prüft den nahen Ort und beide Empfangsvarianten über HTTP mit Dummy-Aktoren.
+
+GP-F11-003 setzt `motion_max_age` auf zulässige 20 Sekunden. Ein verspäteter Austritt vor Home trifft erst nach Ablauf dieses Werts ein; die gespeicherte Home-Walking-Sperre muss bei Timer- und Telefonbestätigung erhalten bleiben. Gegenproben entfernen einen früheren Automotive-Nachweis und berücksichtigen spätere Walking-, Running- oder Cycling-Daten weiterhin anhand ihrer angenommenen Gültigkeit. Eine tatsächlich unterbrochene alte Fußwegsperre darf entfallen, und ein neuer gültiger Automotive-Nachweis darf die Entscheidung ändern. Die reale FHEM-Integration prüft die Walking-Sperre mit Timer und Telefon sowie die Teilentwertung eines Automotive-Nachweises.
+
 ## 13. Änderungen seit der letzten Version
+
+Änderungen von Version 0.61 auf 0.62:
+
+- GP-F11-003: Ein verspäteter Austritt vor Home erhält die bestehende Home-Vormerkung samt unbetroffener Fahrzeugentscheidung.
+- Gemeinsame Bewegungsbewertung für neue Hinweise und Teilentwertung; verbliebene Daten behalten bei Teilentwertung ihren ursprünglichen Bewertungszeitpunkt.
+- Kein vollständiger Neuaufbau der Home-Vormerkung und keine Neubewertung, wenn keine Bewegungsdaten entfallen.
+
+Änderungen von Version 0.60 auf 0.61:
+
+- GP-F11-002: Verspätete Austritte unterbrechen bereits den Annäherungsabschnitt, auch nach einer neueren Ortsmeldung und vor der Home-Vormerkung.
+- Eine gemeinsame Ursprungszeit begrenzt Austrittsprüfung und Bewegungsergänzung ohne zusätzliche Ereignishistorie.
+- Vor Home liegende Unterbrechungen erhalten eine bereits begonnene gültige Home-Frist, entwerten aber frühere Bewegungsursprünge und deren Fahrzeugentscheidung.
+
+Änderungen von Version 0.59 auf 0.60:
+
+- GP-F11-001: Die aktuelle Annäherungsbeobachtung wird beim Home-Eintritt derselben wartenden Ankunft zugeordnet; ihr gültiger Bewegungsnachtrag bleibt wirksam.
+- Der vorhandene Annäherungskontext speichert dafür einen Ereignisschlüssel zusätzlich zur Ablaufzeit. Abbrüche löschen ihn auch vor Beginn einer Home-Frist.
+- Ältere Annäherungsnachträge prüfen die Mindestabwesenheit anhand des bereits qualifizierten Home-Eintritts und lösen keine vorzeitige Bestätigung aus.
+
+Änderungen von Version 0.58 auf 0.59:
+
+- F-11: Akzeptierte Eintritte bleiben ihrer offenen Ankunft zugeordnet; neuere bewegungslose Meldungen verwerfen ihre Bewegungsnachträge nicht mehr.
+- Gemeinsame Ergänzungsprüfung für Geometrie-Vorfilter und Duplikatverarbeitung; vorhandener begrenzter Duplikatspeicher wird weiterverwendet.
+- Der neueste Home-Nachweis bleibt bei älteren Ergänzungen erhalten, damit verspätete Austritte die Ankunft weiterhin korrekt unterbrechen.
+
+Änderungen von Version 0.57 auf 0.58:
+
+- Erste Etappe von R-03: Feste Bündelfrist ab erstem Empfang korrigiert F-06; neue Meldungen verschieben ältere nicht mehr beliebig.
+- F-05: Chronologisch gruppierte Konfliktprüfung ersetzt den Vergleich sämtlicher Paare; nur gleiche Zeitstempel werden miteinander verglichen.
+- Alle bereits vorliegenden Gegenbeobachtungen eines fälligen Bündels bleiben vor der Ankunftsbestätigung berücksichtigt.
 
 Änderungen von Version 0.56 auf 0.57:
 

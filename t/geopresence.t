@@ -2954,4 +2954,392 @@ subtest 'GP-R07-005: deleting obsolete attributes refreshes cached validation wi
     }
 };
 
+subtest 'F-05: distinct observation times need no pairwise batch conflict comparisons' => sub {
+    my ($c,$cfg)=fixture();advance(100);my $latest=$now;
+    for my $age (reverse 0..63) {
+        is((http($c,form($cfg,'Home',1,$latest-$age)))[0],200,'fresh distinct observation accepted');
+    }
+    my $compare=\&GP_Contradiction;my $comparisons=0;
+    advance(2);
+    {
+        no warnings 'redefine';
+        local *GP_Contradiction=sub {$comparisons++;return $compare->(@_)};
+        GeoPresence_Timer($c);
+    }
+    cmp_ok($comparisons,'<=',64,'only the ordinary checks against the preceding location remain');
+    is(scalar @{$c->{helper}{gp}{queue}},0,'the entire due batch is processed');
+    my $s=GP_State($c,'Geo.Test',0);
+    is($s->{last_observed},$latest,'the newest observation is processed');
+    ok(!$s->{conflict},'distinct times do not quarantine the batch');
+};
+
+subtest 'F-06: a continuous event stream cannot extend the first receipt window' => sub {
+    my ($c,$cfg)=fixture();advance(40);
+    for my $step (0..5) {
+        is((http($c,form($cfg,'Work',1,$now)))[0],200,"stream observation $step accepted");
+        GeoPresence_Timer($c);
+        is(scalar @{$c->{helper}{gp}{queue}},($step+1)%3,"fixed window at stream step $step");
+        is(scalar @messages,$step<2?0:1,'ordinary visit is executed once when the first window closes');
+        advance(1) if $step<5;
+    }
+    is(GP_State($c,'Geo.Test',0)->{last_observed},$now,'the last window includes its newest received observation');
+};
+
+subtest 'F-06: the due batch includes newer counterevidence before confirming arrival' => sub {
+    for my $exit (qw(Home Drive Outer Work)) {
+        my ($c,$cfg,$s)=pending_fixture('automotive');
+        advance(8);
+        is((http($c,form($cfg,'Home',1,$now)))[0],200,'first observation starts a two-second window');
+        advance(1);
+        is((http($c,form($cfg,$exit,$exit eq 'Work'?1:0,$now)))[0],200,'newer counterevidence accepted');
+        advance(1);GeoPresence_Timer($c);
+        is(scalar @{$c->{helper}{gp}{queue}},0,"$exit is processed at the first deadline");
+        ok(!$s->{arrival},"$exit cancels the pending arrival in that batch");
+        is(scalar(grep {/^(door|garage) /} @commands),0,"$exit prevents physical output");
+        ok(!$c->{helper}{gp}{actors}{door} && !$c->{helper}{gp}{actors}{garage},'no opening reservation is created');
+    }
+};
+
+subtest 'F-06: productive and debug batches keep independent fixed windows' => sub {
+    my ($c,$cfg)=fixture();advance(40);
+    is((http($c,form($cfg,'Work',1,$now)))[0],200,'productive observation accepted');
+    advance(1);
+    is((http($c,form($cfg,'Work',1,$now),1))[0],200,'debug observation accepted');
+    advance(1);
+    is((http($c,form($cfg,'Work',1,$now),1))[0],200,'newer debug observation accepted');
+    GeoPresence_Timer($c);
+    is(scalar(grep {!$_->{debug}} @{$c->{helper}{gp}{queue}}),0,'productive window is due');
+    is(scalar(grep {$_->{debug}} @{$c->{helper}{gp}{queue}}),2,'debug window has its own later deadline');
+    is(scalar @messages,1,'only the productive visit sends a message');
+    advance(1);GeoPresence_Timer($c);
+    is(scalar @{$c->{helper}{gp}{queue}},0,'debug window closes despite its later observation');
+    is(scalar @messages,1,'debug processing creates no real notification');
+};
+
+subtest 'F-11: an older entry in the same pending arrival can supply missing motion' => sub {
+    for my $case ([first=>'walking'],[later=>'walking'],[first=>'automotive'],[later=>'automotive']) {
+        my ($which,$motion)=@$case;
+        my ($c,$cfg,$s)=pending_fixture('unknown');
+        my $first={%{$s->{arrival}{event}}};my $start=$s->{arrival}{start_mono};
+        advance(5);process($s,$cfg,'Home',1);
+        my $source=$which eq 'first'?$first:{%{$s->{arrival}{latest_home}}};
+        advance(5);process($s,$cfg,'Home',1);
+        my $latest={%{$s->{arrival}{latest_home}}};my $position=$s->{position_time};
+        my $visits=JSON::PP->new->canonical->encode([@$s{qw(zones members zone_visits group_visits)}]);
+        advance(1);
+        GP_Process($s,$cfg,{%$source,motion=>$motion,received=>$now,received_mono=>$mono},$now,$mono);
+        is($s->{arrival}{motion},$motion,"$which entry fills $motion after newer empty entries");
+        is($s->{arrival}{vehicle_eligible},$motion eq 'automotive'?1:0,'vehicle permission follows the supplied motion');
+        is($s->{motion_time},$source->{time},'motion keeps its original observation time');
+        is($s->{position_time},$position,'supplement does not rewind position');
+        is_deeply($s->{arrival}{latest_home},$latest,'supplement retains the newest Home evidence');
+        is($s->{arrival}{started},$first->{received},'arrival retains the first receipt');
+        is($s->{arrival}{start_mono},$start,'monotonic receipt anchor is unchanged');
+        is($s->{arrival}{due_mono},$start+($motion eq 'walking'?60:10),'motion deadline is still based on the first receipt');
+        is(JSON::PP->new->canonical->encode([@$s{qw(zones members zone_visits group_visits)}]),$visits,
+            'supplement replays no membership or visit changes');
+        is_deeply($s->{intents},[],'supplement plans no additional actions');
+        complete_arrival($s,$cfg);actor_fresh();GP_Dispatch($c,'Geo.Test',$cfg,$s,0);
+        is_deeply(\@commands,$motion eq 'walking'?['door lock unlocked']:['door lock unlocked','garage on'],
+            'confirmed arrival executes only the permitted actors');
+        GP_Process($s,$cfg,{%$source,motion=>$motion,received=>$now,received_mono=>$mono},$now,$mono);
+        ok(!$s->{arrival} && !$s->{trip},'completed arrival is not reopened by its supplement');
+    }
+};
+
+subtest 'F-11: HTTP motion supplement survives the geometry filter after newer Home entries' => sub {
+    for my $phone (0,1) {
+        my ($c,$cfg)=fixture();my $s=GP_State($c,'Geo.Test',0);
+        advance(40);http($c,form($cfg,'Work',0,$now));advance(3);GeoPresence_Timer($c);
+        advance(90);my $time=$now;my $original=form($cfg,'Home',1,$time);
+        http($c,$original);advance(3);GeoPresence_Timer($c);
+        my $first={%{$s->{arrival}{event}}};my $start=$s->{arrival}{start_mono};
+        advance(2);my $latest=$now;http($c,form($cfg,'Home',1,$latest));advance(3);GeoPresence_Timer($c);
+        advance(1);http($c,$original.'&motion=walking');
+        if ($phone) {reading('p1','state','present',$now);reading('p1','presence','present',$now);}
+        actor_fresh();advance($phone?5:3);GeoPresence_Timer($c);
+        is($s->{motion},'walking','older HTTP duplicate supplies walking');
+        is($s->{motion_time},$time,'HTTP receipt cannot refresh motion age');
+        if (!$phone) {
+            is($s->{arrival}{event}{received},$first->{received},'HTTP path keeps first wall-clock receipt');
+            is($s->{arrival}{event}{received_mono},$first->{received_mono},'HTTP path keeps first monotonic receipt');
+            is($s->{arrival}{latest_home}{time},$latest,'newest Home entry survives the old duplicate');
+            is($s->{arrival}{due_mono},$start+60,'HTTP supplement does not restart the wait');
+            advance($s->{arrival}{due_mono}-$mono);actor_fresh();GeoPresence_Timer($c);
+        }
+        is_deeply([grep {/^(?:door|garage) /} @commands],['door lock unlocked'],
+            $phone?'walking veto is applied before queued phone confirmation':'timer confirmation honors the late walking veto');
+    }
+};
+
+subtest 'GP-F11-001: the current approach retains its motion origin on entering Home' => sub {
+    for my $gap (0,5) {
+        for my $phone (0,1) {
+            my ($c,$cfg)=fixture();my $s=GP_State($c,'Geo.Test',0);
+            advance(40);http($c,form($cfg,'Work',0,$now));advance(3);GeoPresence_Timer($c);
+            advance(90);my $time=$now;my $approach=form($cfg,'Drive',1,$time);
+            http($c,$approach);advance(3);GeoPresence_Timer($c);
+            ok(!$s->{arrival} && $s->{phase} eq 'returning','approach starts no Home wait');
+            advance(2);http($c,form($cfg,'Home',1,$time+$gap));advance(3);GeoPresence_Timer($c);
+            my $first={%{$s->{arrival}{event}}};my $start=$s->{arrival}{start_mono};
+            ok($s->{arrival}{vehicle_eligible},'remote trip initially permits the garage');
+            my $position=$s->{position_time};
+            advance(1);http($c,$approach.'&motion=walking');
+            if ($phone) {reading('p1','state','present',$now);reading('p1','presence','present',$now);}
+            actor_fresh();advance($phone?5:3);GeoPresence_Timer($c);
+            is($s->{motion},'walking',"approach supplement survives Home; gap=$gap phone=$phone");
+            is($s->{motion_time},$time,'walking retains the approach observation time');
+            if (!$phone) {
+                ok(!$s->{arrival}{vehicle_eligible},'walking revokes the remote garage fallback');
+                is_deeply($s->{arrival}{event},$first,'Home remains the original arrival evidence');
+                is($s->{arrival}{start_mono},$start,'Home receipt still anchors the wait');
+                is($s->{arrival}{due_mono},$start+60,'approach receipt does not move the Home deadline');
+                is($s->{position_time},$position,'approach supplement does not rewind position');
+                advance($s->{arrival}{due_mono}-$mono);actor_fresh();GeoPresence_Timer($c);
+            }
+            is_deeply([grep {/^(?:door|garage) /} @commands],['door lock unlocked'],
+                'timer or phone confirmation opens only the door');
+        }
+    }
+};
+
+subtest 'GP-F11-001: an early approach cannot requalify or consume its pending Home arrival' => sub {
+    my ($c,$cfg)=fixture();my $s=GP_State($c,'Geo.Test',0);
+    advance(40);process($s,$cfg,'Work',0);advance(50);
+    my $approach=ev('Drive',1,$now);GP_Process($s,$cfg,$approach,$now,$mono);
+    advance(20);process($s,$cfg,'Home',1);my $home={%{$s->{arrival}{event}}};
+    advance(1);GP_Process($s,$cfg,{%$approach,motion=>'walking',received=>$now,received_mono=>$mono},$now,$mono);
+    ok($s->{arrival} && $s->{trip}{armed},'valid Home wait remains pending despite the earlier approach time');
+    is($s->{arrival}{motion},'walking','pre-minimum-away approach supplies walking to the qualified Home arrival');
+    is_deeply($s->{arrival}{event},$home,'approach cannot replace the qualifying Home event');
+    is_deeply($s->{intents},[],'supplement cannot trigger immediate output');
+    complete_arrival($s,$cfg);actor_fresh();GP_Dispatch($c,'Geo.Test',$cfg,$s,0);
+    is_deeply(\@commands,['door lock unlocked'],'qualified Home arrival still opens only the door');
+};
+
+subtest 'GP-F11-001: an interrupted or superseded approach cannot donate motion to Home' => sub {
+    for my $boundary (qw(Home Drive Outer remote phone timeout newer_approach)) {
+        my ($c,$cfg)=fixture();my $s=GP_State($c,'Geo.Test',0);
+        advance(40);process($s,$cfg,'Work',0);advance(90);
+        my $approach=ev('Drive',1,$now);GP_Process($s,$cfg,$approach,$now,$mono);
+        advance(1);
+        if ($boundary eq 'phone') {
+            GP_Process($s,$cfg,{kind=>'phone_absent',generation=>$s->{generation},time=>$now,received=>$now,
+                negative_generation=>$s->{phone}{negative_generation}//0,negative_wall=>$now,negative_since=>$mono},$now,$mono);
+            ok(!$s->{approach} && $s->{phase} eq 'away','qualified phone absence ends the approach before Home');
+        } elsif ($boundary eq 'timeout') {
+            $cfg->{approach_timeout}=5;advance(5);GP_TickState($s,$cfg,$now,$mono);
+        } elsif ($boundary eq 'newer_approach') {
+            process($s,$cfg,'Drive',1);
+        } else {
+            process($s,$cfg,$boundary eq 'remote'?'Work':$boundary,0);
+            advance(61) if $boundary eq 'Outer' || $boundary eq 'Drive' || $boundary eq 'remote';
+        }
+        advance(1);process($s,$cfg,'Home',1);
+        ok($s->{arrival},"$boundary is followed by a separate valid Home arrival");
+        advance(1);GP_Process($s,$cfg,{%$approach,motion=>'walking',received=>$now,received_mono=>$mono},$now,$mono);
+        is($s->{arrival}{motion},'unknown',"$boundary prevents the old approach from supplying motion");
+        ok($s->{arrival}{vehicle_eligible},'unrelated old motion cannot change the garage decision');
+    }
+};
+
+subtest 'GP-F11-002: delayed exits interrupt the approach origin without rewinding position' => sub {
+    for my $zone (qw(Home Drive Outer)) {
+        for my $after_home (0,1) {
+            my ($c,$cfg)=fixture();my $s=GP_State($c,'Geo.Test',0);
+            $cfg->{zones}{'Z.Checkpoint'}{lat}=0.0009;$cfg->{zones}{'Z.Checkpoint'}{radius}=20;
+            advance(40);process($s,$cfg,'Drive',0);advance(90);
+            is($s->{trip}{scope},'local','garage needs a separate vehicle proof');
+            my $time=$now;my $approach=ev('Drive',1,$time);
+            GP_Process($s,$cfg,$approach,$now,$mono);
+            advance(20);process($s,$cfg,'Checkpoint',1);
+            if ($after_home) {
+                advance(10);process($s,$cfg,'Home',1);
+                advance(5);process($s,$cfg,'Home',1);
+            } else {advance(3);}
+            my $pending=$s->{arrival};
+            my $position=$s->{position_time};
+            my $visits=JSON::PP->new->canonical->encode([@$s{qw(zones members zone_visits group_visits)}]);
+            my $exit=ev($zone,0,$time+10);$exit->{received}=$now;$exit->{received_mono}=$mono;
+            GP_Process($s,$cfg,$exit,$now,$mono);
+            is($s->{position_time},$position,'late exit does not rewind the newer position');
+            is(JSON::PP->new->canonical->encode([@$s{qw(zones members zone_visits group_visits)}]),$visits,
+                'late exit does not replay memberships or visits');
+            ok(!$s->{approach},"$zone exit removes any pre-Home approach origin");
+            if ($after_home) {
+                is_deeply($s->{arrival}{event},$pending->{event},'exit before Home preserves the qualifying Home event');
+                is($s->{arrival}{start_mono},$pending->{start_mono},'exit before Home preserves the original wait anchor');
+                is($s->{arrival}{due_mono},$pending->{due_mono},'exit before Home does not postpone the deadline');
+                is_deeply($s->{arrival}{latest_home},$pending->{latest_home},'newest Home remains available for later exits');
+            } else {
+                advance(7);process($s,$cfg,'Home',1);
+            }
+            advance(10);GP_Process($s,$cfg,{%$approach,motion=>'automotive',received=>$now,received_mono=>$mono},$now,$mono);
+            ok(!$s->{arrival}{vehicle_eligible},"$zone exit rejects the interrupted automotive origin; after_home=$after_home");
+            is($s->{arrival}{motion},'unknown','old supplement does not change the pending motion');
+            if ($after_home) {
+                my $exit=ev($zone,0,$time+32);$exit->{received}=$now;$exit->{received_mono}=$mono;
+                GP_Process($s,$cfg,$exit,$now,$mono);
+                is($s->{arrival}{event}{key},$pending->{latest_home}{key},'a subsequent exit during Home restarts from the newest entry');
+                is($s->{arrival}{start_mono},$pending->{latest_home}{received_mono},'new wait uses that entry\'s original receipt');
+            }
+            complete_arrival($s,$cfg);actor_fresh();GP_Dispatch($c,'Geo.Test',$cfg,$s,0);
+            is_deeply(\@commands,['door lock unlocked'],'valid Home arrival opens only the door');
+        }
+    }
+};
+
+subtest 'GP-F11-002: HTTP filter retains an unchanged delayed exit before Home' => sub {
+    for my $case (qw(interrupted earlier_exit changed_geometry new_approach)) {
+        my ($c,$cfg)=fixture();my $s=GP_State($c,'Geo.Test',0);
+        advance(40);http($c,form($cfg,'Checkpoint',1,$now,latitude=>0.0009,radius=>20));advance(3);GeoPresence_Timer($c);
+        $cfg=GP_Config($c,'Geo.Test');
+        http($c,form($cfg,'Drive',0,$now));advance(3);GeoPresence_Timer($c);advance(90);
+        my $time=$now;my $approach=form($cfg,'Drive',1,$time);
+        http($c,$approach);advance(3);GeoPresence_Timer($c);
+        advance(17);http($c,form($cfg,'Checkpoint',1,$now));advance(3);GeoPresence_Timer($c);
+        my $position=$s->{position_time};
+        http($c,form($cfg,'Drive',0,$time+($case eq 'earlier_exit'?-1:10),
+            radius=>$case eq 'changed_geometry'?251:250));advance(3);GeoPresence_Timer($c);
+        is($s->{position_time},$position,'HTTP late exit retains the newer position');
+        is(GP_Config($c,'Geo.Test')->{zones}{'Z.Drive'}{radius},250,'late exit cannot restore different geometry');
+        if ($case eq 'new_approach') {
+            advance(1);$approach=form($cfg,'Drive',1,$now);
+            http($c,$approach);advance(3);GeoPresence_Timer($c);
+        }
+        advance(4);http($c,form($cfg,'Home',1,$now));advance(3);GeoPresence_Timer($c);
+        my $start=$s->{arrival}{start_mono};
+        advance(1);http($c,$approach.'&motion=automotive');advance(3);GeoPresence_Timer($c);
+        is($s->{arrival}{vehicle_eligible},$case eq 'interrupted'?0:1,"HTTP supplement respects $case");
+        is($s->{arrival}{start_mono},$start,'supplement does not restart the Home wait');
+        advance($s->{arrival}{due_mono}-$mono);actor_fresh();GeoPresence_Timer($c);
+        is_deeply([grep {/^(?:door|garage) /} @commands],$case eq 'interrupted'?['door lock unlocked']:['door lock unlocked','garage on'],
+            'actual actor commands follow the valid motion origin');
+    }
+};
+
+subtest 'GP-F11-002: late exits revoke cached approach motion and retain newer Home motion' => sub {
+    for my $home_motion (qw(unknown automotive walking)) {
+        my ($c,$cfg)=fixture();my $s=GP_State($c,'Geo.Test',0);
+        $cfg->{arrival_wait_automotive}=60;
+        advance(40);process($s,$cfg,'Drive',0);advance(90);
+        my $time=$now;process($s,$cfg,'Drive',1,'automotive');
+        advance(35);process($s,$cfg,'Home',1,$home_motion);my $first=$s->{arrival};
+        ok($s->{arrival}{vehicle_eligible},'approach automotive initially qualifies the garage');
+        advance(3);my $exit=ev('Drive',0,$time+10);$exit->{received}=$now;$exit->{received_mono}=$mono;
+        GP_Process($s,$cfg,$exit,$now,$mono);
+        is($s->{arrival}{vehicle_eligible},$home_motion eq 'automotive'?1:0,'only newer Home automotive can retain vehicle permission');
+        is($s->{arrival}{motion},$home_motion,'motion before the exit is cleared and newer motion is retained');
+        is($s->{arrival}{start_mono},$first->{start_mono},'reevaluation keeps the original Home receipt');
+        complete_arrival($s,$cfg);actor_fresh();GP_Dispatch($c,'Geo.Test',$cfg,$s,0);
+        is_deeply(\@commands,$home_motion eq 'automotive'?['door lock unlocked','garage on']:['door lock unlocked'],
+            'commands use only motion after the interruption');
+    }
+};
+
+subtest 'GP-F11-003: a pre-Home exit preserves the latched walking veto after its TTL' => sub {
+    for my $zone (qw(Home Drive Outer)) {
+        for my $phone (0,1) {
+            my ($c)=fixture();mode('GP','debug');attribute('GP','motion_max_age',20);mode('GP','active');
+            GeoPresence_Timer($c);
+            my $cfg=GP_Config($c,'Geo.Test');my $s=GP_State($c,'Geo.Test',0);
+            is($cfg->{motion_max_age},20,'short motion TTL is accepted through the attribute callback');
+            advance(40);is((http($c,form($cfg,'Work',0,$now)))[0],200,'remote departure accepted');
+            advance(3);GeoPresence_Timer($c);advance(90);
+            my $time=$now;http($c,form($cfg,'Drive',1,$time));advance(3);GeoPresence_Timer($c);
+            advance(7);http($c,form($cfg,'Home',1,$now,motion=>'walking'));advance(3);GeoPresence_Timer($c);
+            my $first={%{$s->{arrival}}};
+            ok(!$first->{vehicle_eligible},'fresh Home walking initially vetoes the remote fallback');
+            advance(27);http($c,form($cfg,$zone,0,$time+5));advance(3);GeoPresence_Timer($c);
+            cmp_ok($now-$s->{motion_time},'>',$cfg->{motion_max_age},'Home walking has aged beyond its TTL');
+            ok(!$s->{arrival}{vehicle_eligible},"$zone exit cannot age the walking veto into permission; phone=$phone");
+            is($s->{arrival}{motion},'walking','unaffected accepted motion stays latched');
+            is($s->{arrival}{due_mono},$first->{due_mono},'pre-Home interruption leaves the original deadline');
+            is_deeply($s->{arrival}{event},$first->{event},'original Home event and receipt remain intact');
+            is($s->{arrival}{origin_time},$first->{event}{time},'older approach origins are still revoked');
+            if ($phone) {
+                advance(1);
+                reading('p1','state','present',$now);reading('p1','presence','present',$now);
+                advance(5);
+            } else {advance($s->{arrival}{due_mono}-$mono);}
+            actor_fresh();GeoPresence_Timer($c);
+            is_deeply([grep {/^(?:door|garage) /} @commands],['door lock unlocked'],
+                'timer or phone confirms the door without a garage command');
+        }
+    }
+};
+
+subtest 'GP-F11-003: only revoked motion is reassessed at its original evaluation time' => sub {
+    for my $case ([walking=>'unknown',1,'unknown'],[automotive=>'walking',0,'walking'],
+                  [automotive=>'running',0,'running'],[automotive=>'cycling',0,'cycling'],
+                  [unknown=>'automotive',1,'automotive'],[unknown=>'walking',1,'automotive','automotive']) {
+        my ($approach_motion,$home_motion,$eligible,$retained,$new_motion)=@$case;
+        my ($c)=fixture();mode('GP','debug');attribute('GP','motion_max_age',20);
+        attribute('GP','arrival_wait_'.$_,60) for qw(running cycling automotive);
+        mode('GP','active');GeoPresence_Timer($c);
+        my $cfg=GP_Config($c,'Geo.Test');my $s=GP_State($c,'Geo.Test',0);
+        advance(40);process($s,$cfg,'Work',0);advance(90);my $time=$now;
+        process($s,$cfg,'Drive',1,$approach_motion);advance(10);process($s,$cfg,'Home',1,$home_motion);
+        my $first={%{$s->{arrival}}};advance(33);
+        my $exit=ev('Drive',0,$time+5);$exit->{received}=$now;$exit->{received_mono}=$mono;
+        GP_Process($s,$cfg,$exit,$now,$mono);
+        if ($new_motion) {
+            ok(!$s->{arrival}{vehicle_eligible},'walking veto persists until new vehicle evidence');
+            advance(1);process($s,$cfg,'Home',1,$new_motion);
+        }
+        is($s->{arrival}{vehicle_eligible},$eligible,"$approach_motion before exit, $home_motion after exit: correct vehicle decision");
+        is($s->{arrival}{motion},$retained,'revoked motion is removed and unaffected motion retains its accepted validity');
+        is($s->{arrival}{start_mono},$first->{start_mono},'reassessment retains the Home receipt');
+        is($s->{arrival}{due_mono},$first->{due_mono},'unchanged configured wait retains the original deadline');
+        complete_arrival($s,$cfg);actor_fresh();GP_Dispatch($c,'Geo.Test',$cfg,$s,0);
+        is_deeply(\@commands,$eligible?['door lock unlocked','garage on']:['door lock unlocked'],
+            'output follows the surviving evidence rather than elapsed TTL alone');
+    }
+};
+
+subtest 'F-11: supplements cannot replace newer motion or enter another arrival' => sub {
+    for my $newer (qw(walking automotive)) {
+        my ($c,$cfg,$s)=pending_fixture('unknown');my $old={%{$s->{arrival}{event}}};
+        advance(5);process($s,$cfg,'Home',1,$newer);my $time=$s->{motion_time};
+        advance(1);GP_Process($s,$cfg,{%$old,motion=>$newer eq 'walking'?'automotive':'walking',
+            received=>$now,received_mono=>$mono},$now,$mono);
+        is($s->{arrival}{motion},$newer,'newer useful motion is retained');
+        is($s->{motion_time},$time,'older supplement cannot replace the newer timestamp');
+    }
+    my ($c,$cfg,$s)=pending_fixture('unknown');my $old={%{$s->{arrival}{event}}};
+    advance(5);process($s,$cfg,'Home',0);advance(1);process($s,$cfg,'Home',1);
+    my $current={%{$s->{arrival}{event}}};
+    advance(1);GP_Process($s,$cfg,{%$old,motion=>'walking',received=>$now,received_mono=>$mono},$now,$mono);
+    is($s->{arrival}{motion},'unknown','a cancelled arrival cannot provide motion to its successor');
+    is_deeply($s->{arrival}{event},$current,'successor keeps its own original evidence');
+};
+
+subtest 'F-11: an unaccepted origin or changed old geometry cannot supply motion' => sub {
+    for my $case (qw(unseen geometry)) {
+        my ($c,$cfg)=fixture();my $s=GP_State($c,'Geo.Test',0);
+        advance(40);http($c,form($cfg,'Work',0,$now));advance(3);GeoPresence_Timer($c);
+        advance(90);my $time=$now;http($c,form($cfg,'Home',1,$time));advance(3);GeoPresence_Timer($c);
+        advance(2);http($c,form($cfg,'Home',1,$now));advance(3);GeoPresence_Timer($c);
+        my $body=form($cfg,'Home',1,$time-($case eq 'unseen'?1:0),motion=>'walking',
+            radius=>$case eq 'geometry'?55:50);
+        is((http($c,$body))[0],200,'late observation is accepted by the HTTP adapter');
+        advance(3);GeoPresence_Timer($c);
+        is($s->{arrival}{motion},'unknown',"$case observation cannot supplement the current arrival");
+        ok($s->{arrival}{vehicle_eligible},'unrelated evidence does not rewrite the cached vehicle decision');
+        is(GP_Config($c,'Geo.Test')->{zones}{'Z.Home'}{radius},50,'old geometry is not restored');
+    }
+};
+
+subtest 'F-11: a late exit still uses the newest Home entry after motion enrichment' => sub {
+    my ($c,$cfg,$s)=pending_fixture('unknown');my $old={%{$s->{arrival}{event}}};
+    advance(5);process($s,$cfg,'Home',1);my $latest={%{$s->{arrival}{latest_home}}};
+    advance(3);GP_Process($s,$cfg,{%$old,motion=>'walking',received=>$now,received_mono=>$mono},$now,$mono);
+    my $exit=ev('Home',0,$old->{time}+3);$exit->{received}=$now;$exit->{received_mono}=$mono;
+    GP_Process($s,$cfg,$exit,$now,$mono);
+    is($s->{arrival}{event}{key},$latest->{key},'interruption restarts at the actually newer Home entry');
+    is($s->{arrival}{start_mono},$latest->{received_mono},'restart retains that entry\'s original receipt');
+    is($s->{arrival}{motion},'unknown','motion before the intervening exit is not carried over');
+    is($s->{arrival}{due_mono},$latest->{received_mono}+60,'interruption requires a new complete wait');
+};
+
 done_testing();

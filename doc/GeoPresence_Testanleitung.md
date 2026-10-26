@@ -1,6 +1,6 @@
 # GeoPresence – Testanleitung
 
-**Version 4.15 · Stand 26.10.2026 · Handbuch 2.19 · Architektur 0.57**
+**Version 4.20 · Stand 26.10.2026 · Handbuch 2.24 · Architektur 0.62**
 
 Diese Anleitung beschreibt die Prüfung einer eingerichteten GeoPresence-Anlage. Die Testanwendung simuliert Alltagswege und prüft deren neue Diagnosezeilen; gezielte App-Tests prüfen eigene Orts- und Gruppenregeln. Einrichtung, Begriffe und Parameter stehen im [Handbuch](GeoPresence_Handbuch.md).
 
@@ -142,6 +142,12 @@ Damit wird Test 17 ergänzt. Ein solcher Helferort ist eine normale location mit
 | 16 – Nur Geofency mit Home-Sprung | Fernausflug, kurzer Home-Eintritt mit walking und erneuter Austritt | Keine vorzeitige Öffnung |
 | 17 – Nur Geofency mit Helferort | Home verlassen, ausreichend entfernten Helferort erreichen, zu Fuß zurückkehren | Tür nach bestätigter Rückkehr, keine Garage |
 | 18 – Nur Geofency ohne Home-Rückkehr | Fernausflug, Home-Eintritt fehlt | Keine erfundene Telefonbestätigung, keine Öffnung |
+
+Die zusätzlichen Repository-Prüfungen in `t/geopresence.t` und `t/geopresence_fhem_integration.py` decken GP-F11-001 ab: Eine Annäherung ohne Bewegung wird vor Home verarbeitet; erst danach trifft die Wiederholung derselben Annäherung mit `walking` ein. Annäherung und Home haben dabei gleiche oder aufeinanderfolgende Beobachtungszeiten. Sowohl nach Ablauf der Home-Frist als auch bei früherer Telefonbestätigung darf ausschließlich die Tür angefordert werden. Die ursprünglichen Home-Zeitanker bleiben erhalten; unterbrochene oder abgelaufene Annäherungen dürfen keine Bewegung in eine spätere Ankunft übertragen.
+
+Für GP-F11-002 folgt auf die Annäherung zunächst eine neuere Meldung eines nahen Ortes. Danach trifft ein zeitlich dazwischenliegender Austritt verspätet ein, vor oder nach der Home-Meldung. Der Automotive-Nachtrag zur unterbrochenen Annäherung darf die Garage nicht freigeben. Ein gültiger Home-Eintritt behält seine ursprüngliche Frist; Position, Besuche und neuere gültige Bewegungsdaten bleiben erhalten. Die Prüfung verwendet eine lokale Reise, damit kein Fernbereichs-Ersatz den unzulässigen Bewegungsnachweis verdeckt.
+
+Für GP-F11-003 wird dagegen ein bestätigter Fernausflug mit `motion_max_age 20` verwendet. Home meldet frisches `walking`; erst nach mehr als 20 Sekunden kommt ein zeitlich vor Home liegender Austritt an. Die gespeicherte Fußwegsperre muss sowohl bei Timer- als auch bei Telefonbestätigung die Garage weiterhin sperren. Eine Zusatzprüfung entfernt einen früheren Automotive-Nachweis, ohne die später akzeptierte Fußwegsperre durch ihr Alter zu verlieren. Echte neue Bewegungsnachweise dürfen die Entscheidung weiterhin ändern.
 
 Jedes Szenario stellt seinen Ausgangszustand selbst her. Vorbereitungsaktionen, etwa eine Arbeitsankunft zum Herstellen der Startposition, werden getrennt geprüft. Das Programm kontrolliert sowohl erwartete Pläne als auch ausdrücklich ausbleibende Pläne und passende Diagnosegründe.
 

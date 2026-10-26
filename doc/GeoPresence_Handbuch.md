@@ -1,6 +1,6 @@
 # GeoPresence – Handbuch
 
-**Version 2.19 · Stand 26.10.2026 · Architektur 0.57**
+**Version 2.24 · Stand 26.10.2026 · Architektur 0.62**
 
 GeoPresence ist eine Anwesenheits- und Ortssteuerung für FHEM. Es wertet aus, wer zu Hause ist, wer das Haus verlassen hat und wer zurückkehrt, und verbindet diese Informationen mit konfigurierbaren Automationen. So lässt sich beispielsweise beim Betreten eines Gartenbereichs ein Licht einschalten, beim Erreichen eines Arbeitsortes eine Nachricht senden oder bei einer berechtigten Heimkehr die vorhandene Tür- und Garagensteuerung ansprechen. Ziel ist, solche Aktionen passend zur Situation auszuführen und Fehlreaktionen auf einzelne unzuverlässige Meldungen zu vermeiden.
 
@@ -765,7 +765,7 @@ Interaktive Änderungen prüfen diese Beziehung vor der Übernahme. Bei Neustart
 |---|---:|---|
 | `action_max_age` | 90 | Höchstalter von Beobachtung und Empfang für Aktionsverarbeitung |
 | `future_tolerance` | 30 | Toleranz für zukünftige Beobachtungszeiten; auch Schutz nach neuem Sitzungsbeginn |
-| `reorder_window` | 2 | Kurze Sammlung zur zeitlichen Sortierung eingehender Meldungen |
+| `reorder_window` | 2 | Feste Sortierfrist eines Bündels ab dem ersten Empfang |
 | `departure_grace` | 60 | Home-Austritt vor vorläufigem `absent`; allein keine Öffnungsberechtigung |
 | `minimum_away` | 60 | Mindestabstand von bestätigender Entfernungsbeobachtung bis Rückkehr |
 | `phone_absence_window` | 180 | Zusammenhängende vollständige Telefonabwesenheit |
@@ -783,7 +783,15 @@ Interaktive Änderungen prüfen diese Beziehung vor der Übernahme. Bei Neustart
 | `trip_resume_max_age` | 172800 | Höchstalter der ursprünglichen Abwesenheitsbestätigung für Wiederherstellung eines offenen Ausflugs nach Neustart/Reload; 48 Stunden |
 | `departure_margin` | 200 | Zusätzlicher Abstand zwischen Home-Kreis und entferntem Ortskreis |
 
+Nach Ablauf von `reorder_window` verarbeitet der nächste Timerlauf alle bis dahin eingegangenen Meldungen derselben Person und desselben Produktiv- beziehungsweise Debug-Bereichs. Neue Meldungen verlängern dieses Sortierfenster nicht. Jüngere Gegenmeldungen im Bündel werden ebenfalls vor einer möglichen Öffnung ausgewertet.
+
 Die Ankunftsfrist beginnt beim Empfang des ersten gültigen Home-Eintritts eines berechtigten Ausflugs. Eine neue Austrittsmeldung bricht die Vormerkung ab; ein neuer lokaler Telefon-Ankunftsnachweis kann sie im kombinierten Profil früher bestätigen. Wiederholte Eintritte starten die Frist nicht beliebig neu. Für `geofency_only` muss ein umschließender Entfernungsnachweis zusätzlich auch an seiner Home nächstgelegenen Grenze mehr als `departure_margin` Abstand besitzen.
+
+Ein noch frischer Bewegungsnachtrag zu einem bereits angenommenen Eintritt kann dieselbe wartende Ankunft ergänzen, auch wenn inzwischen neuere Home-Meldungen ohne Bewegung eingegangen sind. Das gilt auch für die unmittelbar vorausgehende gültige Annäherung, selbst bei gleicher Beobachtungszeit wie Home. Ein nachgereichtes `walking` sperrt dann weiterhin die Garage. Neuere bekannte Bewegung wird nicht überschrieben; Zeitstempel und Beginn der Wartezeit werden nicht erneuert. Die Home-Frist und die Mindestabwesenheit richten sich weiterhin nach dem ursprünglichen Home-Eintritt. Die Ergänzung löst selbst keine Aktionen aus und öffnet keine abgeschlossene oder abgebrochene Ankunft erneut.
+
+Ein verspäteter Austritt aus Home, Annäherung oder Außenbereich unterbricht auch eine noch nicht zu Home übernommene Annäherung. Eine inzwischen neuere Meldung eines nahen Ortes macht diesen Abbruch nicht unwirksam. Ein späterer Bewegungsnachtrag aus dem unterbrochenen Abschnitt darf die Garage nicht freigeben. Liegt der Austritt zeitlich vor einem bereits gemeldeten gültigen Home-Eintritt, bleibt dessen ursprüngliche Wartezeit erhalten; neuere gültige Bewegungsdaten bleiben berücksichtigt.
+
+Dabei bleibt auch eine bereits gespeicherte Home-Fußwegsperre wirksam, wenn die Bewegung inzwischen älter als `motion_max_age` ist. Beispielsweise dürfen 20 Sekunden Bewegungsgültigkeit bei 60 Sekunden Home-Frist durch einen davor liegenden verspäteten Austritt keine Garagenfreigabe erzeugen. Entwertet der Austritt einen früheren Automotive-Nachweis, bleibt die ursprünglich gültige Wirkung späterer Fußweginformationen berücksichtigt. Neue gültige Bewegungsdaten können die Entscheidung weiterhin ändern.
 
 Die Gültigkeit eines Befehls wird direkt vor seiner Ausgabe mit den aktuellen Uhren geprüft. Das monotone Zeitbudget beginnt beim ursprünglichen Empfang und bleibt auch während der Warteschlange und der Ankunftsfrist verankert. Ein langsamer Geräteaufruf oder eine rückwärts korrigierte Systemzeit verlängert die Frist der nachfolgenden Befehle nicht. Die vorgesehene Ankunftsfrist bleibt dabei berücksichtigt.
 
