@@ -1,6 +1,6 @@
 # GeoPresence – Handbuch
 
-**Version 2.16 · Stand 25.10.2026 · Architektur 0.54**
+**Version 2.19 · Stand 26.10.2026 · Architektur 0.57**
 
 GeoPresence ist eine Anwesenheits- und Ortssteuerung für FHEM. Es wertet aus, wer zu Hause ist, wer das Haus verlassen hat und wer zurückkehrt, und verbindet diese Informationen mit konfigurierbaren Automationen. So lässt sich beispielsweise beim Betreten eines Gartenbereichs ein Licht einschalten, beim Erreichen eines Arbeitsortes eine Nachricht senden oder bei einer berechtigten Heimkehr die vorhandene Tür- und Garagensteuerung ansprechen. Ziel ist, solche Aktionen passend zur Situation auszuführen und Fehlreaktionen auf einzelne unzuverlässige Meldungen zu vermeiden.
 
@@ -196,6 +196,8 @@ attr rr_PERSON rr_locationUnderway underway
 ```
 
 GeoPresence verwaltet die Anwesenheit dieses ROOMMATE-Geräts. Parallel arbeitende Automationen, die denselben Status oder dieselben Türaktionen auslösen, müssen vor der Produktivfreigabe bewusst abgegrenzt werden. Ein externer Wechsel auf `home` gilt als manuelle Heimkehr und widerruft die laufende Öffnungsberechtigung.
+
+Der Widerruf stoppt auch bereits vorgemerkte Folgebefehle. Setzt beispielsweise ein Rückruf des Türbefehls den ROOMMATE manuell auf `home`, wird der folgende Garagenbefehl nicht mehr ausgeführt. Die Rückmeldung für den bereits ausgegebenen Türbefehl wird trotzdem weiter erfasst.
 
 ### 3.2 Person und Quellen einrichten
 
@@ -701,6 +703,10 @@ Normale englische Aktionsmeldungen stehen im FHEM-Log. Ausführliche technische 
 
 Eine neue Person und ihre privaten Orte können bei aktivem Controller eingerichtet werden. Für Änderungen an einer bestehenden Person diese mit `set Geo.PERSON mode disabled` oder `debug` pausieren; ihre Reisen werden verworfen, andere Personen bleiben unbeeinflusst. Änderungen an gemeinsam verwendeten Regeln oder Aktionen erfordern das Pausieren aller betroffenen Personen, einschließlich bisheriger und neu hinzugefügter Regelmitglieder. Alternativ setzt `set System.GeoPresence mode debug` alle freigegebenen Personen in Simulation. Controller-Parameter benötigen Controller debug oder disabled. Ablehnungen nennen die noch aktiven Betroffenen. Nach Validierung die zuvor produktiven Personen ausdrücklich wieder aktivieren.
 
+Diese Schutzprüfung gilt auch beim Löschen aller Attribute oder beim Löschen über ein Muster, sobald Fachparameter betroffen sind. Reine Änderungen oder Löschungen eines Alias bleiben während des Betriebs möglich und brechen keine gültigen Folgebefehle ab.
+
+Das gilt auch für Aliaslöschmuster wie `deleteattr rr_PERSON ^alias$`. Beanstandet die Validierung alte Attribute wie `role`, `condition`, `mode` oder `operatingMode`, berücksichtigt die nächste Validierung auch deren Löschung über ein Muster. Ein Reload ist dafür nicht nötig.
+
 Eine weitere Person durchläuft Kapitel 3 bis 7 mit eigenen Namen, Zugangsdaten und Ortskennungen. Gemeinsame Aktionen können wiederverwendet werden; die `residents`-Listen der gewünschten Regeln ausdrücklich erweitern. Für eine gemeinsame Gruppenregel müssen alle ausgewählten Personen passende eigene Orte mit demselben Gruppennamen besitzen.
 
 FHEMWEB bietet feste Werte als Dropdowns und Geräteverweise als Auswahl an. Bei Regeln entscheidet `trigger`, ob Ortsauswahl oder `arrivalFilter` relevant ist. `locations` und `locationGroup` schließen sich aus: Vor dem Wechsel das bisherige Attribut mit `deleteattr` entfernen. Auch nach einem Quellenwechsel nennt `validate` unbenutzte gespeicherte Attribute, die du ausdrücklich löschen kannst.
@@ -778,6 +784,8 @@ Interaktive Änderungen prüfen diese Beziehung vor der Übernahme. Bei Neustart
 | `departure_margin` | 200 | Zusätzlicher Abstand zwischen Home-Kreis und entferntem Ortskreis |
 
 Die Ankunftsfrist beginnt beim Empfang des ersten gültigen Home-Eintritts eines berechtigten Ausflugs. Eine neue Austrittsmeldung bricht die Vormerkung ab; ein neuer lokaler Telefon-Ankunftsnachweis kann sie im kombinierten Profil früher bestätigen. Wiederholte Eintritte starten die Frist nicht beliebig neu. Für `geofency_only` muss ein umschließender Entfernungsnachweis zusätzlich auch an seiner Home nächstgelegenen Grenze mehr als `departure_margin` Abstand besitzen.
+
+Die Gültigkeit eines Befehls wird direkt vor seiner Ausgabe mit den aktuellen Uhren geprüft. Das monotone Zeitbudget beginnt beim ursprünglichen Empfang und bleibt auch während der Warteschlange und der Ankunftsfrist verankert. Ein langsamer Geräteaufruf oder eine rückwärts korrigierte Systemzeit verlängert die Frist der nachfolgenden Befehle nicht. Die vorgesehene Ankunftsfrist bleibt dabei berücksichtigt.
 
 ### 9.2 Personen und Orte
 

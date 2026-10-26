@@ -1592,6 +1592,109 @@ def run(source, encoding="bytestream", help_only=False):
             actor_reading("upper", "state", "closed")
             actor_reading("lower", "state", "open")
             advance(1)
+            # R-07: use actual FHEM notify callbacks during the first dummy
+            # opening. A short age budget makes a real 1.5 s stall sufficient.
+            check(command("define rr_R07 ROOMMATE") == "", "prepare unrelated R-07 resident")
+            for reason, callback in (("manual Home", "set rr_Test home"),
+                                     ("expired", "{ Time::HiRes::sleep(1.5) }"),
+                                     ("unrelated configuration", "define Geo.R07 GeoPresence resident GP rr_R07"),
+                                     ("alias", "attr Geo.Test alias R07 name"),
+                                     ("alias deletion", "deleteattr Geo.Test alias"),
+                                     ("ROOMMATE alias pattern", "deleteattr rr_Test ^alias$"),
+                                     ("ROOMMATE alias class pattern", "deleteattr rr_Test [a]lias"),
+                                     ("ROOMMATE alias spaced pattern", "deleteattr rr_Test (?x) ^ alias $"),
+                                     ("ROOMMATE functional pattern", "deleteattr rr_Test ^(alias|rr_locationUnderway)$"),
+                                     ("controller pattern", "{ $main::GP_fixture_delete_result=CommandDeleteAttr(undef,'GP action_max_ag.') }"),
+                                     ("controller all", "{ $main::GP_fixture_delete_result=CommandDeleteAttr(undef,'GP') }"),
+                                     ("clock correction during wait", "{ Time::HiRes::sleep(2.5) }")):
+                check(command("set GP mode debug") == "", "pause R-07 fixture")
+                check(command("attr GP reorder_window 0.1") == "", "short R-07 reorder window")
+                check(command("attr GP action_max_age 2") == "", "short R-07 output budget")
+                check(command("set GP mode active") == "", "activate R-07 fixture")
+                if reason.startswith("ROOMMATE"):
+                    check(command("attr rr_Test alias R07 label") == "", "prepare a real ROOMMATE alias")
+                advance(40)
+                phone_state("p1", "absent")
+                phone_state("p2", "absent")
+                advance(5)
+                check(request("Outer", 0)[0] == 200, "R-07 remote departure accepted")
+                advance(1)
+                advance(90)
+                refresh_actor_contacts()
+                command("set door untouched")
+                command("set garage untouched")
+                check(command("define R07.Door notify door:lock.unlocked " + callback) == "",
+                      "R-07 synchronous callback installed: " + reason)
+                correction = reason == "clock correction during wait"
+                check(request("Home", 1, motion="unknown" if correction else "automotive")[0] == 200,
+                      "R-07 Home observation accepted")
+                advance(1)
+                planned = json.loads(command("get GP explain Geo.Test prod format=json"))["state"]
+                check(planned["arrival"]["wait"] == (60 if correction else 10), "R-07 arrival retains its normal wait")
+                if correction:
+                    advance(49)
+                    command("{ no warnings 'redefine';; *GP_Now=sub { Time::HiRes::time()+$main::GP_fixture_offset-10 };; return 'wall corrected' }")
+                advance(10)
+                check(command("{ ReadingsVal('door','state','') }") == "lock unlocked",
+                      "R-07 first door command executes: " + reason)
+                unrelated = reason == "unrelated configuration"
+                allowed = reason not in ("manual Home", "expired", "clock correction during wait", "ROOMMATE functional pattern")
+                check(command("{ ReadingsVal('garage','state','') }") == ("on" if allowed else "untouched"),
+                      "R-07 remaining garage command respects current permission: " + reason)
+                changed = json.loads(command("get GP explain Geo.Test prod format=json"))["state"]
+                if allowed:
+                    permission_valid = changed["output_revision"] == planned["output_revision"]
+                elif reason in ("manual Home", "ROOMMATE functional pattern"):
+                    permission_valid = changed["output_revision"] > planned["output_revision"]
+                else:
+                    permission_valid = any(row["reason"] == "intent expired" for row in changed["trace"])
+                check(permission_valid, "R-07 permission change is scoped to the affected resident")
+                check(("garage" in json.loads(command("get GP explain Geo.Test prod format=json"))["pending_actors"]) == allowed,
+                      "R-07 reserves only commands that were actually issued")
+                check(command("delete R07.Door") == "", "remove R-07 callback")
+                if reason.startswith("ROOMMATE"):
+                    check(command("{ AttrVal('rr_Test','alias','missing') }") == "missing", "ROOMMATE pattern actually removed the alias")
+                    check(command("{ GP_Config($defs{GP},'Geo.Test',0)->{label} }") == "rr_Test",
+                          "ROOMMATE pattern refreshes the cached message label")
+                    check(command("attr rr_Test rr_locationUnderway underway") == "", "restore ROOMMATE guard")
+                if reason.startswith("controller"):
+                    check("Controller configuration requires" in command("{ $main::GP_fixture_delete_result }"),
+                          "R-07 rejects the real controller bulk deletion before committing it")
+                    check(command("{ AttrVal('GP','action_max_age','missing') }") == "2",
+                          "R-07 rejected bulk deletion retains the original age")
+                if correction:
+                    command("{ no warnings 'redefine';; *GP_Now=sub { Time::HiRes::time()+$main::GP_fixture_offset };; return 'wall restored' }")
+                if unrelated:
+                    check(command("delete Geo.R07") == "", "remove unrelated R-07 resident")
+                if allowed:
+                    actor_reading("gate", "state", "open")
+                    actor_reading("upper", "state", "open")
+                    actor_reading("lower", "state", "closed")
+                actor_reading("feedback", "pulse_state", "confirmed")
+                advance(1)
+                check(json.loads(command("get GP explain Geo.Test prod format=json"))["state"]["door_result"] == "confirmed",
+                      "R-07 retains feedback for the issued door command")
+            check(command("delete rr_R07") == "", "remove unrelated R-07 ROOMMATE")
+            command("set GP mode debug")
+            command("deleteattr GP action_max_age")
+            command("deleteattr GP reorder_window")
+            command("set GP mode active")
+            # Reproduce attributes left by an older module before warming the
+            # real validation cache, then use actual FHEM deletion commands.
+            for name, keys, pattern in (("R.Door", "role condition", "^(role|condition)$"),
+                                        ("R.Door", "role condition", "(?x) ^ (role | condition) $"),
+                                        ("GP", "mode operatingMode", "^(mode|operatingMode)$"),
+                                        ("Geo.Test", "mode operatingMode", "^(mode|operatingMode)$")):
+                check(command("set GP mode debug") == "", "pause obsolete-attribute fixture")
+                check(command("{ $attr{'" + name + "'}{$_}='obsolete' for qw(" + keys + ");; "
+                              "GP_InvalidateConfig($defs{GP});; return 'seeded' }") == "seeded",
+                      "restore legacy attributes for " + name)
+                invalid = command("get GP validate Geo.Test")
+                check(not invalid.startswith("OK:") and all(key in invalid for key in keys.split()),
+                      "real validation caches the obsolete attribute errors")
+                check(command("deleteattr " + name + " " + pattern) == "", "real obsolete-attribute pattern accepted")
+                check(command("get GP validate Geo.Test").startswith("OK:"), "cleaned attributes refresh real validation")
+                check(command("set GP mode active") == "", "cleaned configuration activates without a reload")
             # Real departures with lagging indoor presence (19/20 September),
             # including negatives already qualifying before the outer webhook.
             for label, outbound, away, early_negative, motion in (

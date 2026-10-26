@@ -50,6 +50,12 @@ sub diagnostic_lines {
 sub getKeyValue { return (undef,$keys{$_[0]}); }
 sub setKeyValue { defined($_[1]) ? ($keys{$_[0]}=$_[1]) : delete($keys{$_[0]}); return; }
 sub deviceEvents { return $_[0]{CHANGED}; }
+sub getAllAttr {
+    my ($name)=@_;
+    return join(' ',qw(alias room group icon verbose comment eventMap userReadings disable),
+        ($defs{$name}{TYPE}//'') eq 'ROOMMATE' ? qw(rr_locationUnderway rr_geofenceUUIDs) : (),
+        keys %{$attr{$name}//{}});
+}
 sub setNotifyDev { $_[0]{NOTIFYDEV}=$_[1]; }
 require "$FindBin::Bin/../FHEM/98_GeoPresence.pm";
 {
@@ -90,6 +96,16 @@ sub attribute {
     config_event("ATTR $name $key $value") if $init_done;
     return;
 }
+sub delete_attributes {
+    my ($name,$pattern)=@_;
+    my $error=GeoPresence_Attr('del',$name,$pattern);
+    return $error if defined $error;
+    if (defined $pattern) {
+        delete $attr{$name}{$_} for grep {/^$pattern$/} keys %{$attr{$name}//{}};
+    } else { delete $attr{$name}; }
+    config_event('DELETEATTR '.$name.(defined($pattern)?' '.$pattern:'')) if $init_done;
+    return;
+}
 sub config_event { GeoPresence_Notify($defs{GP},{NAME=>'global',CHANGED=>[@_]}); }
 sub mode { my ($name,$value)=@_; my $error=GeoPresence_Set($defs{$name},$name,'mode',$value); die $error if defined $error; return; }
 sub fixture {
@@ -105,6 +121,7 @@ sub fixture {
     device('door','dummy');device('contact','dummy');device('feedback','DOIF');
     device('garage','dummy');device('gate','dummy');device('upper','dummy');device('lower','dummy');
     my $c=gp_define('GP','controller'); $attr{GP}=$options{omit_webhook_port} ? {}:{webhookPort=>8090}; GP_StoreMode($defs{GP},'debug');
+    $attr{GP}{action_max_age}=$options{action_max_age} if exists $options{action_max_age};
     gp_define('Geo.Test','resident GP rr_Test');
     $attr{'Geo.Test'}={deviceId=>'DEVICE',webhookUser=>'user',sourceMode=>'geofency_phone',phoneProxies=>'p1,p2,p3',phoneSignalMode=>'measurement',allowDoor=>1,allowGarage=>1}; GP_StoreMode($defs{'Geo.Test'},'active');
     $keys{'GeoPresence_Geo.Test_auth'}='a'x32 . ':'.Digest::SHA::sha256_hex('a'x32 . ':'.'password123456789012345678');
@@ -138,7 +155,9 @@ sub ev {
 sub new_state { GP_NewState($now,$mono,'test'); }
 sub process {
     my ($s,$cfg,$zone,$entry,$motion)=@_;
-    GP_Process($s,$cfg,ev($zone,$entry,$now,$motion),$now,$mono);
+    my $e=ev($zone,$entry,$now,$motion);
+    $e->{zone}=$cfg->{zone_ids}{lc $zone}[0] if @{$cfg->{zone_ids}{lc $zone}//[]};
+    GP_Process($s,$cfg,$e,$now,$mono);
     return $s->{intents};
 }
 # Existing actor/permission regressions request a completed Home arrival.
@@ -193,6 +212,38 @@ sub feed_house_phone {
 sub actor_fresh {
     reading('contact','state','closed',$now);reading('feedback','pulse_state','idle',$now);
     reading('gate','state','off',$now);reading('upper','state','open',$now);reading('lower','state','closed',$now);
+}
+sub shared_actor_fixture {
+    my ($c)=fixture();
+    {
+        local $init_done=0;
+        device('rr_Other','ROOMMATE');$attr{rr_Other}{rr_locationUnderway}='underway';
+        gp_define('Geo.Other','resident GP rr_Other');
+        $attr{'Geo.Other'}={%{$attr{'Geo.Test'}},deviceId=>'other-device',webhookUser=>'other-user'};
+        $keys{'GeoPresence_Geo.Other_auth'}=$keys{'GeoPresence_Geo.Test_auth'};
+        GP_StoreMode($defs{'Geo.Other'},'active');
+        for my $n (sort grep {/^Z\./} keys %defs) {
+            (my $other=$n)=~s/^Z\./O./;
+            gp_define($other,'location Geo.Other '.$defs{$n}{ROLE});
+            $attr{$other}={%{$attr{$n}}};
+            my $g=JSON::PP::decode_json(GP_Read($n,'gp_geometry','{}'));
+            $g->{device}='other-device';reading($other,'gp_geometry',JSON::PP::encode_json($g),$now-1000);
+        }
+        $attr{$_}{residents}='Geo.Test,Geo.Other' for qw(R.Door R.Late R.Work);
+    }
+    GP_ResetController($c);GeoPresence_Timer($c);
+    return ($c,GP_Config($c,'Geo.Test'),GP_Config($c,'Geo.Other'));
+}
+sub output_intent {
+    my ($s,$cfg,$kind,$params)=@_;
+    my $e={time=>$now,received=>$now};
+    my %arrival;
+    if (GP_IsOpening($kind)) {
+        $s->{last_trip}//={id=>'adapter-trip',armed=>1};
+        %arrival=(trigger=>'arrival',trip=>$s->{last_trip}{id});
+    }
+    return {kind=>$kind,generation=>$s->{generation},output_revision=>$s->{output_revision},
+        expires_mono=>$mono+GP_ActionExpiry($cfg,$e)-$now,e=>$e,params=>$params,%arrival};
 }
 sub actor_event {
     my ($c,$device,$key,$value,$time)=@_;
@@ -672,21 +723,17 @@ subtest 'disabled rules and duplicate rules do not add hidden actions' => sub {
 };
 
 subtest 'shared actuator reservations and independent later arrivals' => sub {
-    my ($c,$cfg)=fixture();
-    # The coordinator accepts intents already authorized by each resident's core.
-    device('Geo.Other','GeoPresence');$defs{'Geo.Other'}{SUBTYPE}='resident';$defs{'Geo.Other'}{CONTROLLER}='GP';
-    device('rr_Other','ROOMMATE');$defs{'Geo.Other'}{ROOMMATE}='rr_Other';
-    $defs{'Geo.Other'}{READINGS}{mode}{VAL}='active';
+    my ($c,$cfg,$cfg2)=shared_actor_fixture();
     my $s1=GP_State($c,'Geo.Test',0);my $s2=GP_State($c,'Geo.Other',0);
-    advance(40);process($_,$cfg,'Work',0) for ($s1,$s2);advance(90);actor_fresh();
-    arrive($_,$cfg) for ($s1,$s2);
-    GP_Dispatch($c,'Geo.Test',$cfg,$s1,0,$now,$mono);GP_Dispatch($c,'Geo.Other',$cfg,$s2,0,$now,$mono);
+    advance(40);process($s1,$cfg,'Work',0);process($s2,$cfg2,'Work',0);advance(90);actor_fresh();
+    arrive($s1,$cfg);arrive($s2,$cfg2);
+    GP_Dispatch($c,'Geo.Test',$cfg,$s1,0,$now,$mono);GP_Dispatch($c,'Geo.Other',$cfg2,$s2,0,$now,$mono);
     is(scalar(grep {$_ eq 'door lock unlocked'} @commands),1,'two residents share one pending door action');
     is(scalar(grep {$_ eq 'garage on'} @commands),1,'two residents share one pending garage action');
     advance(1);reading('feedback','pulse_state','confirmed',$now);GP_ActorFeedback($c,$now,$mono);
     is($s2->{door_result},'confirmed','feedback reaches the second resident');
-    advance(40);process($s2,$cfg,'Drive',0);advance(90);actor_fresh();arrive($s2,$cfg);
-    GP_Dispatch($c,'Geo.Other',$cfg,$s2,0,$now,$mono);
+    advance(40);process($s2,$cfg2,'Drive',0);advance(90);actor_fresh();arrive($s2,$cfg2);
+    GP_Dispatch($c,'Geo.Other',$cfg2,$s2,0,$now,$mono);
     is(scalar(grep {$_ eq 'door lock unlocked'} @commands),2,'later independent arrival can reopen closed door');
 };
 
@@ -725,12 +772,9 @@ subtest 'unchanged old feedback is not a new confirmation, even in the same seco
 };
 
 subtest 'synchronous same-second feedback frees a shared actor for the next resident' => sub {
-    my ($c,$cfg)=fixture();
-    device('Geo.Other','GeoPresence');$defs{'Geo.Other'}{SUBTYPE}='resident';$defs{'Geo.Other'}{CONTROLLER}='GP';
-    device('rr_Other','ROOMMATE');$defs{'Geo.Other'}{ROOMMATE}='rr_Other';
-    $defs{'Geo.Other'}{READINGS}{mode}{VAL}='active';
+    my ($c,$cfg,$cfg2)=shared_actor_fixture();
     my $s1=GP_State($c,'Geo.Test',0);my $s2=GP_State($c,'Geo.Other',0);
-    advance(40);process($_,$cfg,'Work',0) for ($s1,$s2);advance(90.2);actor_fresh();
+    advance(40);process($s1,$cfg,'Work',0);process($s2,$cfg2,'Work',0);advance(90.2);actor_fresh();
     reading('feedback','pulse_state','confirmed',$now);
     $on_command=sub {
         return unless $_[0] eq 'door lock unlocked';
@@ -740,7 +784,7 @@ subtest 'synchronous same-second feedback frees a shared actor for the next resi
     arrive($s1,$cfg);GP_Dispatch($c,'Geo.Test',$cfg,$s1,0,$now,$mono);
     GP_ActorFeedback($c,$now,$mono);
     is($s1->{door_result},'confirmed','feedback inside CommandSet is retained before the first poll');
-    advance(0.5);arrive($s2,$cfg);GP_Dispatch($c,'Geo.Other',$cfg,$s2,0,$now,$mono);
+    advance(0.5);arrive($s2,$cfg2);GP_Dispatch($c,'Geo.Other',$cfg2,$s2,0,$now,$mono);
     is(scalar(grep {$_ eq 'door lock unlocked'} @commands),2,'later resident gets an independent door pulse');
     GP_ActorFeedback($c,$now,$mono);
     is($s2->{door_result},'confirmed','second pulse is confirmed independently');
@@ -748,13 +792,11 @@ subtest 'synchronous same-second feedback frees a shared actor for the next resi
 
 subtest 'door terminal events survive idle before polling and do not leak to the next pulse' => sub {
     for my $terminal (qw(confirmed failed cancelled)) {
-        my ($c,$cfg)=fixture();
-        device('Geo.Other','GeoPresence');$defs{'Geo.Other'}{SUBTYPE}='resident';$defs{'Geo.Other'}{CONTROLLER}='GP';
-        device('rr_Other','ROOMMATE');$defs{'Geo.Other'}{ROOMMATE}='rr_Other';$defs{'Geo.Other'}{READINGS}{mode}{VAL}='active';
+        my ($c,$cfg,$cfg2)=shared_actor_fixture();
         my $s1=GP_State($c,'Geo.Test',0);my $s2=GP_State($c,'Geo.Other',0);
-        advance(40);process($_,$cfg,'Work',0) for ($s1,$s2);advance(90.2);actor_fresh();
-        arrive($_,$cfg) for ($s1,$s2);
-        GP_Dispatch($c,'Geo.Test',$cfg,$s1,0,$now,$mono);GP_Dispatch($c,'Geo.Other',$cfg,$s2,0,$now,$mono);
+        advance(40);process($s1,$cfg,'Work',0);process($s2,$cfg2,'Work',0);advance(90.2);actor_fresh();
+        arrive($s1,$cfg);arrive($s2,$cfg2);
+        GP_Dispatch($c,'Geo.Test',$cfg,$s1,0,$now,$mono);GP_Dispatch($c,'Geo.Other',$cfg2,$s2,0,$now,$mono);
         advance(0.1);actor_event($c,'feedback','pulse_state',$terminal);
         advance(0.1);actor_event($c,'feedback','pulse_state','idle');
         is(GP_Read('feedback','pulse_state',''),'idle','contact close resets visible pulse_state before the poll');
@@ -762,8 +804,8 @@ subtest 'door terminal events survive idle before polling and do not leak to the
         is($s1->{door_result},$terminal,"first resident keeps $terminal despite idle");
         is($s2->{door_result},$terminal,"shared resident receives $terminal despite idle");
         ok(!$c->{helper}{gp}{actors}{door},'completed door reservation is released');
-        advance(1);process($s2,$cfg,'Work',0);advance(61);actor_fresh();arrive($s2,$cfg);
-        GP_Dispatch($c,'Geo.Other',$cfg,$s2,0,$now,$mono);
+        advance(1);process($s2,$cfg2,'Work',0);advance(61);actor_fresh();arrive($s2,$cfg2);
+        GP_Dispatch($c,'Geo.Other',$cfg2,$s2,0,$now,$mono);
         is(scalar(grep {$_ eq 'door lock unlocked'} @commands),2,'next independent arrival receives its own pulse');
         GP_ActorFeedback($c,$now,$mono);
         is($s2->{door_result},'pending','previous completion is never inherited by a new reservation');
@@ -788,19 +830,17 @@ subtest 'synchronous completion survives idle and later diagnostics before the t
 };
 
 subtest 'an arrival after observed completion cannot share the already finished pulse' => sub {
-    my ($c,$cfg)=fixture();
-    device('Geo.Other','GeoPresence');$defs{'Geo.Other'}{SUBTYPE}='resident';$defs{'Geo.Other'}{CONTROLLER}='GP';
-    device('rr_Other','ROOMMATE');$defs{'Geo.Other'}{ROOMMATE}='rr_Other';$defs{'Geo.Other'}{READINGS}{mode}{VAL}='active';
+    my ($c,$cfg,$cfg2)=shared_actor_fixture();
     my $s1=GP_State($c,'Geo.Test',0);my $s2=GP_State($c,'Geo.Other',0);
-    advance(40);process($_,$cfg,'Work',0) for ($s1,$s2);advance(90.2);actor_fresh();
-    arrive($_,$cfg) for ($s1,$s2);
+    advance(40);process($s1,$cfg,'Work',0);process($s2,$cfg2,'Work',0);advance(90.2);actor_fresh();
+    arrive($s1,$cfg);arrive($s2,$cfg2);
     $on_command=sub {
         return unless $_[0] eq 'door lock unlocked';
         actor_event($c,'feedback','pulse_state','confirmed');
         actor_event($c,'feedback','pulse_state','idle');
     };
     GP_Dispatch($c,'Geo.Test',$cfg,$s1,0,$now,$mono);
-    GP_Dispatch($c,'Geo.Other',$cfg,$s2,0,$now,$mono);
+    GP_Dispatch($c,'Geo.Other',$cfg2,$s2,0,$now,$mono);
     is(scalar(grep {$_ eq 'door lock unlocked'} @commands),2,'next resident gets a new pulse even before the next feedback timer');
     is($s1->{door_result},'confirmed','finished request is finalized before reserving the next pulse');
     GP_ActorFeedback($c,$now,$mono);
@@ -877,7 +917,7 @@ subtest 'real actor completions stay logged after controller and resident sessio
                 my $door=$kind eq 'door_open';my $target=$door ? 'door':'garage';
                 my $params=$door ? {target=>$target,command=>'lock unlocked',contact=>'contact',feedbackDevice=>'feedback'}
                     : {target=>$target,command=>'on',stateDevice=>'gate',upperContact=>'upper',lowerContact=>'lower'};
-                $s->{intents}=[{kind=>$kind,generation=>$s->{generation},e=>{time=>$now,received=>$now},params=>$params}];
+                $s->{intents}=[output_intent($s,$cfg,$kind,$params)];
                 GP_Dispatch($c,'Geo.Test',$cfg,$s,0,$now,$mono);
                 is(scalar(grep {$_->[2] =~ /requested/} @logs),1,'real request logged before another callback');
                 $change->[0] eq 'reload' ? GP_ResetController($c) : mode($change->[0],$change->[2]);
@@ -918,8 +958,7 @@ subtest 'actual output records survive synchronous mode changes inside adapters'
                 my ($controller,$resident,$config,$state,$debug)=@_;
                 unless ($debug) {
                     $state->{phase}='home';
-                    $state->{intents}=[map {{kind=>$kind,generation=>$state->{generation},rule=>'actual-output',
-                        e=>{time=>$now,received=>$now},params=>$params{$kind}}} 1..2];
+                    $state->{intents}=[map {{%{output_intent($state,$config,$kind,$params{$kind})},rule=>'actual-output'}} 1..2];
                 }
                 return $dispatch->(@_);
             };
@@ -937,8 +976,8 @@ subtest 'actual output records survive synchronous mode changes inside adapters'
 subtest 'logging callbacks cannot duplicate completion or authorize a further command' => sub {
     my ($c,$cfg)=fixture();advance(40);actor_fresh();$attr{GP}{verbose}=3;
     my $s=GP_State($c,'Geo.Test',0);$s->{phase}='home';
-    my $intent={kind=>'door_open',generation=>$s->{generation},e=>{time=>$now,received=>$now},
-        params=>{target=>'door',command=>'lock unlocked',contact=>'contact',feedbackDevice=>'feedback'}};
+    my $intent=output_intent($s,$cfg,'door_open',
+        {target=>'door',command=>'lock unlocked',contact=>'contact',feedbackDevice=>'feedback'});
     $s->{intents}=[{%$intent}];GP_Dispatch($c,'Geo.Test',$cfg,$s,0,$now,$mono);
     advance(1);actor_event($c,'feedback','pulse_state','confirmed');
     $s->{intents}=[{%$intent}];
@@ -1729,7 +1768,7 @@ subtest 'switch_on is bounded, deduplicated, validated and suppressed in debug' 
     gp_define('A.Light','action GP switch_on');$attr{'A.Light'}={target=>'test.dev.licht',command=>'on'};
     gp_define('R.Light','rule GP');$attr{'R.Light'}={trigger=>'enter',residents=>'Geo.Test',locations=>'Z.Sternensteg',action=>'A.Light',cooldown=>10};
     is_deeply([GP_Validate($c)],[],'new switch action and zone rule validate');
-    my $cfg=GP_Config($c,'Geo.Test',1);my $s=new_state();advance(40);
+    my $cfg=GP_Config($c,'Geo.Test',1);my $s=GP_State($c,'Geo.Test',1);advance(40);
     process($s,$cfg,'Sternensteg',1);
     is_deeply([map {$_->{kind}} @{$s->{intents}}],['switch_on'],'zone entry schedules switch without door permission');
     my $before=$reading_calls;
@@ -1742,7 +1781,8 @@ subtest 'switch_on is bounded, deduplicated, validated and suppressed in debug' 
     is(scalar @{$s->{intents}},0,'duplicate entry cannot retrigger after cooldown without a new visit');
     advance(1);process($s,$cfg,'Sternensteg',0);advance(1);process($s,$cfg,'Sternensteg',1);
     is(scalar @{$s->{intents}},1,'new visit after cooldown schedules again');
-    $defs{GP}{READINGS}{mode}{VAL}='active';$c->{helper}{gp}{ready}=1;$c->{helper}{gp}{prod}{'Geo.Test'}=$s;
+    mode('GP','active');$cfg=GP_Config($c,'Geo.Test',0);$s=GP_State($c,'Geo.Test',0);
+    advance(40);process($s,$cfg,'Sternensteg',1);
     GP_Dispatch($c,'Geo.Test',$cfg,$s,0,$now,$mono);
     is_deeply(\@commands,['test.dev.licht on'],'active adapter sends exactly the fixed on command');
     is_deeply($c->{helper}{gp}{actors},{},'switch creates no opening reservation');
@@ -1859,8 +1899,8 @@ subtest 'three resident policies retain door, garage and phone arrival contracts
 
 
 sub pending_fixture {
-    my ($motion)=@_;
-    my ($c,$cfg)=fixture();my $s=GP_State($c,'Geo.Test',0);
+    my ($motion,%options)=@_;
+    my ($c,$cfg)=fixture(%options);my $s=GP_State($c,'Geo.Test',0);
     advance(40);process($s,$cfg,'Work',0);advance(90);actor_fresh();
     process($s,$cfg,'Home',1,$motion);
     return ($c,$cfg,$s);
@@ -1955,7 +1995,8 @@ subtest 'fast waits need motion at most 30 seconds old in the current arrival se
 };
 
 subtest 'delayed delivery does not shorten waiting or turn an old car observation fresh' => sub {
-    my ($c,$cfg)=fixture();my $s=new_state();advance(40);process($s,$cfg,'Work',0);advance(140);
+    my ($c)=fixture();my $cfg=GP_Config($c,'Geo.Test',1);my $s=GP_State($c,'Geo.Test',1);
+    advance(40);process($s,$cfg,'Work',0);advance(140);
     my $e=ev('Home',1,$now-40,'automotive');$e->{received}=$now;
     GP_Process($s,$cfg,$e,$now,$mono);
     is($s->{arrival}{wait},60,'old car report uses unknown wait');is($s->{arrival}{due_mono},$mono+60,'wait begins at receipt');
@@ -2178,15 +2219,17 @@ subtest 'full reports, uninitialized views and resident dropdowns are read only'
         like($json->{error},qr/Usage:.*\[prod\|debug\]/,'invalid and obsolete selectors give a structured usage error');
     }
     like(GeoPresence_Get($c,'GP','logStatus','debug'),qr/Too many arguments/,'selector is scoped to explain');
-    my $before=JSON::PP->new->canonical->encode($c->{helper}{gp});
     $defs{'Geo.Second'}={NAME=>'Geo.Second',TYPE=>'GeoPresence',SUBTYPE=>'resident',CONTROLLER=>'GP'};
     $defs{'Geo.Other'}={NAME=>'Geo.Other',TYPE=>'GeoPresence',SUBTYPE=>'resident',CONTROLLER=>'Other'};
     config_event('DEFINED Geo.Second');
+    my $before=JSON::PP->new->canonical->encode($c->{helper}{gp});
     $menu=GeoPresence_Get($c,'GP','?');
     like($menu,qr/Geo\.Second#debug/,'new resident appears without a controller restart');
     unlike($menu,qr/Geo\.Other/,'another controller resident is not offered');
+    is(JSON::PP->new->canonical->encode($c->{helper}{gp}),$before,'updated dropdown leaves resident state untouched');
     delete $defs{'Geo.Second'}; delete $defs{'Geo.Test'};
     config_event('DELETED Geo.Second','DELETED Geo.Test');
+    $before=JSON::PP->new->canonical->encode($c->{helper}{gp});
     like(GeoPresence_Get($c,'GP','?'),qr/\bexplain:textField\b/,'empty controller retains usable command discovery');
     is(JSON::PP->new->canonical->encode($c->{helper}{gp}),$before,'dropdown lookup does not allocate state');
     is(scalar @commands,0,'no actuator or ROOMMATE commands'); is(scalar @messages,0,'no notifications');
@@ -2641,6 +2684,274 @@ subtest 'a new phone return confirms the resumed trip without a Home webhook' =>
     GP_Dispatch($c,'Geo.Test',$cfg,$s,0,$now,$mono);
     is(scalar(grep {/^(?:door|garage) /} @commands),2,'phone fallback uses the restored remote proof');
     is(JSON::PP::decode_json(GP_Read('Geo.Test','gp_trip_checkpoint',''))->{status},'none','phone return consumes checkpoint before output');
+};
+
+sub nonopening_fixture {
+    my ($first)=@_;
+    my ($c)=fixture();mode('GP','debug');device('lamp','dummy');
+    gp_define('A.OutputLight','action GP switch_on');
+    attribute('A.OutputLight','target','lamp');attribute('A.OutputLight','command','on');
+    my $rule=$first eq 'switch_on' ? 'R.AOutputLight':'R.ZOutputLight';
+    gp_define($rule,'rule GP');
+    attribute($rule,'residents','Geo.Test');attribute($rule,'trigger','enter');
+    attribute($rule,'locationGroup','Work');attribute($rule,'action','A.OutputLight');
+    mode('GP','active');
+    my $cfg=GP_Config($c,'Geo.Test',0);my $s=GP_State($c,'Geo.Test',0);
+    advance(40);process($s,$cfg,'Work',1);
+    return ($c,$cfg,$s);
+}
+
+subtest 'F-08: manual Home during the door callback revokes the remaining garage plan' => sub {
+    my ($c,$cfg,$s)=pending_fixture('automotive');complete_arrival($s,$cfg);actor_fresh();
+    is_deeply([map {$_->{kind}} @{$s->{intents}}],['door_open','garage_open'],'both openings are planned');
+    my $revision=$s->{output_revision};
+    $on_command=sub {
+        return unless $_[0] eq 'door lock unlocked';
+        reading('rr_Test','state','home',$now);
+        local $defs{rr_Test}{CHANGED}=['home'];GeoPresence_Notify($c,$defs{rr_Test});
+    };
+    GP_Dispatch($c,'Geo.Test',$cfg,$s,0,$now,$mono);
+    is_deeply(\@commands,['door lock unlocked'],'manual Home stops the copied garage plan');
+    cmp_ok($s->{output_revision},'>',$revision,'revocation advances the output version even when already Home');
+    ok(!$c->{helper}{gp}{actors}{garage},'cancelled garage plan creates no reservation');
+    actor_event($c,'feedback','pulse_state','confirmed');GP_ActorFeedback($c,$now,$mono);
+    is($s->{door_result},'confirmed','the already issued door request still receives feedback');
+};
+
+subtest 'F-09: every opening uses current clocks after a synchronous callback' => sub {
+    for my $delay (89,90,91) {
+        my ($c,$cfg,$s)=pending_fixture('automotive');complete_arrival($s,$cfg);actor_fresh();
+        my ($old_wall,$old_mono)=($now,$mono);
+        $on_command=sub {advance($delay) if $_[0] eq 'door lock unlocked'};
+        GP_Dispatch($c,'Geo.Test',$cfg,$s,0,$old_wall,$old_mono);
+        is_deeply(\@commands,$delay<=90 ? ['door lock unlocked','garage on']:['door lock unlocked'],
+            "delay $delay is checked against the remaining arrival budget");
+    }
+    my ($c,$cfg,$s)=pending_fixture('automotive');complete_arrival($s,$cfg);actor_fresh();
+    my ($old_wall,$old_mono)=($now,$mono);advance(91);
+    GP_Dispatch($c,'Geo.Test',$cfg,$s,0,$old_wall,$old_mono);
+    is_deeply(\@commands,[],'stale caller clocks cannot authorize even the first output');
+};
+
+subtest 'R-07: notification and switch callbacks use the same revocable output gate' => sub {
+    for my $first (qw(notify switch_on)) {
+        for my $reason (qw(manual expired)) {
+            my ($c,$cfg,$s)=nonopening_fixture($first);
+            is(scalar @{$s->{intents}},2,'two ordinary output plans');
+            my $callback=sub {
+                if ($reason eq 'expired') {advance(91);return;}
+                local $defs{rr_Test}{CHANGED}=['home'];GeoPresence_Notify($c,$defs{rr_Test});
+            };
+            $on_message=$callback if $first eq 'notify';
+            $on_command=$callback if $first eq 'switch_on';
+            GP_Dispatch($c,'Geo.Test',$cfg,$s,0,$now,$mono);
+            is(scalar(@messages)+scalar(@commands),1,"$first callback blocks the next output: $reason");
+        }
+    }
+};
+
+subtest 'R-07: small wall-clock corrections cannot extend a monotonic output deadline' => sub {
+    my ($c,$cfg,$s)=nonopening_fixture('notify');advance(89);
+    $on_message=sub {$mono+=2;$now-=2};
+    GP_Dispatch($c,'Geo.Test',$cfg,$s,0,$now,$mono);
+    is(scalar @messages,1,'first notification is still fresh');
+    is_deeply(\@commands,[],'monotonic deadline rejects the second output');
+    ok(!grep({$_->{reason} eq 'clock discontinuity; permissions revoked'} @{$s->{trace}}),
+        'small correction stays below the discontinuity threshold');
+};
+
+subtest 'R-07: changed configuration cancels pending outputs without rebuilding it' => sub {
+    for my $cold (0,1) {
+        for my $event ('MODIFIED contact','ATTR contact event-on-change-reading state','DELETEATTR contact') {
+            my ($c,$cfg,$s)=nonopening_fixture('notify');
+            $on_message=sub {GP_InvalidateDevices($c) if $cold;config_event($event)};
+            my $build=\&GP_Catalog;my $calls=0;
+            {
+                no warnings 'redefine';local *GP_Catalog=sub {$calls++;return $build->(@_)};
+                GP_Dispatch($c,'Geo.Test',$cfg,$s,0,$now,$mono);
+            }
+            is(scalar @messages,1,"first output precedes $event (cold=$cold)");
+            is_deeply(\@commands,[],'obsolete configuration cannot authorize the switch');
+            is($calls,0,'discarding obsolete plans never rebuilds or reads the catalogue');
+            ok(!$c->{helper}{gp_config},'rebuilding remains deferred until a new consumer');
+        }
+    }
+};
+
+subtest 'R-07: unrelated configuration changes retain another resident output batch' => sub {
+    my ($c,$cfg,$s)=nonopening_fixture('notify');
+    $on_message=sub {
+        device('rr_New','ROOMMATE');$attr{rr_New}{rr_locationUnderway}='underway';
+        gp_define('Geo.New','resident GP rr_New');
+        attribute('Geo.New','sourceMode','phone_only');attribute('Geo.New','phoneProxies','p1');
+    };
+    GP_Dispatch($c,'Geo.Test',$cfg,$s,0,$now,$mono);
+    is(scalar @messages,1,'first notification executes');
+    is_deeply(\@commands,['lamp on'],'unrelated setup cannot cancel the still-authorized switch');
+};
+
+subtest 'R-07: expiration during subscription leaves no unissued actor reservation' => sub {
+    my ($c,$cfg,$s)=pending_fixture('automotive');complete_arrival($s,$cfg);actor_fresh();
+    my $subscribe=\&setNotifyDev;my $delayed=0;
+    {
+        no warnings 'redefine';
+        local *setNotifyDev=sub {
+            advance(91) if !$delayed++;
+            return $subscribe->(@_);
+        };
+        GP_Dispatch($c,'Geo.Test',$cfg,$s,0,$now,$mono);
+    }
+    is_deeply(\@commands,[],'final gate checks clocks after subscription');
+    is_deeply($c->{helper}{gp}{actors},{},'undispatched reservation is removed');
+};
+
+subtest 'GP-R07-001: display aliases cannot revoke a valid opening sequence' => sub {
+    for my $name (qw(Geo.Test rr_Test door)) {
+        for my $operation (qw(set del)) {
+            my ($c,$cfg,$s)=pending_fixture('automotive');complete_arrival($s,$cfg);actor_fresh();
+            $attr{$name}{alias}='Previous name';my $revision=$s->{output_revision};
+            my $catalog=$c->{helper}{gp_config};
+            $on_command=sub {
+                return unless $_[0] eq 'door lock unlocked';
+                $operation eq 'set' ? attribute($name,'alias','New name') : delete_attributes($name,'alias');
+            };
+            GP_Dispatch($c,'Geo.Test',$cfg,$s,0);
+            is_deeply(\@commands,['door lock unlocked','garage on'],"$operation $name alias keeps the garage authorized");
+            is($s->{output_revision},$revision,'display edit keeps the output version');
+            is($c->{helper}{gp_config},$catalog,'live display alias keeps the prepared configuration') if $name ne 'rr_Test';
+            is(GP_Config($c,'Geo.Test')->{label},$operation eq 'set'?'New name':'rr_Test',
+                'subsequent configuration reads refresh the ROOMMATE label') if $name eq 'rr_Test';
+        }
+    }
+};
+
+subtest 'GP-R07-002: a clock correction during the arrival wait cannot extend output freshness' => sub {
+    for my $delay (90,95) {
+        my ($c,$cfg,$s)=pending_fixture('unknown');my $receipt=$mono;
+        advance(50);$now-=10;GP_CheckClock($s,$cfg,$now,$mono);advance(10);
+        complete_arrival($s,$cfg);actor_fresh();
+        is($s->{intents}[0]{expires_mono},$receipt+150,'deadline remains anchored before the clock correction');
+        $on_command=sub {advance($delay) if $_[0] eq 'door lock unlocked'};
+        GP_Dispatch($c,'Geo.Test',$cfg,$s,0);
+        is_deeply(\@commands,$delay==90?['door lock unlocked','garage on']:['door lock unlocked'],
+            "remaining $delay seconds are measured from the original receipt");
+    }
+    my ($c,$cfg,$s)=pending_fixture('unknown');
+    advance(50);$now-=10;GP_CheckClock($s,$cfg,$now,$mono);advance(105);
+    GP_ConfirmArrival($s,$cfg,$now,$mono);
+    ok(!$s->{arrival},'a delayed confirmation cannot revive the expired budget');
+    is_deeply($s->{intents},[],'expired confirmation creates no output plans');
+};
+
+subtest 'GP-R07-002: receipt clocks survive the webhook reorder queue' => sub {
+    my ($c,$cfg)=fixture();my $s=GP_State($c,'Geo.Test',0);
+    advance(40);process($s,$cfg,'Work',0);advance(90);
+    my $receipt=$mono;
+    is((http($c,form($cfg,'Home',1,$now)))[0],200,'Home webhook accepted');
+    advance(3);$now-=1;GeoPresence_Timer($c);
+    is($s->{arrival}{start_mono},$receipt,'queued observation keeps its original monotonic reception time');
+    complete_arrival($s,$cfg);
+    is($s->{intents}[0]{expires_mono},$receipt+150,'reordering does not shift the action deadline');
+};
+
+subtest 'GP-R07-003: controller bulk deletions obey the active configuration guard' => sub {
+    for my $pattern ('action_max_ag.',undef) {
+        my ($c,$cfg,$s)=pending_fixture('unknown',action_max_age=>180);complete_arrival($s,$cfg);actor_fresh();
+        my $error;
+        $on_command=sub {$error=delete_attributes('GP',$pattern) if $_[0] eq 'door lock unlocked'};
+        GP_Dispatch($c,'Geo.Test',$cfg,$s,0);
+        like($error//'',qr/Controller configuration requires/,'bulk deletion is rejected before FHEM commits it');
+        is($attr{GP}{action_max_age},180,'rejected deletion retains the configured freshness limit');
+        is_deeply(\@commands,['door lock unlocked','garage on'],'rejected change leaves the original sequence valid');
+    }
+};
+
+subtest 'GP-R07-003: committed controller deletions revoke every affected output even with cold caches' => sub {
+    for my $cold (0,1) {
+        for my $pattern ('action_max_ag.',undef) {
+            my ($c,$cfg,$s)=pending_fixture('unknown',action_max_age=>180);complete_arrival($s,$cfg);actor_fresh();
+            my $revision=$s->{output_revision};
+            $on_command=sub {
+                return unless $_[0] eq 'door lock unlocked';
+                GP_InvalidateDevices($c) if $cold;
+                delete $attr{GP}{action_max_age};
+                config_event('DELETEATTR GP'.(defined($pattern)?' '.$pattern:''));
+            };
+            my $catalog=\&GP_Catalog;my $builds=0;
+            {
+                no warnings 'redefine';local *GP_Catalog=sub {$builds++;return $catalog->(@_)};
+                GP_Dispatch($c,'Geo.Test',$cfg,$s,0);
+            }
+            is_deeply(\@commands,['door lock unlocked'],'committed controller change suppresses the garage');
+            cmp_ok($s->{output_revision},'>',$revision,'controller is a dependency of each resident');
+            is($builds,0,'revocation needs no configuration rebuild');
+        }
+    }
+};
+
+subtest 'GP-R07-003: deletion patterns validate and reset their combined change once' => sub {
+    my ($c)=fixture();mode('GP','debug');
+    attribute('GP','action_max_age',200);attribute('GP','reorder_window',120);
+    like(delete_attributes('GP','action_max_ag.'),qr/smaller than action_max_age/,
+        'pattern cannot restore an age incompatible with the remaining window');
+    is($attr{GP}{action_max_age},200,'rejected deletion retains the old value');
+    my $epoch=$c->{helper}{gp}{epoch};
+    is(delete_attributes('GP','action_max_ag.|reorder_windo.'),undef,'combined default pair is valid');
+    is($c->{helper}{gp}{epoch},$epoch+1,'combined deletion resets the controller once');
+    my $cfg=GP_Config($c,'Geo.Test');
+    is_deeply([@$cfg{qw(action_max_age reorder_window)}],[90,2],'both defaults are visible together');
+    mode('GP','active');
+    my $s=GP_State($c,'Geo.Test',0);my $revision=$s->{output_revision};
+    $attr{GP}{debugLog}=1;$attr{GP}{logFile}='/tmp/unused-geopresence-review.log';
+    my $catalog=$c->{helper}{gp_config};
+    is(delete_attributes('GP','debugLo.|logFil.'),undef,'diagnostic-only pattern remains allowed while active');
+    is($s->{output_revision},$revision,'diagnostic pattern does not revoke outputs');
+    is($c->{helper}{gp_config},$catalog,'diagnostic pattern keeps the prepared configuration');
+};
+
+subtest 'GP-R07-004: ROOMMATE alias deletion patterns preserve the remaining opening' => sub {
+    for my $pattern ('^alias$','a.ias','[a]lias','^(alias|room)$','(?x) ^ alias $') {
+        for my $cold (0,1) {
+            my ($c,$cfg,$s)=pending_fixture('automotive');complete_arrival($s,$cfg);actor_fresh();
+            $attr{rr_Test}{alias}='Previous name';my $revision=$s->{output_revision};
+            $on_command=sub {
+                return unless $_[0] eq 'door lock unlocked';
+                GP_InvalidateDevices($c) if $cold;
+                is(delete_attributes('rr_Test',$pattern),undef,'ROOMMATE display deletion accepted');
+            };
+            GP_Dispatch($c,'Geo.Test',$cfg,$s,0);
+            is_deeply(\@commands,['door lock unlocked','garage on'],"$pattern preserves the garage, cold=$cold");
+            is($s->{output_revision},$revision,'display pattern keeps the output version');
+            is(GP_Config($c,'Geo.Test')->{label},'rr_Test','subsequent configuration uses the remaining ROOMMATE name');
+        }
+    }
+    my ($c,$cfg,$s)=pending_fixture('automotive');complete_arrival($s,$cfg);actor_fresh();
+    $attr{rr_Test}{alias}='Previous name';
+    $on_command=sub {delete_attributes('rr_Test','^(alias|rr_locationUnderway)$') if $_[0] eq 'door lock unlocked'};
+    GP_Dispatch($c,'Geo.Test',$cfg,$s,0);
+    is_deeply(\@commands,['door lock unlocked'],'a pattern removing a functional ROOMMATE attribute still revokes the garage');
+};
+
+subtest 'GP-R07-005: deleting obsolete attributes refreshes cached validation without compiling in callbacks' => sub {
+    for my $case (['R.Work','^(role|condition)$',[qw(role condition)],qr/unsupported rule attribute/],
+                  ['R.Work','(?x) ^ (role | condition) $',[qw(role condition)],qr/unsupported rule attribute/],
+                  ['GP','^(mode|operatingMode)$',[qw(mode operatingMode)],qr/remove obsolete attribute/],
+                  ['Geo.Test','^(mode|operatingMode)$',[qw(mode operatingMode)],qr/remove obsolete attribute/]) {
+        my ($name,$pattern,$keys,$message)=@$case;
+        my ($c)=fixture();mode('GP','debug');
+        $attr{$name}{$_}='obsolete' for @$keys;
+        GP_InvalidateConfig($c);
+        like(join('; ',GP_Validate($c,'Geo.Test')), $message, 'obsolete attributes are cached as invalid');
+        my $catalog=\&GP_Catalog;my $builds=0;
+        {
+            no warnings 'redefine';local *GP_Catalog=sub {$builds++;return $catalog->(@_)};
+            is(delete_attributes($name,$pattern),undef,"cleanup $pattern accepted");
+        }
+        is($builds,0,'cleanup callbacks do not compile a catalogue');
+        ok(!$c->{helper}{gp_config},'the obsolete validation cache is discarded');
+        is_deeply([GP_Validate($c,'Geo.Test')],[],'subsequent validation sees the cleaned configuration');
+        is(GeoPresence_Set($c,'GP','mode','active'),undef,'the cleaned configuration can be activated');
+    }
 };
 
 done_testing();

@@ -321,17 +321,19 @@ subtest 'reentry after arrival confirmation still revokes a queued prerequisite'
 
 subtest 'manual home during dispatch cannot retain a completed trip prerequisite' => sub {
     my ($c,$cfg,$s)=rules_fixture();
+    $cfg=GP_Config($c,'Geo.Test',0);
     $defs{GP}{READINGS}{mode}{VAL}='active';$defs{'Geo.Test'}{READINGS}{mode}{VAL}='active';
     $c->{helper}{gp}{prod}{'Geo.Test'}=$s;$c->{helper}{gp}{ready}=1;
     $s->{phase}='home';
     $s->{last_trip}={id=>'old',exits=>{'group:Employment'=>$now-1}};
     my $intent={kind=>'notify',generation=>$s->{generation},rule=>'Pending',trip=>'old',after_exit=>'group:Employment',
+        output_revision=>$s->{output_revision},expires_mono=>$mono+90,
         exit_time=>$now-1,params=>{message=>'return'},e=>{time=>$now,received=>$now}};
     $defs{rr_Test}{CHANGED}=['home'];
     GeoPresence_Notify($c,$defs{rr_Test});
     $s->{intents}=[$intent];GP_Dispatch($c,'Geo.Test',$cfg,$s,0,$now,$mono);
     is_deeply(\@messages,[],'manual arrival prevents pending prerequisite notification');
-    ok(grep({$_->{reason} eq 'prior exit revoked before dispatch'} @{$s->{trace}}),'manual return invalidates completed-trip proof');
+    ok(grep({$_->{reason} eq 'output permission revoked'} @{$s->{trace}}),'manual return invalidates completed-trip proof');
 };
 
 subtest 'missing place geometry is reported without blocking a configured Home' => sub {

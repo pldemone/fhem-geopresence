@@ -13,6 +13,7 @@ my (@normal,@sets,@messages,$set_error,$push_error);
 sub Log3 { push @normal, [@_]; }
 sub CommandSet { push @sets, $_[1]; return $set_error; }
 sub pushMsg { die "mock delivery interface failed\n" if $push_error; push @messages, [@_]; }
+sub getKeyValue { (undef,('a'x32).':'.('b'x64)); }
 sub setNotifyDev { $_[0]{NOTIFYDEV}=$_[1]; }
 sub setReadingsVal { $_[0]{READINGS}{$_[1]}={VAL=>$_[2],TIME=>$_[3]}; }
 sub InternalTimer { die 'Unexpected timer change'; }
@@ -39,22 +40,28 @@ sub fixture {
     %defs=(); %attr=(); @normal=(); @sets=(); @messages=();
     $set_error=undef; $push_error=0; $init_done=1; $unicodeEncoding=1;
     $wall=Time::Local::timegm(0,0,12,16,8,2026); $mono=1000;
-    $c=$defs{'System.GeoPresence'}={NAME=>'System.GeoPresence',TYPE=>'GeoPresence',SUBTYPE=>'controller',helper=>{}};
+    $c=$defs{'System.GeoPresence'}={NAME=>'System.GeoPresence',TYPE=>'GeoPresence',SUBTYPE=>'controller',
+        CONTROLLER=>'System.GeoPresence',helper=>{}};
     $defs{$r}={NAME=>$r,TYPE=>'GeoPresence',SUBTYPE=>'resident',CONTROLLER=>$c->{NAME},ROOMMATE=>'rr_Test'};
-    $defs{rr_Test}={NAME=>'rr_Test'};
+    $defs{rr_Test}={NAME=>'rr_Test',TYPE=>'ROOMMATE'};
     $attr{rr_Test}{alias}='Lumo';
+    $attr{rr_Test}{rr_locationUnderway}='underway';
+    $defs{Phone}={NAME=>'Phone',TYPE=>'PRESENCE'};
+    $attr{$r}={deviceId=>'log-phone',webhookUser=>'log-user',phoneProxies=>'Phone',allowDoor=>1,allowGarage=>1};
     $attr{global}{verbose}=3;
     $attr{$c->{NAME}}={logFile=>"$dir/$number-geopresence-%Y-%m.log"}; GP_StoreMode($defs{$c->{NAME}},'active');
     $defs{$r}{READINGS}{mode}{VAL}='active';
     $s=GP_NewState($wall-100,$mono-100,'test-generation');
     $c->{helper}{gp}={ready=>1,start=>$wall-100,epoch=>8,prod=>{$r=>$s},debug=>{},actors=>{},
-        learned=>{$r=>{zones=>{saved=>1}}},learning=>{$r=>1}};
-    $cfg={rules=>[],label=>'Lumo',action_max_age=>90,future_tolerance=>30,
-        zone_display_max_age=>43200,departure_margin=>200,geometry_ready=>1,
-        actor_timeout=>60,motion_max_age=>180,minimum_away=>60,phoneSignalMode=>'state',
-        zones=>{Home=>{label=>'Zuhause',role=>'home',lat=>50,lon=>7,radius=>100},
-                Garden=>{label=>'Vorgarten',role=>'place',lat=>50,lon=>7,radius=>50}},
-        roles=>{home=>['Home']}};
+        learned=>{$r=>{device=>'log-phone',zones=>{saved=>1}}},learning=>{$r=>1}};
+    for my $z ([Home=>'home','Zuhause',100],[Outer=>'outer','Umgebung',1000],[Garden=>'place','Vorgarten',50]) {
+        my ($n,$role,$label,$radius)=@$z;
+        $defs{$n}={NAME=>$n,TYPE=>'GeoPresence',SUBTYPE=>'location',CONTROLLER=>$c->{NAME},PARENT=>$r,ROLE=>$role};
+        $attr{$n}={zoneId=>lc($n),label=>$label};
+        $defs{$n}{READINGS}{gp_geometry}{VAL}=JSON::PP::encode_json({lat=>50,lon=>7,radius=>$radius,
+            time=>$wall-1000,changed=>$wall-1000,device=>'log-phone',id=>lc($n),blocked=>0});
+    }
+    $cfg=GP_Config($c,$r,0);
     for my $n (qw(Door Gate Light Contact Feedback State Upper Lower)) { $defs{$n}={NAME=>$n}; }
     @{$attr{Door}}{qw(alias)}=('Haustür');
     @{$attr{Gate}}{qw(alias)}=('Garage');
@@ -87,10 +94,16 @@ sub event {
 sub intent {
     my ($kind,$params)=@_;
     $s->{phase}='home';
+    $s->{last_trip}={id=>'log-trip',armed=>1};
     $s->{intents}=[{kind=>$kind,rule=>'Geo.Rule.Test',generation=>$s->{generation},
+        output_revision=>$s->{output_revision},expires_mono=>$mono+90,trip=>'log-trip',
         e=>{time=>$wall,received=>$wall},params=>$params}];
 }
-sub dispatch { GP_Dispatch($c,$r,$cfg,$s,$_[0]//0,$wall,$mono); flush($_[0]//0); }
+sub dispatch {
+    my $debug=$_[0]//0;
+    $c->{helper}{gp}{debug}{$r}=$s if $debug;
+    GP_Dispatch($c,$r,GP_Config($c,$r,$debug),$s,$debug,$wall,$mono); flush($debug);
+}
 sub reading {
     my ($dev,$name,$value)=@_;
     $defs{$dev}{READINGS}{$name}={VAL=>$value,TIME=>POSIX::strftime('%Y-%m-%d %H:%M:%S',localtime($wall))};

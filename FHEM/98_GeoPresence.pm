@@ -39,6 +39,8 @@ my %GP_ATTRS = (
     rule => [qw(enabled trigger residents locations locationGroup afterExit arrivalFilter action cooldown)],
 );
 my %GP_ALLOWED = map { $_ => 1 } map { @$_ } values %GP_ATTRS;
+my %GP_LEGACY_ATTR = map {$_=>1} qw(mode operatingMode role condition);
+my %GP_DISPLAY_ATTR = map {$_=>1} qw(alias room group icon verbose comment debugLog logFile);
 my %GP_ENUMS = (
     debugLog => [qw(auto 0 1)], sourceMode => [qw(geofency_phone geofency_only phone_only)],
     phoneSignalMode => [qw(state measurement)], positionSignalMode => [qw(state measurement)], enabled => [qw(1 0)],
@@ -86,6 +88,22 @@ sub GP_RuleAttrEnabled {
 sub GP_AttrSpec {
     my ($key)=@_;
     return $GP_ENUMS{$key} ? $key.':'.join(',',@{$GP_ENUMS{$key}}) : $key;
+}
+
+sub GP_MatchingAttrs {
+    my ($key,@keys)=@_;
+    return eval {grep {!length($key) || /^$key$/} @keys};
+}
+
+# The pre-commit guard protects changes to supported business parameters.
+# Global invalidation also covers display names and obsolete validation inputs.
+sub GP_ConfigAttrKeys {
+    my ($d,$key,$deleting)=@_;
+    return () if $key eq 'debugLog' || $key eq 'logFile';
+    return ($key) if $GP_ALLOWED{$key};
+    return () unless $deleting;
+    return GP_MatchingAttrs($key,grep {$_ ne 'debugLog' && $_ ne 'logFile'}
+        @{$GP_ATTRS{$d->{SUBTYPE}//''}//[]});
 }
 
 sub GP_UpdateAttrLists {
@@ -452,7 +470,7 @@ sub GP_Dependencies {
     my $index={dependents=>{},target_residents=>{}};
     for my $r (@{$inventory->{residents}}) {
         my $rr=$defs{$r}{ROOMMATE}//'';
-        $index->{dependents}{$_}{$r}=1 for ($r,$rr,GP_List(GP_Attr($r,'phoneProxies','')));
+        $index->{dependents}{$_}{$r}=1 for ($c->{NAME},$r,$rr,GP_List(GP_Attr($r,'phoneProxies','')));
         (my $suffix=$rr)=~s/^rr_//;
         $index->{dependents}{$_}{$r}=1 for ("People.Loc.$suffix","People.handler.$suffix.enter");
     }
@@ -546,6 +564,9 @@ sub GP_Catalog {
             >=GP_Attr($c->{NAME},'action_max_age',$GP_DEFAULT{action_max_age});
     push @{$catalog->{common_errors}},"$c->{NAME}: remove obsolete attribute $_; use set mode"
         for grep {exists $attr{$c->{NAME}}{$_}} qw(mode operatingMode);
+    # Retain the published bindings while a shared cache is cold. A change to
+    # another resident must not revoke this resident's in-flight plans.
+    $c->{helper}{gp_output_dependencies}=$catalog->{dependents};
     return $c->{helper}{gp_config}=$catalog;
 }
 
@@ -825,9 +846,11 @@ sub GeoPresence_Attr {
         if $key eq 'mode' || $key eq 'operatingMode';
     return 'Geometry is received from Geofency; do not configure coordinates or radius'
         if $cmd eq 'set' && ($d->{SUBTYPE}//'') eq 'location' && $key =~ /\A(?:latitude|longitude|radius)\z/;
-    return unless $GP_ALLOWED{$key};
     my $kind = $d->{SUBTYPE};
-    return "Attribute $key is not valid for $kind" unless grep { $_ eq $key } @{$GP_ATTRS{$kind}};
+    return "Attribute $key is not valid for $kind" if $GP_ALLOWED{$key}
+        && !grep { $_ eq $key } @{$GP_ATTRS{$kind}};
+    my @keys=GP_ConfigAttrKeys($d,$key,$cmd eq 'del');
+    return unless @keys || $key eq 'debugLog' || $key eq 'logFile';
     return "Attribute $key is not used by the selected sourceMode" if $cmd eq 'set' && $init_done
         && $kind eq 'resident' && !GP_ResidentAttrEnabled(GP_Attr($name,'sourceMode','geofency_phone'),$key);
     return "Attribute $key is not used by the selected trigger or location selector" if $cmd eq 'set' && $init_done
@@ -846,7 +869,7 @@ sub GeoPresence_Attr {
         delete @{$c->{helper}}{qw(gp_log_error gp_log_warning)};
         return;
     }
-    my $change={$key=>$cmd eq 'set' ? $value:undef};
+    my $change={map {$_=>$cmd eq 'set' ? $value:undef} @keys};
     my $error=GP_ConfigChangeError($c,$d,$change); return $error if $error;
     if ($cmd eq 'set') {
         return 'Invalid control character or command separator' if !defined($value) || $value =~ /[\r\n\x00;]/;
@@ -881,23 +904,25 @@ sub GeoPresence_Attr {
             return "$key already belongs to another resident" if grep {$_ ne $name && lc GP_Attr($_,$key,'') eq lc($value)} GP_Residents($c);
         }
     }
-    if ($init_done && ($key eq 'reorder_window' || $key eq 'action_max_age')) {
+    if ($init_done && (exists($change->{reorder_window}) || exists($change->{action_max_age}))) {
         # Loading applies attributes one at a time, possibly in sorted order.
         # Validate their relationship only once that complete configuration is
         # available. Interactive edits still validate the proposed pair here.
-        my $proposed=$cmd eq 'set' ? $value:$GP_DEFAULT{$key};
-        my $window=$key eq 'reorder_window' ? $proposed:GP_Attr($name,'reorder_window',$GP_DEFAULT{reorder_window});
-        my $age=$key eq 'action_max_age' ? $proposed:GP_Attr($name,'action_max_age',$GP_DEFAULT{action_max_age});
+        my $window=exists($change->{reorder_window}) ? $change->{reorder_window}//$GP_DEFAULT{reorder_window}
+            : GP_Attr($name,'reorder_window',$GP_DEFAULT{reorder_window});
+        my $age=exists($change->{action_max_age}) ? $change->{action_max_age}//$GP_DEFAULT{action_max_age}
+            : GP_Attr($name,'action_max_age',$GP_DEFAULT{action_max_age});
         return 'reorder_window must be smaller than action_max_age' if $window >= $age;
     }
     # Results belong to this phone identity. Returning to an old ID must not
     # revive a previous phone's setup data; same-ID spelling changes are harmless.
-    delete $c->{helper}{gp}{learned}{$name} if $key =~ /\A(?:deviceId|sourceMode|webhookUser)\z/
-        && ($cmd ne 'set' || lc($value) ne lc GP_Attr($name,$key,''));
+    delete $c->{helper}{gp}{learned}{$name} if grep {
+        exists($change->{$_}) && ($cmd ne 'set' || lc($value) ne lc GP_Attr($name,$_ ,''))
+    } qw(deviceId sourceMode webhookUser);
     # AttrFn runs before FHEM commits the attribute. Rebuild on the next tick.
     GP_ConfigChanged($c,$d,$change);
-    if ($key =~ /\A(?:sourceMode|trigger|locations|locationGroup|groups)\z/) {
-        local $attr{$name}{$key} = $cmd eq 'set' ? $value : $key eq 'sourceMode' ? 'geofency_phone':'';
+    if (grep {exists($change->{$_})} qw(sourceMode trigger locations locationGroup groups)) {
+        local @{$attr{$name}}{@keys}=@{$change}{@keys};
         GP_UpdateAttrLists();
     }
     return;
@@ -982,7 +1007,7 @@ sub GP_GeometryErrors {
 sub GP_RevokeGeometry {
     my ($s,$time,$now)=@_;
     delete @{$s}{qw(trip arrival approach automotive motion motion_time desired_status conflict)};
-    $s->{zones}={}; $s->{members}={}; $s->{intents}=[]; $s->{queued_phones}=[];
+    $s->{zones}={}; $s->{members}={}; GP_RevokeOutputs($s); $s->{queued_phones}=[];
     $s->{phase}='unknown'; $s->{location}='unknown';
     $s->{position_time}=$time if $time>($s->{position_time}//0);
     GP_ResetNegative($s,$time);
@@ -1421,7 +1446,24 @@ sub GP_NewState {
     return {start=>$now, generation=>$generation, phase=>'unknown', zones=>{}, seen=>{}, seen_order=>[],
         boundary=>0, seq=>0, phone=>GP_NewPhone(GP_UsesSource($source_mode,'phone')),
         last_decision=>'initialized', last_reason=>'new session; no qualified trip restored',
-        mono=>$mono, wall=>$now, notify_seen=>{}, notify_order=>[], trace=>[], intents=>[]};
+        mono=>$mono, wall=>$now, output_revision=>0, notify_seen=>{}, notify_order=>[], trace=>[], intents=>[]};
+}
+
+sub GP_RevokeOutputs {
+    my ($s)=@_;
+    $s->{output_revision}++;
+    $s->{intents}=[];
+}
+
+sub GP_RevokeDependentOutputs {
+    my ($c,@names)=@_;
+    my $rt=$c->{helper}{gp} or return;
+    my $dependencies=$c->{helper}{gp_output_dependencies}//{};
+    my %affected;
+    $affected{$_}=1 for map {keys %{$dependencies->{$_}//{}}} @names;
+    for my $r (keys %affected) {
+        GP_RevokeOutputs($rt->{$_}{$r}) for grep {$rt->{$_}{$r}} qw(prod debug);
+    }
 }
 
 sub GP_Trace {
@@ -1466,7 +1508,7 @@ sub GP_AfterStart {
 sub GP_RememberEvent {
     my ($s,$e)=@_;
     return unless $e->{key};
-    $s->{seen}{$e->{key}}={motion=>$e->{motion}//'unknown',received=>$e->{received}};
+    $s->{seen}{$e->{key}}={motion=>$e->{motion}//'unknown',received=>$e->{received},received_mono=>$e->{received_mono}};
     push @{$s->{seen_order}},$e->{key};
     delete $s->{seen}{shift @{$s->{seen_order}}} while @{$s->{seen_order}}>2000;
 }
@@ -1493,7 +1535,7 @@ sub GP_EnrichDuplicate {
     $s->{automotive}=$e->{time} if $e->{motion} eq 'automotive';
     # Keep the first receipt and original observation time. A retry cannot
     # refresh motion freshness or restart the Home wait.
-    my $enriched={%$e,received=>$seen->{received},role=>$zone->{role}};
+    my $enriched={%$e,received=>$seen->{received},received_mono=>$seen->{received_mono},role=>$zone->{role}};
     if (my $p=$s->{arrival}) {
         $p->{event}{motion}=$e->{motion} if ($p->{event}{key}//'') eq $e->{key};
         GP_BeginArrival($s,$cfg,$enriched,$now,$mono);
@@ -1631,20 +1673,20 @@ sub GP_Rules {
             if ($e->{time}-$s->{trip}{away_time}<$cfg->{minimum_away}
                 || $mono-$s->{trip}{away_mono}<$cfg->{minimum_away}) { $skip->('return before minimum away time'); next; }
         }
-        my %history=length($after) ? (after_exit=>$after,exit_time=>$exit,trip=>$s->{trip}{id}):();
+        my %history=length($after) ? (after_exit=>$after,exit_time=>$exit):();
+        $history{trip}=$s->{trip}{id} if $trigger eq 'arrival' || length($after);
+        my $key;
         if (GP_IsOpening($type)) {
             unless ($trigger eq 'arrival') { $skip->('opening requires confirmed arrival'); next; }
             if (($type eq 'door_open' && !$cfg->{allowDoor}) || ($type eq 'garage_open' && !$cfg->{allowGarage})) {
                 $skip->('resident has no permission for this actor'); next;
             }
-            my $key=join('|',$s->{trip}{id},$type,$rule->{params}{target}//'');
+            $key=join('|',$s->{trip}{id},$type,$rule->{params}{target}//'');
             if ($s->{trip}{actions}{$key}++) { $skip->('action already consumed in this trip'); next; }
-            push @{$s->{intents}}, {kind=>$type,key=>$key,trip=>$s->{trip}{id},rule=>$rule->{name},%history,
-                params=>$rule->{params},e=>{%$e},generation=>$s->{generation}};
         } else {
             my $visit=$trigger eq 'arrival' || length($after) ? $s->{trip}{id}
                 : length($e->{group}//'') ? ($s->{group_visits}{$e->{group}}//0) : ($s->{zone_visits}{$e->{zone}}//0);
-            my $key=join('|',$rule->{action},$trigger,$visit,$e->{selector}//'arrival');
+            $key=join('|',$rule->{action},$trigger,$visit,$e->{selector}//'arrival');
             my $label=$type eq 'switch_on' ? 'switch' : 'notification';
             if ($s->{notify_seen}{$key}) { $skip->("$label already consumed"); next; }
             if (defined($s->{notify_last}{$rule->{action}}) && $now-$s->{notify_last}{$rule->{action}}<$rule->{cooldown}) {
@@ -1653,9 +1695,10 @@ sub GP_Rules {
             $s->{notify_seen}{$key}=1; $s->{notify_last}{$rule->{action}}=$now;
             push @{$s->{notify_order}}, $key;
             delete $s->{notify_seen}{shift @{$s->{notify_order}}} while @{$s->{notify_order}}>2000;
-            push @{$s->{intents}}, {kind=>$type,key=>$key,rule=>$rule->{name},params=>$rule->{params},%history,
-                e=>{%$e},generation=>$s->{generation}};
         }
+        push @{$s->{intents}}, {kind=>$type,key=>$key,rule=>$rule->{name},trigger=>$trigger,%history,
+            params=>$rule->{params},e=>{%$e},generation=>$s->{generation},output_revision=>$s->{output_revision},
+            expires_mono=>GP_ActionMonoExpiry($cfg,$e,$now,$mono)};
     }
 }
 
@@ -1697,9 +1740,8 @@ sub GP_BeginArrival {
     if (!$p) {
         # Count from server receipt, never from a phone's possibly delayed date.
         # The reorder window is part of the wait, not an additional full wait.
-        my $elapsed=$now-$e->{received}; $elapsed=0 if $elapsed<0;
         $p=$s->{arrival}={event=>{%$e},trip=>$s->{trip}{id},generation=>$s->{generation},
-            start_mono=>$mono-$elapsed,started=>$e->{received},
+            start_mono=>$e->{received_mono},started=>$e->{received},
             vehicle_eligible=>GP_VehicleEligible($s,$cfg,$now)?1:0};
     }
     $p->{latest_home}={%$e} if ($e->{role}//'') eq 'home';
@@ -1727,10 +1769,21 @@ sub GP_ActionFresh {
     # Only the module's confirmation path supplies this allowance. Keep the
     # original event date/receipt; deliberate waiting does not turn a late retry
     # into a fresh observation or permit unbounded execution after a timer stall.
-    my $allowance=$e->{arrival_wait_budget}//0;
-    return $now-$e->{time}<=$cfg->{action_max_age}+$allowance
-        && $e->{time}<=$now+$cfg->{future_tolerance}
-        && $now-$e->{received}<=$cfg->{action_max_age}+$allowance;
+    return $e->{time}<=$now+$cfg->{future_tolerance} && $now<=GP_ActionExpiry($cfg,$e);
+}
+
+sub GP_ActionExpiry {
+    my ($cfg,$e)=@_;
+    my $oldest=$e->{time}<$e->{received} ? $e->{time}:$e->{received};
+    return $oldest+$cfg->{action_max_age}+($e->{arrival_wait_budget}//0);
+}
+
+sub GP_ActionMonoExpiry {
+    my ($cfg,$e,$now,$mono)=@_;
+    # Convert the observation's age at receipt only once. Later wall-clock
+    # corrections must not refund time spent queued or waiting for arrival.
+    my $received=$e->{received_mono}//($mono-($now-$e->{received}));
+    return $received+GP_ActionExpiry($cfg,$e)-$e->{received};
 }
 
 sub GP_ConfirmArrival {
@@ -1745,7 +1798,7 @@ sub GP_ConfirmArrival {
     }
     my $e={%{$p->{event}},arrival_wait_budget=>$p->{wait},
         arrival_vehicle_eligible=>$p->{vehicle_eligible},confirmation=>'timer'};
-    unless (GP_ActionFresh($cfg,$e,$now)) {
+    unless (GP_ActionFresh($cfg,$e,$now) && $mono<=GP_ActionMonoExpiry($cfg,$e,$now,$mono)) {
         GP_CancelArrival($s,$now,'arrival confirmation expired');
         $s->{phase}='away';
         return;
@@ -1792,7 +1845,7 @@ sub GP_CheckClock {
         delete @{$s}{qw(trip arrival approach automotive motion motion_time position_time desired_status resume_event_floor)};
         $s->{phone}=GP_NewPhone(GP_UsesSource($cfg->{sourceMode},'phone'));
         $s->{zones}={}; $s->{members}={}; $s->{phase}='unknown'; $s->{boundary}=0; $s->{start}=$now;
-        $s->{intents}=[]; $s->{generation}.=':clock';
+        GP_RevokeOutputs($s); $s->{generation}.=':clock';
         GP_Trace($s,$now,'clock discontinuity; permissions revoked');
     }
     $s->{wall}=$now; $s->{mono}=$mono;
@@ -1822,6 +1875,7 @@ sub GP_Process {
             || ($e->{kind} =~ /^phone_/ && !GP_UsesSource($cfg->{sourceMode},'phone'));
     $s->{last_observed}=$e->{time}; $s->{last_received}=$e->{received};
     $s->{last_key}=$e->{key}; $s->{config_revision}=GP_ConfigRevision($cfg);
+    $e->{received_mono}//=$mono-($now-$e->{received});
     GP_CheckClock($s,$cfg,$now,$mono);
     GP_Trace($s,$now,'observation received',{diagnostic_only=>1,source=>$e->{kind},zone=>$e->{zone},entry=>$e->{entry},
         motion=>$e->{motion},zone_position=>$e->{zone_position},current_position=>$e->{current_position}});
@@ -1911,6 +1965,7 @@ sub GP_Process {
     for my $name (keys %{$s->{zones}}) {
         if (GP_Contradiction($e,{%{$s->{zones}{$name}},zone=>$name},$cfg)) {
             $s->{conflict}=1; delete $s->{trip}; GP_CancelArrival($s,$now,'contradictory locations');
+            GP_RevokeOutputs($s);
             return GP_Trace($s,$now,'contradictory locations at same time');
         }
     }
@@ -2048,8 +2103,8 @@ sub GP_Phone {
         GP_ResetNegative($s,undef);
         delete $p->{missing_since};
         return unless $new_positive;
-        return {kind=>'phone_snapshot',time=>$latest,received=>$now,generation=>$s->{generation}} if $state_mode && $latest<=$s->{start};
-        return {kind=>'phone_present',time=>$latest,received=>$now,arrival=>$arrival,
+        return {kind=>'phone_snapshot',time=>$latest,received=>$now,received_mono=>$mono,generation=>$s->{generation}} if $state_mode && $latest<=$s->{start};
+        return {kind=>'phone_present',time=>$latest,received=>$now,received_mono=>$mono,arrival=>$arrival,
             key=>'phone:'.$latest.':'.$old_state} if $s->{phase} ne 'home' || $s->{trip};
         return;
     }
@@ -2073,7 +2128,7 @@ sub GP_Phone {
                 $p->{state}='absent'; $p->{health}=$state_mode?'held':'fresh'; $p->{qualified}=1;
                 return if $p->{negative_emitted};
                 $p->{negative_emitted}=1;
-                return {kind=>'phone_absent',time=>$observed,received=>$now,generation=>$s->{generation},
+                return {kind=>'phone_absent',time=>$observed,received=>$now,received_mono=>$mono,generation=>$s->{generation},
                     negative_generation=>$p->{negative_generation}//0,
                     negative_wall=>$p->{negative_wall},negative_since=>$p->{negative_since}};
             }
@@ -2692,7 +2747,7 @@ sub GP_HandleHTTP {
     return (413,'Request too large') if length($body)>16384;
     my $rt=$c->{helper}{gp};
     return (503,'Initializing') unless $rt && $rt->{ready};
-    my $now=GP_Now();
+    my ($now,$mono)=(GP_Now(),GP_Mono());
     if (!defined($rt->{rate_start}) || $now-$rt->{rate_start}>=60) { $rt->{rate_start}=$now; $rt->{rate_count}=0; }
     return (429,'Rate limit') if ++$rt->{rate_count}>120;
     my $auth=$headers->{authorization}//'';
@@ -2734,6 +2789,7 @@ sub GP_HandleHTTP {
     # retry these intentionally ignored observations after setup has finished.
     return (200,'OK ignored during learning; isTest=true required; no actions') if $learning && !$test;
     my ($e,$invalid)=GP_Normalize($c,$r,$cfg,$p,$now,$learning);
+    $e->{received_mono}=$mono if $e;
     @{$diag}{qw(zone entry observed)}=($e->{zone},$e->{entry},$e->{time}) if $e;
     if ($learning) {
         return (422,$invalid) if $invalid;
@@ -2850,42 +2906,83 @@ sub GP_ActorResult {
 }
 
 sub GP_CanOutput {
-    my ($c,$r,$s)=@_;
+    my ($c,$r,$s,$cfg,$debug)=@_;
     my $rt=$c->{helper}{gp};
-    return $rt && $rt->{ready} && GP_EffectiveMode($c,$r,0) eq 'active'
-        && $rt->{prod}{$r} && $rt->{prod}{$r}==$s && !$s->{conflict};
+    my $pool=$debug ? 'debug':'prod';
+    # Configuration edits reset their affected contexts or revoke their output
+    # versions. An unrelated shared-cache rebuild needs neither a new catalogue
+    # nor cancellation of this still-valid immutable resident snapshot.
+    return 0 unless $rt && GP_TimerCurrent($c,$rt) && $rt->{ready}
+        && GP_EffectiveMode($c,$r,$debug) eq ($debug ? 'debug':'active')
+        && ($rt->{$pool}{$r}//0)==$s && !$s->{conflict}
+        && ($cfg->{resident}//'') eq $r && GP_Field($cfg->{roommate},'TYPE','') eq 'ROOMMATE'
+        && !$c->{helper}{gp_http_error} && (!$cfg->{notify_required} || defined &pushMsg);
+    return 1;
+}
+
+sub GP_OutputReady {
+    my ($c,$r,$cfg,$s,$debug,$intent)=@_;
+    my $current=GP_CanOutput($c,$r,$s,$cfg,$debug);
+    my $offset=$debug ? ($s->{debug_offset}//0):0;
+    my ($now,$mono)=(GP_Now()+$offset,GP_Mono()+$offset);
+    my $reason;
+    if (!$current) {
+        $reason='output context no longer current';
+    } else {
+        # Caller-supplied timer times never authorize I/O. Static validation
+        # belongs to planning; only live permissions are checked here.
+        GP_CheckClock($s,$cfg,$now,$mono);
+        if (($intent->{generation}//'') ne $s->{generation}
+            || !defined($intent->{output_revision}) || $intent->{output_revision}!=$s->{output_revision}) {
+            $reason='output permission revoked';
+        } elsif ($intent->{after_exit}) {
+            my $trip=$s->{trip}//$s->{last_trip}//{};
+            my $proof=($trip->{exits}//{})->{$intent->{after_exit}};
+            $reason='prior exit revoked before dispatch' unless ($trip->{id}//'') eq ($intent->{trip}//'')
+                && defined($proof) && $proof==$intent->{exit_time};
+        }
+        if (!$reason && (($intent->{trigger}//'') eq 'arrival' || GP_IsOpening($intent->{kind}))) {
+            my $trip=$s->{last_trip}//{};
+            $reason='arrival permission revoked before dispatch' unless $s->{phase} eq 'home'
+                && $trip->{armed} && ($trip->{id}//'') eq ($intent->{trip}//'')
+                && GP_UsesSource($cfg->{sourceMode},'geo') && $cfg->{geometry_ready};
+            $reason='resident has no permission for this actor' if !$reason
+                && (($intent->{kind} eq 'door_open' && !$cfg->{allowDoor})
+                    || ($intent->{kind} eq 'garage_open' && !$cfg->{allowGarage}));
+        }
+        $reason='intent expired' if !$reason && (!GP_ActionFresh($cfg,$intent->{e},$now)
+            || !defined($intent->{expires_mono}) || $mono>$intent->{expires_mono});
+    }
+    return ($now,$mono) unless $reason;
+    GP_Trace($s,$now,$reason,{rule=>$intent->{rule},kind=>$intent->{kind},decision=>'suppressed'});
+    return;
 }
 
 sub GP_Dispatch {
-    my ($c,$r,$cfg,$s,$debug,$now,$mono)=@_;
+    my ($c,$r,$cfg,$s,$debug)=@_;
     # Consuming the trip is checkpointed BEFORE any synchronous device/logging
     # callback can save state or reload the module during an opening request.
     GP_Checkpoint($c,$r,$cfg,$s) unless $debug;
     my $intents=$s->{intents}; $s->{intents}=[];
+    my $revision=$s->{output_revision};
     for my $intent (@$intents) {
-        next if $intent->{generation} ne $s->{generation};
-        next if $s->{conflict};
-        if ($intent->{after_exit}) {
-            my $trip=$s->{trip}//$s->{last_trip}//{};
-            my $proof=($trip->{exits}//{})->{$intent->{after_exit}};
-            unless (($trip->{id}//'') eq $intent->{trip} && defined($proof) && $proof==$intent->{exit_time}) {
-                GP_Trace($s,$now,'prior exit revoked before dispatch',{rule=>$intent->{rule}}); next;
-            }
-        }
-        if (GP_IsOpening($intent->{kind}) && $s->{phase} =~ /\A(?:away|leaving|unknown)\z/) {
-            GP_Trace($s,$now,'opening cancelled by newer position'); next;
-        }
-        unless (GP_ActionFresh($cfg,$intent->{e},$now)) { GP_Trace($s,$now,'intent expired'); next; }
+        # A callback can invalidate the whole remainder. Do not walk and log
+        # every obsolete candidate after a mode/configuration reset or revoke.
+        last if $s->{output_revision}!=$revision || !GP_CanOutput($c,$r,$s,$cfg,$debug);
+        my ($now,$mono);
         if ($debug) {
+            ($now,$mono)=GP_OutputReady($c,$r,$cfg,$s,1,$intent);
+            next unless defined $now;
             GP_Trace($s,$now,'would execute; debug suppressed', {rule=>$intent->{rule},kind=>$intent->{kind},target=>$intent->{params}{target}//'pushMsg'});
             next;
         }
-        last unless GP_CanOutput($c,$r,$s);
         my $p=$intent->{params};
         if ($intent->{kind} eq 'notify') {
             my $message=$p->{message}//'';
             $message =~ s/%resident%/$cfg->{label}/g;
-            unless (GP_SafeText($message)) { GP_Trace($s,$now,'unsafe notification text rejected'); next; }
+            unless (GP_SafeText($message)) { GP_Trace($s,GP_Now(),'unsafe notification text rejected'); next; }
+            ($now,$mono)=GP_OutputReady($c,$r,$cfg,$s,0,$intent);
+            next unless defined $now;
             my $ok=eval {GP_Profile($c,'notification','pushMsg',sub {pushMsg($p->{channel}//0,$p->{priority}//0,$message)});1};
             GP_RecordAction($c,$r,$s,$now,$ok?'notification dispatched':'notification failed',
                 {rule=>$intent->{rule},channel=>$p->{channel}//0,message=>$message});
@@ -2896,18 +2993,28 @@ sub GP_Dispatch {
             # never arbitrary FHEM command text. Configuration validates target
             # conflicts with door/garage actions before accepting an event.
             next unless GP_Name($p->{target}) && exists($defs{$p->{target}}) && ($p->{command}//'') eq 'on';
+            ($now,$mono)=GP_OutputReady($c,$r,$cfg,$s,0,$intent);
+            next unless defined $now;
             my $error=eval {GP_Profile($c,'actor_command',$p->{target},sub {CommandSet(undef,$p->{target}.' on')})};
             $error=$@ if $@;
             GP_RecordAction($c,$r,$s,$now,$error ? 'switch command failed':'switch command dispatched',
                 {rule=>$intent->{rule},kind=>'switch_on',target=>$p->{target}});
             next;
         }
+        next unless GP_IsOpening($intent->{kind});
         my $target=$p->{target};
+        my $command=$intent->{kind} eq 'door_open' ? 'lock unlocked':'on';
+        next unless ($p->{command}//'') eq $command;
         my $rt=$c->{helper}{gp};
+        ($now,$mono)=GP_OutputReady($c,$r,$cfg,$s,0,$intent);
+        next unless defined $now;
         # A preceding resident's command may already have completed synchronously
         # in this timer pass. Only a still-pending request can be shared.
-        GP_ActorFeedback($c,$now,$mono) if $rt->{actors}{$target};
-        last unless GP_CanOutput($c,$r,$s);
+        if ($rt->{actors}{$target}) {
+            GP_ActorFeedback($c,$now,$mono);
+            ($now,$mono)=GP_OutputReady($c,$r,$cfg,$s,0,$intent);
+            next unless defined $now;
+        }
         if ($rt->{actors}{$target}) {
             $rt->{actors}{$target}{waiters}{$r}=1;
             GP_Trace($s,$now,'shared actor already pending',{target=>$target});
@@ -2930,8 +3037,17 @@ sub GP_Dispatch {
         # Subscribe before CommandSet as the complete pulse may be reported
         # synchronously, with the same value and TIME as the previous pulse.
         GP_UpdateNotifyDevices($c);
+        ($now,$mono)=GP_OutputReady($c,$r,$cfg,$s,0,$intent);
+        unless (defined $now) {
+            # This reservation has not issued a command. Remove only our own
+            # slot, including if a reset retained the shared actors hash.
+            delete $rt->{actors}{$target} if ($rt->{actors}{$target}//0)==$actor;
+            GP_UpdateNotifyDevices($c) if $c->{helper}{gp} && GP_TimerCurrent($c,$c->{helper}{gp});
+            next;
+        }
+        @{$actor}{qw(start mono)}=($now,$mono);
         $s->{$result}='dispatch_started';
-        my $error=eval {GP_Profile($c,'actor_command',$target,sub {CommandSet(undef,$target.' '.$p->{command})})};
+        my $error=eval {GP_Profile($c,'actor_command',$target,sub {CommandSet(undef,$target.' '.$command)})};
         $error=$@ if $@;
         $s->{$result}=$error ? 'failed':'pending';
         GP_RecordAction($c,$r,$s,$now,$error?'actor command failed':'actor command dispatched',
@@ -2942,7 +3058,7 @@ sub GP_Dispatch {
 sub GP_Publish {
     my ($c,$r,$cfg,$s)=@_;
     GP_Checkpoint($c,$r,$cfg,$s);
-    return unless GP_CanOutput($c,$r,$s);
+    return unless GP_CanOutput($c,$r,$s,$cfg,0);
     my $rr=$defs{$r}{ROOMMATE};
     if (my $status=delete $s->{desired_status}) {
         my $current=GP_Read($rr,'state','unknown');
@@ -2953,7 +3069,7 @@ sub GP_Publish {
             GP_Profile($c,'roommate_command',$rr,sub {CommandSet(undef,"$rr state $status")});
         }
     }
-    return unless GP_CanOutput($c,$r,$s);
+    return unless GP_CanOutput($c,$r,$s,$cfg,0);
     my $t=$s->{trip}//{};
     my $arrival=$s->{arrival}//{};
     my %readings=(gp_phase=>$s->{phase},gp_location=>$s->{location}//'unknown',gp_trip_id=>$t->{id}//'',
@@ -3129,6 +3245,7 @@ sub GP_TimerStep {
                     push @{$s->{queued_phones}},$phone;
                     if (@{$s->{queued_phones}}>32) {
                         $s->{queued_phones}=[]; delete @{$s}{qw(trip arrival)};
+                        GP_RevokeOutputs($s);
                         GP_ResetNegative($s,$wall);
                         GP_Trace($s,$wall,'phone queue overflow; permissions revoked');
                     }
@@ -3192,6 +3309,7 @@ sub GP_TimerStep {
                 }
                 if ($conflict) {
                     delete $s->{trip}; GP_CancelArrival($s,$wall,'conflicting batch'); $s->{conflict}=1;
+                    GP_RevokeOutputs($s);
                     GP_Trace($s,$wall,'conflicting batch; actions quarantined');
                 }
                 $s->{intents}=\@pending;
@@ -3199,7 +3317,7 @@ sub GP_TimerStep {
                 # phone observations have been ordered and processed. Never
                 # dispatch while an exit is still held by reorder_window.
                 GP_Profile($c,'arrival',$target,sub {GP_ConfirmArrival($s,$cfg,$wall,$clock)});
-                GP_Profile($c,'dispatch',$target,sub {GP_Dispatch($c,$r,$cfg,$s,$debug,$wall,$clock)});
+                GP_Profile($c,'dispatch',$target,sub {GP_Dispatch($c,$r,$cfg,$s,$debug)});
                 return unless GP_TimerCurrent($c,$rt);
             }
             GP_Profile($c,'publish_geometry',$target,sub {GP_PublishGeometry($c,$r,$s)}) unless $debug;
@@ -3231,6 +3349,7 @@ sub GeoPresence_Notify {
                 my $inventory=$c->{helper}{gp_devices};
                 if ($event =~ /\A(DEFINED|DELETED|RENAMED|MODIFIED) (\S+)(?: (\S+))?/) {
                     my $operation=$1; my @names=grep {defined} ($2,$3);
+                    GP_RevokeDependentOutputs($c,@names);
                     my $own=grep {
                         ($inventory && $inventory->{members}{$_}) || (GP_Field($_,'TYPE','') eq 'GeoPresence'
                             && GP_Field($_,'CONTROLLER','') eq $c->{NAME})
@@ -3244,18 +3363,39 @@ sub GeoPresence_Notify {
                     # already updates its widgets. Only membership changes can
                     # affect global choices, including PRESENCE devices.
                     GP_UpdateAttrLists() if $operation ne 'MODIFIED';
-                } elsif ($inventory && $event =~ /\A(ATTR|DELETEATTR) (\S+)(?: (\S+))?/) {
+                } elsif ($event =~ /\A(ATTR|DELETEATTR) (\S+)(?: (.*))?\z/s) {
                     my ($operation,$name,$key)=($1,$2,$3//'');
-                    # Cosmetic action attributes never enter a descriptor or
-                    # its fingerprint. Source attributes remain live in the
-                    # source adapters; dependent edits also refresh labels and
-                    # static reference checks after FHEM committed the change.
-                    next if $key =~ /\A(?:room|group|icon|verbose|comment|debugLog|logFile)\z/;
-                    my $own=$inventory->{members}{$name};
-                    GP_InvalidateConfig($c) if $own
-                        ? ($operation eq 'DELETEATTR' || $GP_ALLOWED{$key}
-                            || $key =~ /\A(?:mode|operatingMode|role|condition)\z/)
-                        : $catalog && $catalog->{dependents}{$name};
+                    $key =~ s/\s.*//s if $operation eq 'ATTR';
+                    next if $GP_DISPLAY_ATTR{$key} && $key ne 'alias';
+                    my $own=($inventory && $inventory->{members}{$name})
+                        || (GP_Field($name,'TYPE','') eq 'GeoPresence' && GP_Field($name,'CONTROLLER','') eq $c->{NAME});
+                    my $dependent=($c->{helper}{gp_output_dependencies}//{})->{$name};
+                    next unless $own || $dependent;
+                    my @keys=($key);
+                    if ($operation eq 'DELETEATTR' && $key !~ /\A[\w-]+\z/) {
+                        # FHEM reports the original pattern after deletion.
+                        # Resolve external names from FHEM's device schema;
+                        # removed attributes are no longer in the live hash.
+                        my @available=$own
+                            ? (@{$GP_ATTRS{$defs{$name}{SUBTYPE}//''}//[]},keys %GP_LEGACY_ATTR,keys %GP_DISPLAY_ATTR)
+                            : (map {s/:.*//r} (split(/\s+/,getAllAttr($name)),keys %{$attr{$name}//{}}));
+                        @keys=GP_MatchingAttrs($key,@available);
+                    }
+                    my $alias=grep {$_ eq 'alias'} @keys;
+                    @keys=grep {!$GP_DISPLAY_ATTR{$_}} @keys;
+                    unless (@keys) {
+                        # Only ROOMMATE labels are cached in resident snapshots;
+                        # display-only changes never revoke pending outputs.
+                        GP_InvalidateConfig($c) if $alias && $catalog && $dependent
+                            && GP_Field($name,'TYPE','') eq 'ROOMMATE';
+                        next;
+                    }
+                    my $relevant=$own
+                        ? scalar(grep {$GP_ALLOWED{$_} || $GP_LEGACY_ATTR{$_}} @keys)
+                        : $dependent;
+                    next unless $relevant;
+                    GP_RevokeDependentOutputs($c,$name);
+                    GP_InvalidateConfig($c);
                 }
             }
         }
@@ -3291,7 +3431,7 @@ sub GeoPresence_Notify {
         delete $s->{trip}; GP_CancelArrival($s,GP_Now(),'manual home');
         delete $s->{last_trip}{exits} if $s->{last_trip};
         $s->{members}={};
-        $s->{phase}='home'; $s->{boundary}=GP_Now(); $s->{intents}=[];
+        $s->{phase}='home'; $s->{boundary}=GP_Now(); GP_RevokeOutputs($s);
         $s->{position_time}=$s->{boundary}; $s->{desired_status}='home';
         GP_ResetNegative($s,$s->{boundary});
         GP_Trace($s,GP_Now(),'manual home; no opening');
@@ -4040,6 +4180,7 @@ set System.GeoPresence applyGeometry Geo.PERSON
 set Geo.PERSON mode debug</pre>
   <p>Test in debug before activation. New or changed geometry cancels the previous trip, pending actions and phone absence qualification; no rules execute in that event batch. A fresh, consistent Home exit may start a new unconfirmed local trip after geometry validation. It needs new departure confirmation: a full new phone absence window after the exit or independent Geo distance evidence under the source profile's normal rules. A changed-geometry Home entry alone never grants opening permission. Diagnostics identify the location, original event time and changed values in <code>geometry_changes</code>.</p>
   <p>A duplicate Home or approach entry may fill missing motion while that arrival section is still current. It does not replay visits or rules, replace known motion, refresh the observation timestamp or restart the Home wait. Completed or interrupted arrivals are not reopened. Debug plans appear as <code>would execute; debug suppressed</code>. The light, door, garage, notifications and ROOMMATE are not changed by the simulation. Start with the German handbook <code>doc/GeoPresence_Handbuch.md</code> for a complete resident setup and examples of locations, actions and rules. The separate <code>doc/GeoPresence_Testanleitung.md</code> describes automated everyday tests and guided phone tests for custom actions and groups.</p>
+  <p>Every output is checked immediately before the adapter call against the current mode, configuration, revocations and clocks. Manual ROOMMATE home also cancels plans already taken from the pending list: a door callback cannot leave the following garage command authorized. Slow callbacks do not extend the remaining time of later commands. The monotonic deadline is anchored to the original receipt, including time spent queued or awaiting arrival confirmation, so a backward wall-clock correction cannot extend it. Display aliases do not revoke pending commands, including alias deletion patterns such as <code>^alias$</code>. Deleting obsolete attributes also refreshes validation when a deletion pattern is used. Configuration guards apply to attribute deletion patterns and deletion of all attributes; controller changes affect every resident. Already issued actuator requests continue to receive feedback after a revocation.</p>
 
   <a id="GeoPresence-operation"></a>
   <h4>Operation, transport and persistence</h4>

@@ -1,6 +1,6 @@
 # GeoPresence – Architektur
 
-**Version 0.54 · Stand 25.10.2026 · Handbuch 2.16**
+**Version 0.57 · Stand 26.10.2026 · Handbuch 2.19**
 
 Diese Beschreibung spezifiziert den aktuellen Aufbau von `FHEM/98_GeoPresence.pm`. Einrichtung und Bedienung stehen im [Handbuch](GeoPresence_Handbuch.md); Prüfabläufe und Testprogramm sind in der [Testanleitung](GeoPresence_Testanleitung.md) beschrieben. Gerätenamen wie `Geo.PERSON` und `Geo.PERSON.ORT` sind austauschbare Beispiele.
 
@@ -84,6 +84,10 @@ Gerätesuche, gemeinsame Identitäts- und Hardwarekonfliktprüfungen sowie stati
 
 Der Attributcallback prüft interaktive Änderungen vor der Übernahme; erst ein späterer Verarbeitungspunkt baut die vollständige Konfiguration aus den tatsächlich übernommenen Werten auf. Abgelehnte Änderungen ersetzen keinen laufenden Stand. Beim Start und bei `rereadcfg` erfolgen Einzelwertprüfungen sofort, Beziehungen wie `reorder_window < action_max_age` dagegen erst am vollständig eingelesenen Stand. Damit bleiben gültige gespeicherte Werte unabhängig von der alphabetischen Attributreihenfolge erhalten. Ein ungültiger Gesamtstand sperrt die Verarbeitung und wird nicht durch stillschweigend verwendete Standardwerte ersetzt. INITIALIZED, REREADCFG und Modulreload verwerfen den aufbereiteten Stand ebenfalls.
 
+Auch Löschmuster und vollständige Attributlöschungen werden vor der Übernahme anhand der Fachattribute des jeweiligen Gerätetyps geprüft. Sie durchlaufen gemeinsam den Aktiv-Schutz, die Prüfung der resultierenden Zeitwerte und eine einmalige Rücksetzung; gleichzeitig gelöschte Werte gelten dabei zusammen als Standardwerte. Reine Aliasänderungen widerrufen keine Aktionspläne. Ein ROOMMATE-Alias aktualisiert beim nächsten Konfigurationszugriff den Nachrichtenbezeichner, ohne laufende Freigaben zu ändern.
+
+Die globale Entwertung löst Löschmuster vor der Relevanzentscheidung in Attributnamen auf. Für externe Geräte verwendet sie deren FHEM-Attributbeschreibung; für eigene Geräte zusätzlich die bekannten, vom Validator beanstandeten Altattribute `mode`, `operatingMode`, `role` und `condition`. So erhalten Aliaslöschmuster wie `^alias$` dieselbe Behandlung wie die direkte Löschung. Die Bereinigung beanstandeter Altattribute verwirft den gespeicherten Prüfstand, ohne während der Attributübernahme einen neuen Katalog aufzubauen.
+
 Produktive und simulierte Geometrie besitzen getrennte abgeleitete Ansichten. Neue Koordinaten, Radien oder Konfliktmarkierungen erneuern nur die Ansicht der betroffenen Person und des betroffenen Bereichs. Ein neuer Beobachtungszeitstempel bei unveränderten Kreisen löst weder eine erneute Regelaufbereitung noch eine erneute Prüfung der Kreisverschachtelung aus. Moduswechsel und Debug-Reset verwerfen die jeweils betroffenen Ansichten entsprechend ihrem Geometrievertrag.
 
 Sensorwerte, Quellenstörungen, Scanintervalle, aktuelle Aktorrückmeldungen, die Verfügbarkeit von `pushMsg` und Listenerfehler bleiben Laufzeitdaten und werden weiterhin aktuell ausgewertet. Berichtsaufbereitung und Darstellung verwenden denselben Konfigurationsstand. Die Konfigurationsbindung übernimmt ausschließlich verwendete Adapterparameter; `room` und ungenutzte Aktorattribute beeinflussen deshalb keinen neuen Checkpoint. Ältere Checkpoints, deren Fingerabdruck noch solche zusätzlichen Aktorattribute enthält, werden beim ersten Versionswechsel sicher verworfen; danach ist ein neuer Abwesenheitsnachweis erforderlich.
@@ -147,6 +151,8 @@ GeoPresence speichert Beobachtungszeit und Empfangszeit getrennt. Eine kurze War
 Liefert eine Wiederholung desselben Home- oder Annäherungseintritts erstmals eine Bewegungsart, darf sie fehlende Transportdaten im noch aktuellen Ankunftsabschnitt ergänzen. Bereits bekannte Bewegungsarten werden dadurch nicht ersetzt. Wiederholungen innerhalb desselben Bündels werden vor dessen Reiseauswertung zusammengeführt, damit auch eine anschließende Telefonbestätigung den Fußwegnachweis berücksichtigt. Bei einer noch wartenden Rückkehr wird die passende Ankunftsfrist weiterhin vom ersten Empfang gerechnet; der ursprüngliche Beobachtungszeitpunkt bestimmt die Bewegungsfrische. Bereits abgeschlossene oder unterbrochene Ankünfte werden nicht erneut ausgeführt, Regeln und Besuche nicht wiederholt. Eine Ergänzung in einem späteren Timerlauf erscheint als `duplicate event enriched with motion`.
 
 Standardmäßig dürfen Beobachtungen für neue Aktionen höchstens 90 Sekunden alt und höchstens 30 Sekunden in der Zukunft liegen. Die Zeit der ursprünglichen Meldung bleibt auch während einer vorgesehenen Ankunftsfrist erhalten; nur diese kontrollierte Frist erweitert das Ausführungsbudget. Ein Timerstau oder ein verspäteter Retry macht alte Daten nicht neu.
+
+Beim Empfang wird zusätzlich die monotone Zeit erfasst. Die frühere Originalzeit von Beobachtung und Empfang begrenzt das Aktionsalter; ihr Unterschied wird auf den ursprünglichen monotonen Empfangszeitpunkt bezogen. Warteschlange, Ankunftsfrist und Bewegungsnachträge behalten diesen Bezug bei. Ein später erzeugter Plan übernimmt daraus seine Ablaufgrenze einschließlich der vorgesehenen Ankunftsfrist. Die Ankunftsbestätigung selbst prüft bereits diese Grenze. Unmittelbar vor der Ausgabe werden Systemzeit und monotone Zeit neu gelesen; Zeitwerte vom Anfang des Timerlaufs erteilen keine Freigabe. Dadurch verlängern weder langsame Rückrufe noch kleine rückwärts gerichtete Systemzeitkorrekturen vor oder nach der Planerzeugung die verbleibende Frist.
 
 Für Fristen wird eine monotone Uhr verwendet. Ein deutlicher Sprung zwischen Systemzeit und monotoner Uhr setzt Öffnungsberechtigungen zurück. Nach einer neuen Sitzung gilt eine Anlaufgrenze gegen nachträglich zugestellte alte Meldungen.
 
@@ -298,6 +304,22 @@ Gleichzeitige berechtigte Ankünfte können denselben laufenden Zielauftrag teil
 
 Produktive Aufträge werden auch bei anschließendem Debug weiterhin auf Abschluss überwacht. Debug-Aufträge erzeugen keine Reservierung eines realen Aktors. Die Türsteuerung entscheidet über Impulsdauer und Mechanik; GeoPresence setzt nicht voraus, dass jede Tür nach einem Öffnungsimpuls dauerhaft entriegelt bleibt.
 
+### 9.4 Abschließende Freigabe
+
+Tür, Garage, Licht und Benachrichtigung verwenden dieselbe abschließende Freigabe. Ein Plan enthält die Regel, den Auslöser, seine Originalbeobachtung, gemeinsam verwendete Aktorparameter, gegebenenfalls Reise und Austrittsnachweis sowie die Freigabenummer und monotone Ablaufgrenze. Die Regeln erfassen den Verbrauch weiterhin einmal vor der Ausgabe; die gemeinsame Planerzeugung ersetzt getrennte Konstruktionen für Öffnungs- und gewöhnliche Aktionen.
+
+Die Ausgabe verlangt den weiterhin aktuellen produktiven beziehungsweise simulierten Zustand und den passenden Modus. Relevante Konfigurationsänderungen setzen die betroffenen Zustände zurück oder widerrufen ihre Freigabenummer anhand der bereits bekannten Geräteabhängigkeiten. Änderungen an anderen Personen lassen einen laufenden, weiterhin gültigen Plan bestehen, auch wenn der gemeinsame Konfigurationscache dadurch erneuert werden muss. Die Abschlussprüfung baut keinen Katalog auf und wiederholt keine statische Vollvalidierung. Sie prüft aktuelle Betriebsfehler, Freigabenummer, Sitzung, bereits verarbeitete Gegenbeobachtungen, erforderliche Austrittsnachweise und beide aktuellen Uhren. Ankunftsaktionen bleiben an den bestätigten Abschluss derselben berechtigten Reise gebunden; Tür und Garage prüfen zusätzlich die persönliche Berechtigung.
+
+Die Attributrelevanz wird vor dem Widerruf bestimmt; Alias- und Diagnoseänderungen entziehen keine fachliche Berechtigung. Jeder Bewohner ist im Abhängigkeitsindex zusätzlich seinem Controller zugeordnet. Eine bereits übernommene fachliche Controlleränderung erreicht damit alle laufenden Pläne, auch nach einer Sammellöschung und bei kaltem Cache.
+
+Bei Musterlöschungen werden Anzeigeattribute anhand der aufgelösten Namen erkannt. `deleteattr rr_PERSON ^alias$` erneuert deshalb nur den zwischengespeicherten Nachrichtenbezeichner. Ein Muster, das zusätzlich `rr_locationUnderway` entfernt, widerruft weiterhin die abhängigen Ausgaben.
+
+Manuelles ROOMMATE `home`, Geometriewiderruf, Uhrsprung, widersprüchliche Beobachtungen und Telefon-Warteschlangenüberlauf entwerten ausstehende Ausgaben durch eine neue Freigabenummer. Das gilt auch dann, wenn eine Befehlsliste bereits lokal aus der Warteliste entnommen wurde. Ein manueller Home-Wechsel innerhalb des Türbefehls stoppt deshalb den anschließenden Garagenplan, obwohl der Bewohner bereits die Phase home hatte. Ein veralteter Gesamtvorgang bricht die restliche Liste ab; einzelne abgelaufene Pläne können keine noch gültigen anderen Pläne sperren.
+
+Die vier festen Ausgabepfade bleiben erhalten. Der Öffnungsadapter prüft die Aktorposition, reserviert das Ziel und registriert seine Rückmeldungen vor `CommandSet`. Nach dieser Vorbereitung erfolgt die Abschlussfreigabe erneut; eine noch nicht ausgegebene, dabei abgelehnte Reservierung wird entfernt. Auftragsbeginn und Timeout verwenden die aktuelle Zeit der tatsächlichen Ausgabe. Checkpoint-Verbrauch wird weiterhin vor produktiven Adapteraufrufen gespeichert. Bereits ausgegebene Aufträge werden bei einem späteren Widerruf weiter auf Rückmeldung überwacht.
+
+Freigabenummern und monotone Ablaufgrenzen gehören nur zur laufenden Sitzung und werden nicht als ausführbare Aufträge im Checkpoint gespeichert. Debug prüft denselben Freigabevertrag, schreibt jedoch ausschließlich den Simulationsplan und ruft keinen produktiven Adapter auf.
+
 ## 10. Simulation, Diagnose und Oberfläche
 
 ### 10.1 Getrennte Zustände
@@ -378,7 +400,31 @@ Regressionstests prüfen eine Radiusänderung beim Home-Austritt mit zuvor quali
 
 Laufzeittests unterscheiden einen fremden blockierenden Timer von einem synchronen, absichtlich verzögerten Notify am Dummy-Aktor. Weitere Prüfungen decken Reading-Callbacks, Dateiausgabe einschließlich der eigenen Slow-Run-Diagnose, begrenzte Historien, unveränderte Ausführung und die Trennung inklusiver und exklusiver Messzeiten ab.
 
+Die Ausgaberegressionen prüfen manuelle Heimsetzung während des Türbefehls, abgelaufene und noch gültige Folgeaufträge, Rückrufe von Nachrichten und Licht, kleine Uhrkorrekturen, veränderte Konfiguration und die Bereinigung nicht ausgegebener Reservierungen. Die reale FHEM-Integration verwendet zusätzlich einen Home-setzenden Notify und einen echten Rückruf mit 1,5 Sekunden Wartezeit am Dummy-Türaktor. Die Garage bleibt jeweils unverändert; die Rückmeldung der bereits angeforderten Tür wird weiter übernommen. Eine Gegenprobe richtet im Tür-Rückruf eine unbeteiligte Person ein; der weiterhin berechtigte Garagenbefehl wird dabei ausgeführt.
+
+Weitere Regressionen prüfen Aliasänderungen und Aliaslöschungen innerhalb des Türbefehls, Controller-Sammellöschungen vor und nach der Übernahme, gemeinsam wiederhergestellte Zeitstandardwerte sowie kleine Uhrkorrekturen während Warteschlange und Ankunftsfrist. Die reale FHEM-Gegenprobe stellt die Systemzeit während der Ankunftsfrist um zehn Sekunden zurück und verzögert anschließend den Tür-Rückruf tatsächlich um 2,5 Sekunden; die Garage erhält keine verlängerte Frist.
+
+Die Nachprüfung ergänzt verschiedene Aliaslöschmuster am ROOMMATE bei warmen und kalten Caches sowie die Erneuerung gespeicherter Fehler nach der Musterlöschung von Altattributen. Reale FHEM-Befehle prüfen dabei sowohl den weiter ausgegebenen Garagenbefehl als auch eine erfolgreiche Validierung und Aktivierung nach der Bereinigung.
+
 ## 13. Änderungen seit der letzten Version
+
+Änderungen von Version 0.56 auf 0.57:
+
+- Löschmuster werden vor der Attributklassifikation aufgelöst; Aliaslöschmuster am ROOMMATE erhalten gültige Folgeaufträge.
+- Die globale Cache-Entwertung berücksichtigt auch gemustert gelöschte, vom Validator beanstandete Altattribute.
+- Gemeinsamer Musterabgleich und FHEM-Attributbeschreibungen ersetzen weitere Sonderfälle für einzelne Musterschreibweisen.
+
+Änderungen von Version 0.55 auf 0.56:
+
+- Attributrelevanz vor dem Widerruf; Aliasänderungen erhalten gültige Folgeaufträge.
+- Monotone Fristen bleiben vom ursprünglichen Empfang über Warteschlange und Ankunftsfrist bis zur Ausgabe verankert.
+- Controller-Abhängigkeiten und gemeinsam geprüfte Sammellöschungen schließen den Schutz vor veralteten Konfigurationsparametern.
+
+Änderungen von Version 0.54 auf 0.55:
+
+- [[#9.4 Abschließende Freigabe|Abschnitt 9.4]]: Gemeinsame Freigabe für alle vier Ausgabepfade, Widerruf bereits entnommener Pläne und erneute Prüfung nach synchronen Rückrufen.
+- [[#4.2 Reihenfolge und Frische|Abschnitt 4.2]]: Aktuelle Uhren vor der Ausgabe und eine monotone Ablaufgrenze verhindern die Ausführung inzwischen veralteter Aufträge.
+- Gemeinsame Planerzeugung, feste Öffnungsbefehle und Entfernung noch nicht ausgegebener Reservierungen; passive Rückmeldungen und Checkpoint-Verbrauch bleiben erhalten.
 
 Änderungen von Version 0.53 auf 0.54:
 
