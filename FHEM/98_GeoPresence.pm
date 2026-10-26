@@ -1545,10 +1545,10 @@ sub GP_EnrichDuplicate {
     $seen->{motion}=$e->{motion};
     $s->{motion}=$e->{motion}; $s->{motion_time}=$e->{time};
     $s->{automotive}=$e->{time} if $e->{motion} eq 'automotive';
-    # Keep the first receipt and original observation time. A retry cannot
-    # refresh motion freshness or restart the Home wait.
-    my $enriched={%$e,received=>$seen->{received},received_mono=>$seen->{received_mono},role=>$cfg->{zones}{$e->{zone}}{role}};
     if (my $p=$s->{arrival}) {
+        # Keep the first receipt and original observation time. A retry cannot
+        # refresh motion freshness or restart the Home wait.
+        my $enriched={%$e,received=>$seen->{received},received_mono=>$seen->{received_mono},role=>$cfg->{zones}{$e->{zone}}{role}};
         $p->{event}{motion}=$e->{motion} if ($p->{event}{key}//'') eq $e->{key};
         GP_BeginArrival($s,$cfg,$enriched,$now,$mono);
     }
@@ -2083,8 +2083,7 @@ sub GP_Process {
         GP_Rules($s,$cfg,$e->{entry}?'enter':'exit',$event,$now,$mono);
     }
     if ($e->{entry} && ($role eq 'home' || $role eq 'approach')) {
-        if ($role eq 'home') { GP_BeginArrival($s,$cfg,$e,$now,$mono); }
-        elsif ($s->{arrival}) { GP_BeginArrival($s,$cfg,$e,$now,$mono); }
+        if ($role eq 'home' || $s->{arrival}) { GP_BeginArrival($s,$cfg,$e,$now,$mono); }
         elsif ($s->{trip} && $s->{trip}{armed}) {
             $s->{phase}='returning'; $s->{approach}={key=>$e->{key},origin_time=>$e->{time},mono=>$mono};
         }
@@ -3315,11 +3314,12 @@ sub GP_TimerStep {
             my $batch_ready=!@batch || grep {$_->{due}<=$mono} @batch;
             if ($batch_ready) {
                 @{$rt->{queue}}=grep {!($_->{resident} eq $r && $_->{debug}==$debug)} @{$rt->{queue}};
-                my @events=sort {$a->{time}<=>$b->{time}} map {{%{$_->{event}}}}
-                    grep {$_->{epoch}==$rt->{epoch}} @batch;
                 my ($geometry_changed,$geometry_conflict)=(0,0);
-                my @accepted;
-                for my $e (@events) {
+                my @events;
+                # Dequeued events belong to this batch; arrivals and plans keep
+                # their own snapshots. Iterate sorted input, collecting output.
+                for my $e (sort {$a->{time}<=>$b->{time}} map {$_->{event}}
+                    grep {$_->{epoch}==$rt->{epoch}} @batch) {
                     my $result=GP_Profile($c,'geometry',$target,sub {GP_UpdateGeometry($c,$r,$debug,$s,$e,$cfg,$wall)});
                     if ($result eq 'stale') {
                         GP_Trace($s,$wall,'stale geometry observation ignored',{zone=>$e->{zone}});
@@ -3328,16 +3328,15 @@ sub GP_TimerStep {
                         # approach or Home wait. A registered motion supplement
                         # may enrich that arrival without rewinding its position.
                         my $z=$cfg->{zones}{$e->{zone}}//{};
-                        push @accepted,$e if (GP_InterruptsArrival($s,$cfg,$e) || GP_MotionOrigin($s,$cfg,$e))
+                        push @events,$e if (GP_InterruptsArrival($s,$cfg,$e) || GP_MotionOrigin($s,$cfg,$e))
                             && GP_HasGeometry($e->{geometry}) && GP_HasGeometry($z)
                             && !grep {$e->{geometry}{$_}!=$z->{$_}} qw(lat lon radius);
                         next;
                     }
                     $geometry_changed=1 if $result eq 'changed' || $result eq 'conflict';
                     $geometry_conflict=1 if $result eq 'conflict';
-                    push @accepted,$e;
+                    push @events,$e;
                 }
-                @events=@accepted;
                 GP_MergeBatchMotion(@events);
                 $cfg=GP_Config($c,$r,$debug) if $geometry_changed;
                 my $conflict=$geometry_conflict || GP_BatchConflict($s,$cfg,\@events,$wall);
