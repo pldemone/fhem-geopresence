@@ -198,6 +198,74 @@ subtest 'overlapping group membership and first/last transitions' => sub {
     advance(1);event($s,$cfg,'Helper',0);is_deeply(plans($s),[],'same route does not repeat in trip');
 };
 
+subtest 'F-03: ordinary visits and afterExit consumption never overwrite each other' => sub {
+    for my $trigger (qw(enter exit)) {
+        my ($c)=rules_fixture();
+        for my $name (qw(Ordinary Mixed)) {
+            def('R.'.$name,'rule GP');
+            $attr{'R.'.$name}={residents=>'Geo.Test',trigger=>$trigger,locations=>'Z.Helper',action=>'A.Message',cooldown=>0};
+        }
+        $attr{'R.Mixed'}{afterExit}='group:Employment';
+        my $cfg=GP_Config($c,'Geo.Test',1); my $s=GP_State($c,'Geo.Test',1); advance(40);
+        event($s,$cfg,'Work',0); advance(1);
+        my $entry=$trigger eq 'enter' ? 1:0;
+        event($s,$cfg,'Helper',$entry);
+        is_deeply([sort @{plans($s)}],[qw(R.Mixed R.Ordinary)],"$trigger: ordinary and trip rule both run initially");
+        advance(1); event($s,$cfg,'Helper',$entry);
+        is_deeply(plans($s),[],"$trigger: same visit repeats neither rule");
+        advance(1); event($s,$cfg,'Helper',$entry ? 0:1); advance(1); event($s,$cfg,'Helper',$entry);
+        is_deeply(plans($s),['R.Ordinary'],"$trigger: another visit does not repeat the trip rule");
+        advance(1); event($s,$cfg,'Helper',$entry ? 0:1); advance(1); event($s,$cfg,'Helper',$entry);
+        is_deeply(plans($s),['R.Ordinary'],"$trigger: repeated visits cannot overwrite trip consumption");
+        is($s->{action_visits}{'A.Message|'.$trigger.'|location:Z.Helper'},3,'latest ordinary visit retained');
+        is($s->{trip}{actions}{'A.Message|'.$trigger.'|location:Z.Helper'},1,'trip consumption retained separately');
+        advance(61); event($s,$cfg,'Home',1,'walking'); finish($s,$cfg);
+        advance(1); event($s,$cfg,'Work',0); advance(1); event($s,$cfg,'Helper',$entry);
+        is_deeply([sort @{plans($s)}],$entry ? [qw(R.Mixed R.Ordinary)]:['R.Mixed'],
+            "$trigger: new trip resets route consumption, ordinary rules still require a new visit");
+        if (!$entry) {
+            advance(1); event($s,$cfg,'Helper',1); advance(1); event($s,$cfg,'Helper',0);
+            is_deeply(plans($s),['R.Ordinary'],'new observed visit re-enables the ordinary exit without repeating the route');
+        }
+    }
+};
+
+subtest 'F-03: groups and individual locations retain independent consumption slots' => sub {
+    my ($c)=rules_fixture(); def('R.Individual','rule GP');
+    $attr{'R.Individual'}={residents=>'Geo.Test',trigger=>'enter',locations=>'Z.Work,Z.Work2',action=>'A.Message',cooldown=>0};
+    my $cfg=GP_Config($c,'Geo.Test',1); my $s=GP_State($c,'Geo.Test',1); advance(40);
+    event($s,$cfg,'Work',1);
+    is_deeply([sort @{plans($s)}],[qw(R.GroupEnter R.Individual)],'group and location both react to their first visit');
+    advance(1); event($s,$cfg,'Work2',1);
+    is_deeply(plans($s),['R.Individual'],'second overlapping location has its own visit, same group does not repeat');
+    is_deeply($s->{action_visits},{'A.Message|enter|group:Employment'=>1,
+        'A.Message|enter|location:Z.Work'=>1,'A.Message|enter|location:Z.Work2'=>1},'one current slot per selection');
+    advance(1); event($s,$cfg,'Work',0); advance(1); event($s,$cfg,'Work2',0);
+    advance(1); event($s,$cfg,'Work',1);
+    is_deeply([sort @{plans($s)}],[qw(R.GroupEnter R.Individual)],'new group and location visit can react again');
+};
+
+subtest 'F-03: cooldown stays shared across visit and trip slots without consuming suppressed actions' => sub {
+    my ($c)=rules_fixture();
+    for my $name (qw(Shared RouteLight)) {def('R.'.$name,'rule GP');}
+    $attr{'R.Shared'}={residents=>'Geo.Test',trigger=>'enter',locations=>'Z.Work,Z.Work2',action=>'A.Light',cooldown=>10};
+    $attr{'R.RouteLight'}={residents=>'Geo.Test',trigger=>'enter',locations=>'Z.Helper',afterExit=>'group:Employment',action=>'A.Light',cooldown=>10};
+    my $cfg=GP_Config($c,'Geo.Test',1); my $s=GP_State($c,'Geo.Test',1); advance(40);
+    event($s,$cfg,'Work',1);
+    is(scalar(grep {$_->{kind} eq 'switch_on'} @{$s->{intents}}),1,'first location schedules the switch');
+    advance(1); event($s,$cfg,'Work2',1);
+    is(scalar(grep {$_->{kind} eq 'switch_on'} @{$s->{intents}}),0,'second location shares the cooldown');
+    advance(10); event($s,$cfg,'Work2',1);
+    is(scalar(grep {$_->{kind} eq 'switch_on'} @{$s->{intents}}),1,'previously suppressed visit can run after cooldown');
+    advance(1); event($s,$cfg,'Work',0); advance(1); event($s,$cfg,'Work2',0);
+    advance(1); event($s,$cfg,'Helper',1);
+    is(scalar(grep {$_->{kind} eq 'switch_on'} @{$s->{intents}}),0,'trip rule shares the same action cooldown');
+    advance(10); event($s,$cfg,'Helper',1);
+    is(scalar(grep {$_->{kind} eq 'switch_on'} @{$s->{intents}}),1,'suppressed trip rule was not prematurely consumed');
+    advance(11); event($s,$cfg,'Helper',1);
+    is(scalar(grep {$_->{kind} eq 'switch_on'} @{$s->{intents}}),0,'consumed trip rule does not repeat after cooldown');
+};
+
 subtest 'same-time, missing and revoked history cannot satisfy afterExit' => sub {
     my ($c,$cfg,$s)=rules_fixture();
     event($s,$cfg,'Helper',0);is_deeply(plans($s),[],'no prior history');
@@ -393,7 +461,7 @@ subtest 'journey reset can retain geometry without retaining an arrival or touch
     is_deeply($s->{intents},[],'no pending debug actions');
     is_deeply($s->{zones},{},'geometry does not restore observed visits');
     is_deeply($s->{seen},{},'event deduplication reset');
-    is_deeply($s->{notify_seen},{},'notification history reset');
+    is_deeply($s->{action_visits},{},'notification consumption reset');
     is($s->{phone_mode}//'live','live','phone simulation reset');
     ok(!exists($rt->{learning}{'Geo.Test'}) && !exists($rt->{learned}{'Geo.Test'}),'learning reception and unconfirmed candidate discarded');
     is_deeply($rt->{queue},[{debug=>1,resident=>'Geo.Other',kind=>'geo'},

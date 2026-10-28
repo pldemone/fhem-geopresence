@@ -57,6 +57,8 @@ my %GP_ACTION_ATTRS = (
 );
 my $GP_JSON = JSON::PP->new->canonical->utf8;
 my $GP_CHECKPOINT_JSON = JSON::PP->new->canonical->ascii;
+my @GP_CHECKPOINT_TRIP_FIELDS = qw(id start home_exit scope armed away_time away_reason actions exits);
+my @GP_CHECKPOINT_STATE_FIELDS = qw(location position_time boundary zones members zone_visits group_visits motion motion_time automotive);
 my %GP_AUTH;
 
 sub GP_UsesSource {
@@ -1446,7 +1448,7 @@ sub GP_NewState {
     return {start=>$now, generation=>$generation, phase=>'unknown', zones=>{}, seen=>{}, seen_order=>[],
         boundary=>0, seq=>0, phone=>GP_NewPhone(GP_UsesSource($source_mode,'phone')),
         last_decision=>'initialized', last_reason=>'new session; no qualified trip restored',
-        mono=>$mono, wall=>$now, output_revision=>0, notify_seen=>{}, notify_order=>[], trace=>[], intents=>[]};
+        mono=>$mono, wall=>$now, output_revision=>0, action_visits=>{}, action_last=>{}, trace=>[], intents=>[]};
 }
 
 sub GP_RevokeOutputs {
@@ -1545,6 +1547,7 @@ sub GP_EnrichDuplicate {
     $seen->{motion}=$e->{motion};
     $s->{motion}=$e->{motion}; $s->{motion_time}=$e->{time};
     $s->{automotive}=$e->{time} if $e->{motion} eq 'automotive';
+    $s->{checkpoint_dirty}=1;
     if (my $p=$s->{arrival}) {
         # Keep the first receipt and original observation time. A retry cannot
         # refresh motion freshness or restart the Home wait.
@@ -1587,7 +1590,8 @@ sub GP_Arm {
         delete @{$s}{qw(trip arrival approach automotive motion motion_time)};
         my $detail={phone_state=>$s->{phone}{state},phone_health=>$s->{phone}{health},phone_latest=>$s->{phone}{latest}};
         if ($retain) {
-            $s->{trip}={map({$_=>$home->{$_}} qw(id start home_exit leave_mono)),scope=>'local',armed=>0,actions=>{}};
+            # Same trip keeps its consumption; rejected departure evidence does not.
+            $s->{trip}={map({$_=>$home->{$_}} qw(id start home_exit leave_mono)),scope=>'local',armed=>0,actions=>$home->{actions}//{}};
             $s->{phase}='leaving'; $s->{location}='underway';
             # The rejected event must neither supersede earlier negative samples
             # nor restart their running qualification or demand a new transition.
@@ -1664,6 +1668,63 @@ sub GP_ExitEvidence {
     return defined($exit) && $exit>=$trip->{start} && $exit<$time ? $exit:undef;
 }
 
+sub GP_ConsumptionSlot {
+    my ($rule,$selector)=@_;
+    return (join('|',$rule->{type},$rule->{params}{target}//''),1) if GP_IsOpening($rule->{type});
+    return (join('|',$rule->{action},$rule->{trigger},$selector),
+        $rule->{trigger} eq 'arrival' || length($rule->{afterExit}//'') ? 1:0);
+}
+
+# Prepared once per configuration, only when recovery or migration needs it.
+sub GP_ConsumptionSlots {
+    my ($cfg)=@_;
+    return $cfg->{consumption_slots} if $cfg->{consumption_slots};
+    my $slots={trip=>{},visit=>{},last=>{}};
+    for my $trigger (keys %{$cfg->{rule_index}}) {
+        for my $selector (keys %{$cfg->{rule_index}{$trigger}}) {
+            for my $rule (@{$cfg->{rule_index}{$trigger}{$selector}}) {
+                my ($key,$trip)=GP_ConsumptionSlot($rule,$selector);
+                if ($trip) { $slots->{trip}{$key}=$rule->{type}; }
+                else {
+                    my ($kind,$name)=split /:/,$selector,2;
+                    $slots->{visit}{$key}=[$kind eq 'group' ? 'group_visits':'zone_visits',$name];
+                }
+                $slots->{last}{$rule->{action}}=1 unless GP_IsOpening($rule->{type});
+            }
+        }
+    }
+    return $cfg->{consumption_slots}=$slots;
+}
+
+# One-time import for version 1 checkpoints and live states from an older module.
+# Read only the current visit/trip keys; never carry the old history forward.
+sub GP_CompactConsumption {
+    my ($cfg,$trip,$state)=@_;
+    my $slots=GP_ConsumptionSlots($cfg);
+    my $seen=delete($state->{notify_seen})//{};
+    my $actions=$trip->{actions}//{};
+    my $last=delete($state->{notify_last})//{};
+    delete $state->{notify_order};
+    $trip->{actions}={}; $state->{action_visits}={};
+    $state->{action_last}={map {$_=>$last->{$_}} grep {exists $last->{$_}} keys %{$slots->{last}}};
+    for my $key (keys %{$slots->{trip}}) {
+        my $opening=GP_IsOpening($slots->{trip}{$key});
+        my $old;
+        if ($opening) { $old=$trip->{id}.'|'.$key; }
+        else {
+            my ($action,$trigger,$selector)=split /\|/,$key,3;
+            $old=join('|',$action,$trigger,$trip->{id},$selector);
+        }
+        $trip->{actions}{$key}=1 if $opening ? $actions->{$old}:$seen->{$old};
+    }
+    for my $key (keys %{$slots->{visit}}) {
+        my ($field,$name)=@{$slots->{visit}{$key}};
+        my $visit=($state->{$field}//{})->{$name}//0;
+        my ($action,$trigger,$selector)=split /\|/,$key,3;
+        $state->{action_visits}{$key}=$visit if $seen->{join('|',$action,$trigger,$visit,$selector)};
+    }
+}
+
 sub GP_Rules {
     my ($s,$cfg,$trigger,$e,$now,$mono)=@_;
     my $selector=$trigger eq 'arrival' ? 'arrival' : length($e->{group}//'')
@@ -1677,37 +1738,35 @@ sub GP_Rules {
             ? $e->{arrival_vehicle_eligible} : GP_VehicleEligible($s,$cfg,$now))) {
             $skip->('no qualifying car or remote evidence, or current walking/cycling'); next;
         }
-        my $type=$rule->{type};
-        if ($trigger eq 'arrival' || GP_IsOpening($type)) {
+        my $type=$rule->{type}; my $opening=GP_IsOpening($type);
+        if ($trigger eq 'arrival' || $opening) {
             unless (GP_UsesSource($cfg->{sourceMode},'geo')) { $skip->('source profile does not authorize arrival actions'); next; }
             unless ($cfg->{geometry_ready}) { $skip->('geometry not ready'); next; }
             unless ($s->{trip} && $s->{trip}{armed} && !$s->{conflict}) { $skip->('departure not confirmed'); next; }
             if ($e->{time}-$s->{trip}{away_time}<$cfg->{minimum_away}
                 || $mono-$s->{trip}{away_mono}<$cfg->{minimum_away}) { $skip->('return before minimum away time'); next; }
         }
-        my %history=length($after) ? (after_exit=>$after,exit_time=>$exit):();
-        $history{trip}=$s->{trip}{id} if $trigger eq 'arrival' || length($after);
-        my $key;
-        if (GP_IsOpening($type)) {
+        if ($opening) {
             unless ($trigger eq 'arrival') { $skip->('opening requires confirmed arrival'); next; }
             if (($type eq 'door_open' && !$cfg->{allowDoor}) || ($type eq 'garage_open' && !$cfg->{allowGarage})) {
                 $skip->('resident has no permission for this actor'); next;
             }
-            $key=join('|',$s->{trip}{id},$type,$rule->{params}{target}//'');
-            if ($s->{trip}{actions}{$key}++) { $skip->('action already consumed in this trip'); next; }
-        } else {
-            my $visit=$trigger eq 'arrival' || length($after) ? $s->{trip}{id}
-                : length($e->{group}//'') ? ($s->{group_visits}{$e->{group}}//0) : ($s->{zone_visits}{$e->{zone}}//0);
-            $key=join('|',$rule->{action},$trigger,$visit,$e->{selector}//'arrival');
-            my $label=$type eq 'switch_on' ? 'switch' : 'notification';
-            if ($s->{notify_seen}{$key}) { $skip->("$label already consumed"); next; }
-            if (defined($s->{notify_last}{$rule->{action}}) && $now-$s->{notify_last}{$rule->{action}}<$rule->{cooldown}) {
-                $skip->("$label cooldown"); next;
-            }
-            $s->{notify_seen}{$key}=1; $s->{notify_last}{$rule->{action}}=$now;
-            push @{$s->{notify_order}}, $key;
-            delete $s->{notify_seen}{shift @{$s->{notify_order}}} while @{$s->{notify_order}}>2000;
         }
+        my ($key,$trip_bound)=GP_ConsumptionSlot($rule,$selector);
+        my $consumed=$trip_bound ? ($s->{trip}{actions}//={}) : ($s->{action_visits}//={});
+        my $visit=$trip_bound ? 1
+            : length($e->{group}//'') ? ($s->{group_visits}{$e->{group}}//0) : ($s->{zone_visits}{$e->{zone}}//0);
+        my $label=$type eq 'switch_on' ? 'switch' : 'notification';
+        if (defined($consumed->{$key}) && $consumed->{$key}==$visit) {
+            $skip->($opening ? 'action already consumed in this trip':"$label already consumed"); next;
+        }
+        if (!$opening && defined($s->{action_last}{$rule->{action}})
+            && $now-$s->{action_last}{$rule->{action}}<$rule->{cooldown}) { $skip->("$label cooldown"); next; }
+        $consumed->{$key}=$visit;
+        $s->{action_last}{$rule->{action}}=$now unless $opening;
+        $s->{checkpoint_dirty}=1;
+        my %history=length($after) ? (after_exit=>$after,exit_time=>$exit):();
+        $history{trip}=$s->{trip}{id} if $trip_bound;
         push @{$s->{intents}}, {kind=>$type,key=>$key,rule=>$rule->{name},trigger=>$trigger,%history,
             params=>$rule->{params},e=>{%$e},generation=>$s->{generation},output_revision=>$s->{output_revision},
             expires_mono=>GP_ActionMonoExpiry($cfg,$e,$now,$mono)};
@@ -1954,6 +2013,7 @@ sub GP_Process {
         }
         my $changed=$s->{phase} ne 'away' ? 1:0;
         GP_CancelArrival($s,$now,'new phone absence');
+        $s->{checkpoint_dirty}=1 if !defined($s->{position_time}) || $s->{position_time}!=$e->{time};
         $s->{position_time}=$e->{time};
         $s->{phase}='away'; $s->{desired_status}='absent';
         return GP_Trace($s,$now,'phone absence qualified',{changed=>$changed,departure_armed=>$s->{trip} && $s->{trip}{armed} ? 1:0});
@@ -1988,6 +2048,7 @@ sub GP_Process {
             if (defined($s->{automotive}) && $s->{automotive}<=$e->{time}) {
                 delete $s->{automotive}; $revoked=1;
             }
+            $s->{checkpoint_dirty}=1 if $revoked;
             if ($p && $e->{time}<$p->{event}{time}) {
                 $p->{origin_time}=$p->{event}{time};
                 GP_UpdateArrivalMotion($s,$cfg,$p,$now,$p->{motion_evaluated_at}) if $revoked;
@@ -2025,6 +2086,9 @@ sub GP_Process {
         }
     }
     return GP_Trace($s,$now,'event before completed arrival') if $e->{time}<=$s->{boundary};
+    # Accepted Geo observations update the saved position, memberships and trip.
+    # Rejected events and unchanged duplicates never reach this mutation path.
+    $s->{checkpoint_dirty}=1;
     delete $s->{conflict};
     my $previous_position=$s->{position_time};
     $s->{position_time}=$e->{time};
@@ -2207,14 +2271,17 @@ sub GP_TickState {
         if (!GP_UsesSource($cfg->{sourceMode},'phone') || $s->{phone}{state} ne 'present') { $s->{phase}='away'; $s->{desired_status}='absent'; }
     }
     if ($s->{approach} && $mono-$s->{approach}{mono}>=$cfg->{approach_timeout}) {
+        $s->{checkpoint_dirty}=1 if grep {exists $s->{$_}} qw(automotive motion motion_time);
         delete @{$s}{qw(approach automotive motion motion_time)};
         $s->{phase}='away' if $s->{trip};
     }
     for my $name (keys %{$s->{zones}}) {
         my $z=$s->{zones}{$name};
         if ($now-$z->{time}>$cfg->{zone_display_max_age}) {
-            $z->{entry}=0;
-            $s->{location}='unknown' if ($s->{location}//'') eq $cfg->{zones}{$name}{label};
+            if ($z->{entry}) { $z->{entry}=0; $s->{checkpoint_dirty}=1; }
+            if (($s->{location}//'') ne 'unknown' && ($s->{location}//'') eq $cfg->{zones}{$name}{label}) {
+                $s->{location}='unknown'; $s->{checkpoint_dirty}=1;
+            }
         }
     }
     return;
@@ -2393,7 +2460,7 @@ sub GP_WriteHTTP {
 sub GP_ClearCheckpoint {
     my ($r,$reason)=@_;
     my $d=$defs{$r} or return;
-    my $value=$GP_CHECKPOINT_JSON->encode({version=>1,status=>'none',reason=>$reason});
+    my $value=$GP_CHECKPOINT_JSON->encode({version=>2,status=>'none',reason=>$reason});
     return if GP_Read($r,'gp_trip_checkpoint','') eq $value;
     setReadingsVal($d,'gp_trip_checkpoint',$value,POSIX::strftime('%Y-%m-%d %H:%M:%S',localtime(GP_Now())));
 }
@@ -2418,19 +2485,26 @@ sub GP_Checkpoint {
     # down or a contradiction blocks outputs. Persistence is not an actuator.
     return unless $rt && GP_EffectiveMode($c,$r,0) eq 'active'
         && $rt->{prod}{$r} && $rt->{prod}{$r}==$s;
-    # Idle ticks do not serialize the configuration or journey again. Every
-    # relevant mutation records a trace; quiet reads must remain cheap.
-    return if defined($s->{checkpoint_sequence}) && $s->{checkpoint_sequence}==($s->{trace_sequence}//0)
-        && ($s->{checkpoint_value}//'') eq GP_Read($r,'gp_trip_checkpoint','');
     my $t=$s->{trip};
     $cfg//=GP_Config($c,$r,0) if $t && $t->{armed} && !$s->{conflict};
-    if ($t && $t->{armed} && !$s->{conflict} && GP_UsesSource($cfg->{sourceMode},'geo')
-        && $cfg->{geometry_ready} && $s->{phase} =~ /\A(?:away|leaving|returning)\z/) {
-        my $checkpoint={version=>1,status=>'qualified',saved_at=>GP_Now(),
+    my $qualified=$t && $t->{armed} && !$s->{conflict} && GP_UsesSource($cfg->{sourceMode},'geo')
+        && $cfg->{geometry_ready} && $s->{phase} =~ /\A(?:away|leaving|returning)\z/;
+    my $trip=$qualified ? $t->{id}:'';
+    if ($qualified && exists($s->{notify_seen})) {
+        GP_CompactConsumption($cfg,$t,$s);
+        $s->{checkpoint_dirty}=1;
+    }
+    # Persist only changed journey data. Always check qualification first so
+    # revocations cannot be hidden by a clean marker. Also repair edited readings.
+    return if defined($s->{checkpoint_trip}) && $s->{checkpoint_trip} eq $trip
+        && (!$qualified || !$s->{checkpoint_dirty})
+        && ($s->{checkpoint_value}//'') eq GP_Read($r,'gp_trip_checkpoint','');
+    if ($qualified) {
+        my $checkpoint={version=>2,status=>'qualified',saved_at=>GP_Now(),
             revision=>GP_ResumeRevision($c,$r,$cfg),
-            trip=>{map {$_=>$t->{$_}} grep {exists $t->{$_}} qw(id start home_exit scope armed away_time away_reason actions exits)},
+            trip=>{map {$_=>$t->{$_}} grep {exists $t->{$_}} @GP_CHECKPOINT_TRIP_FIELDS},
             state=>{map {$_=>$s->{$_}} grep {exists $s->{$_}}
-                qw(location position_time boundary zones members zone_visits group_visits notify_seen notify_order notify_last motion motion_time automotive)}};
+                (@GP_CHECKPOINT_STATE_FIELDS,qw(action_visits action_last))}};
         my $value=eval {$GP_CHECKPOINT_JSON->encode($checkpoint)};
         if (defined($value) && length($value)<=65536) {
             setReadingsVal($defs{$r},'gp_trip_checkpoint',$value,
@@ -2440,7 +2514,8 @@ sub GP_Checkpoint {
             GP_Trace($s,GP_Now(),'qualified trip could not be checkpointed',{source=>'checkpoint'});
         }
     } else { GP_ClearCheckpoint($r,'No unfinished qualified trip'); }
-    $s->{checkpoint_sequence}=$s->{trace_sequence}//0;
+    $s->{checkpoint_dirty}=0;
+    $s->{checkpoint_trip}=$trip;
     $s->{checkpoint_value}=GP_Read($r,'gp_trip_checkpoint','');
 }
 
@@ -2449,7 +2524,7 @@ sub GP_ResumeTrip {
     my $raw=GP_Read($r,'gp_trip_checkpoint','');
     $s->{resume}={status=>'none',reason=>'No saved qualified trip'};
     return unless length($raw);
-    my ($checkpoint,$trip,$state);
+    my ($checkpoint,$trip,$state,$legacy);
     my ($now,$mono)=(GP_Now(),GP_Mono());
     my $error;
     {
@@ -2458,8 +2533,9 @@ sub GP_ResumeTrip {
             die "checkpoint too large\n" if length($raw)>65536;
             $checkpoint=$GP_CHECKPOINT_JSON->decode($raw);
             die "invalid checkpoint structure\n" unless ref($checkpoint) eq 'HASH'
-                && !ref($checkpoint->{version}) && ($checkpoint->{version}//'') eq '1'
+                && !ref($checkpoint->{version}) && ($checkpoint->{version}//'') =~ /\A[12]\z/
                 && !ref($checkpoint->{status}) && ($checkpoint->{status}//'') =~ /\A(?:qualified|none)\z/;
+            $legacy=$checkpoint->{version}==1;
             if ($checkpoint->{status} eq 'qualified') {
                 die "resident is not active\n" unless GP_EffectiveMode($c,$r,0) eq 'active';
                 die "configuration or identity changed\n" unless $cfg->{geometry_ready}
@@ -2471,8 +2547,9 @@ sub GP_ResumeTrip {
                     && !ref($trip->{scope}) && ($trip->{scope}//'') =~ /\A(?:local|remote)\z/
                     && defined($trip->{id}) && !ref($trip->{id}) && length($trip->{id})<=256
                     && $trip->{id} =~ /\A[A-Za-z0-9_.:\-]+\z/;
-                my %trip_keys=map {$_=>1} qw(id start home_exit scope armed away_time away_reason actions exits);
-                my %state_keys=map {$_=>1} qw(location position_time boundary zones members zone_visits group_visits notify_seen notify_order notify_last motion motion_time automotive);
+                my %trip_keys=map {$_=>1} @GP_CHECKPOINT_TRIP_FIELDS;
+                my %state_keys=map {$_=>1} (@GP_CHECKPOINT_STATE_FIELDS,
+                    $legacy ? qw(notify_seen notify_order notify_last) : qw(action_visits action_last));
                 die "unsupported checkpoint fields\n" if grep {!$trip_keys{$_}} keys %$trip;
                 die "unsupported checkpoint fields\n" if grep {!$state_keys{$_}} keys %$state;
                 die "invalid departure reason\n" if exists($trip->{away_reason})
@@ -2499,10 +2576,8 @@ sub GP_ResumeTrip {
                 for my $key (qw(actions exits)) {
                     die "invalid trip history\n" if exists($trip->{$key}) && ref($trip->{$key}) ne 'HASH';
                 }
-                for my $key (keys %{$trip->{actions}//{}}) {
-                    die "invalid consumed action\n" unless length($key)<=512
-                        && GP_Number($trip->{actions}{$key}) && $trip->{actions}{$key}>0;
-                }
+                die "missing consumption state\n" if !$legacy && (ref($trip->{actions}) ne 'HASH'
+                    || ref($state->{action_visits}) ne 'HASH' || ref($state->{action_last}) ne 'HASH');
                 for my $ref (keys %{$trip->{exits}//{}}) {
                     my $time=$trip->{exits}{$ref};
                     die "invalid prior exit\n" unless ($ref =~ /\Alocation:(.+)\z/ && $cfg->{zones}{$1}
@@ -2519,15 +2594,39 @@ sub GP_ResumeTrip {
                             && $v->{time}<=$checkpoint->{saved_at}+$cfg->{future_tolerance};
                     }
                 }
-                for my $key (qw(zone_visits group_visits notify_seen notify_last)) {
+                for my $key (qw(zone_visits group_visits),$legacy ? qw(notify_seen notify_last) : qw(action_visits action_last)) {
                     die "invalid saved counters\n" if exists($state->{$key}) && ref($state->{$key}) ne 'HASH';
                     for my $v (values %{$state->{$key}//{}}) {
                         die "invalid saved counter\n" unless GP_Number($v) && $v>=0;
                     }
                 }
-                die "invalid notification history\n" if exists($state->{notify_order})
-                    && (ref($state->{notify_order}) ne 'ARRAY' || @{$state->{notify_order}}>2000
-                        || grep {!defined($_) || ref($_) || length($_)>512} @{$state->{notify_order}});
+                for my $spec ([zone_visits=>'zones'],[group_visits=>'groups']) {
+                    for my $name (keys %{$state->{$spec->[0]}//{}}) {
+                        my $v=$state->{$spec->[0]}{$name};
+                        die "invalid saved visit\n" unless exists($cfg->{$spec->[1]}{$name}) && $v==int($v);
+                    }
+                }
+                if ($legacy) {
+                    die "invalid notification history\n" if exists($state->{notify_order})
+                        && (ref($state->{notify_order}) ne 'ARRAY' || @{$state->{notify_order}}>2000
+                            || grep {!defined($_) || ref($_) || length($_)>512} @{$state->{notify_order}});
+                    for my $key (keys %{$trip->{actions}//{}}) {
+                        die "invalid consumed action\n" unless length($key)<=512
+                            && GP_Number($trip->{actions}{$key}) && $trip->{actions}{$key}>0;
+                    }
+                    GP_CompactConsumption($cfg,$trip,$state);
+                }
+                my $slots=GP_ConsumptionSlots($cfg);
+                for my $key (keys %{$trip->{actions}//{}}) {
+                    die "invalid consumed action\n" unless exists($slots->{trip}{$key})
+                        && GP_Number($trip->{actions}{$key}) && $trip->{actions}{$key}==1;
+                }
+                for my $key (keys %{$state->{action_visits}//{}}) {
+                    my $slot=$slots->{visit}{$key}; my $v=$state->{action_visits}{$key};
+                    die "invalid consumed visit\n" unless $slot && $v==int($v)
+                        && $v<=(($state->{$slot->[0]}//{})->{$slot->[1]}//0);
+                }
+                die "invalid action cooldown\n" if grep {!exists $slots->{last}{$_}} keys %{$state->{action_last}//{}};
                 my $rrtime=GP_ReadingTime($cfg->{roommate},'state');
                 die "a later ROOMMATE Home state superseded the departure\n" if defined($rrtime)
                     && $rrtime>=int($trip->{away_time}) && GP_Read($cfg->{roommate},'state','') =~ /\A(?:home|gotosleep|asleep|awoken)\z/;
@@ -2559,6 +2658,9 @@ sub GP_ResumeTrip {
     $s->{trip}{away_mono}=$mono-($now-$trip->{away_time});
     $s->{trip}{leave_mono}=$mono-($now-$trip->{home_exit}) if defined $trip->{home_exit};
     $s->{phase}='away';
+    $s->{checkpoint_dirty}=$legacy ? 1:0;
+    $s->{checkpoint_trip}=$trip->{id};
+    $s->{checkpoint_value}=$raw;
     $s->{resume_event_floor}=$s->{start};
     $s->{resume}={status=>'restored',restored_at=>$now,saved_at=>$checkpoint->{saved_at},reason=>'Qualified unfinished trip restored'};
     GP_Trace($s,$now,'qualified unfinished trip restored; waiting for a new return',{source=>'restart'});
@@ -4259,7 +4361,7 @@ set Geo.PERSON mode debug</pre>
   <h5>Activation and configuration changes</h5>
   <p>Production activation validates configuration and checks for conflicting legacy arrival paths. Set the ROOMMATE's rr_locationUnderway to underway, remove old rr_geofenceUUIDs and disable the old arrival handlers before activation. Resident and private-location configuration requires that resident to be effectively debug or disabled; shared changes require pausing all affected residents. Controller configuration requires controller debug or disabled. Changes revoke the affected journeys. Diagnostic settings debugLog, logFile and standard verbose can be changed during production without resetting trips or learning.</p>
   <h5>Persistence</h5>
-  <p>Use FHEM's normal save mechanism for definitions, attributes and production readings. A deviceId confirmed with learnConfirm is an ordinary configuration attribute; learnConfirm does not call save. Production geometry is stored in gp_geometry. A qualified unfinished production trip is stored as one versioned gp_trip_checkpoint reading. After restart, rereadcfg or module reload it can resume if identity, configuration, geometry and the trip_resume_max_age limit still match and no later Home or indoor presence contradicts it. A NEW return is required; startup alone never opens, and old arrival timers, queued commands, unconfirmed departures and debug trips never resume. The checkpoint is consumed before dispatching opening commands. gp_resume_status/gp_resume_reason and explain describe restoration or rejection.</p>
+  <p>Use FHEM's normal save mechanism for definitions, attributes and production readings. A deviceId confirmed with learnConfirm is an ordinary configuration attribute; learnConfirm does not call save. Production geometry is stored in gp_geometry. A qualified unfinished production trip is stored as one versioned gp_trip_checkpoint reading. Version 2 stores current consumption and cooldowns instead of old visit histories; valid version 1 data is imported once without replaying actions or renewing departure evidence. After restart, rereadcfg or module reload it can resume if identity, configuration, geometry and the trip_resume_max_age limit still match and no later Home or indoor presence contradicts it. A NEW return is required; startup alone never opens, and old arrival timers, queued commands, unconfirmed departures and debug trips never resume. The checkpoint is consumed before dispatching opening commands. gp_resume_status/gp_resume_reason and explain describe restoration or rejection.</p>
   <p>Checkpoints use the ordinary FHEM state file; no additional database or automatic configuration save is used. A clean shutdown writes the state file; after an abrupt crash only the last successfully written state is available, so observations missed during downtime cannot be reconstructed. Test requests never promote debug geometry or permissions. Learning results for a configured phone remain available in the current process after learnConfirm or timeout; a restart, new learning session, phone identity change or resident deletion discards them. An unconfirmed phone candidate is also discarded by cancellation, relevant configuration/password changes or module reload.</p>
 
   <p>Productive resident readings <code>gp_arrival_pending</code>, <code>gp_arrival_motion</code>, <code>gp_arrival_wait</code> and <code>gp_arrival_deadline</code> show the provisional return (deadline in Unix seconds). Debug exposes the same information under <code>state.arrival</code> in <code>get System.GeoPresence explain Geo.PERSON debug format=json</code>. English diagnostics include <code>arrival pending</code>, <code>arrival cancelled</code> and <code>arrival confirmed</code>, with motion, wait and confirmation source. These details are written only to the separate diagnostic file.</p>

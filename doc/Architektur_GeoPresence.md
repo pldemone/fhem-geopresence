@@ -1,6 +1,6 @@
 # GeoPresence – Architektur
 
-**Version 0.62 · Stand 26.10.2026 · Handbuch 2.24**
+**Version 0.65 · Stand 27.10.2026 · Handbuch 2.27**
 
 Diese Beschreibung spezifiziert den aktuellen Aufbau von `FHEM/98_GeoPresence.pm`. Einrichtung und Bedienung stehen im [Handbuch](GeoPresence_Handbuch.md); Prüfabläufe und Testprogramm sind in der [Testanleitung](GeoPresence_Testanleitung.md) beschrieben. Gerätenamen wie `Geo.PERSON` und `Geo.PERSON.ORT` sind austauschbare Beispiele.
 
@@ -190,6 +190,8 @@ Ein akzeptierter outer-Austritt oder ein ausreichend entfernter Ort liefert selb
 
 Aktuelle lokale Telefonanwesenheit kann einen widersprechenden Entfernungsnachweis zurückweisen. Dies umfasst die gehaltene positive Zustandsmeldung und die kurze `handover`-Phase beim Raumwechsel. Ein bereits beobachteter, noch unbestätigter Home-Austritt kann dabei erhalten bleiben, wenn er zeitlich nach der letzten tatsächlichen positiven Telefonbeobachtung liegt; eine später qualifizierte Abwesenheit bestätigt dann nur diesen lokalen Ausflug.
 
+Beim Beibehalten dieses Home-Abgangs bleiben Reise-ID und bereits verbrauchte Reiseaktionen zusammen erhalten. Zurückgewiesene Entfernungs- und bisherige Austrittsnachweise werden weiterhin verworfen; es entsteht keine Öffnungsberechtigung. Ein später neu beobachteter Austritt oder ein weiterer Ortsbesuch gibt eine bereits verbrauchte `afterExit`-Aktion in derselben Reise nicht erneut frei. Erst ein tatsächlich neuer Ausflug erhält einen neuen Reiseverbrauch.
+
 ### 5.3 Verwerfen von Berechtigungen
 
 Bestätigte Heimkehr verbraucht die Reiseberechtigung. Ein neuer Ausflug beginnt mit neuen Nachweisen. Manuelles ROOMMATE `home`, relevante Konfigurationsänderung, Identitätswechsel, Geometrieänderung, Uhrsprung oder widersprüchliche Beobachtungen widerrufen alte Berechtigungen. Ein Neustart darf ausschließlich den in [[#11. Persistenz und Lebenszyklus|Kapitel 11]] beschriebenen gültigen, noch offenen Ausflug fortsetzen.
@@ -282,6 +284,10 @@ Beispiel: `trigger exit`, `locations Geo.PERSON.RUECKWEG` und `afterExit group:A
 ### 8.4 Deduplizierung
 
 Geschützte Öffnungen werden je Ausflug, Aktortyp und Ziel nur einmal angefordert. Gewöhnliche Aktionen werden je Aktion, Auslöser, Besuch und Orts-/Gruppenauswahl dedupliziert; Bedingungen mit vorherigem Austritt verwenden den laufenden Ausflug als Besuchsgrenze. Zusätzlich gilt der Cooldown je Person und Aktion. Zwei absichtlich verschiedene Aktionen können unabhängig reagieren.
+
+`action_visits` speichert pro gewöhnlicher Aktion, Auslöser und Auswahl nur den zuletzt verbrauchten Orts- beziehungsweise Gruppenbesuch. Eine neue verbrauchte Besuchsnummer ersetzt die vorige; eine Liste alter Besuche entfällt. Die Auswahl unterscheidet `location:...` und `group:...`. Ankunftsaktionen und Regeln mit `afterExit` führen ihren Verbrauch dagegen direkt in `trip.actions`. Dadurch können gewöhnliche Besuche und reisegebundene Regeln derselben Aktion und Auswahl ihre Verbrauchsstände nicht gegenseitig überschreiben. Der Abschluss oder Widerruf des Ausflugs beendet diesen Reiseverbrauch; eine gewöhnliche Austrittsregel benötigt weiterhin einen neuen beobachteten Besuch und wird nicht allein durch einen neuen Ausflug erneut freigegeben.
+
+`trip.actions` enthält kurze Schlüssel je Öffnungstyp und Ziel beziehungsweise je gewöhnlicher Reiseaktion, Auslöser und Auswahl. Die Reise-ID wird nicht pro Eintrag wiederholt. `action_last` hält den letzten Verbrauchszeitpunkt je gewöhnlicher Aktion für den gemeinsamen Cooldown; ein durch Cooldown unterdrückter Kandidat wird nicht verbraucht. Die Anzahl der Verbrauchseinträge hängt von den konfigurierten Aktions-/Auswahlkombinationen ab, nicht von der Zahl vergangener Besuche. Produktions- und Debug-Zustände sowie verschiedene Personen besitzen weiterhin eigene veränderbare Verbrauchsstände.
 
 ## 9. Aktionen und Rückmeldungen
 
@@ -376,6 +382,14 @@ Konfiguration wird mit FHEMs normalem `save` gespeichert. Readings einschließli
 
 Ein bestätigter, noch nicht abgeschlossener produktiver Ausflug wird im versionierten Reading `gp_trip_checkpoint` als ein zusammengehöriger JSON-Datensatz gespeichert. Er enthält ursprünglichen Beginn und Abwesenheitsnachweis, lokale/ferne Reichweite, beobachtete Orte und Gruppen, explizite Austritte sowie verbrauchte Aktionen und Nachrichten. Zugangsdaten, Aktoraufträge, Ereigniswarteschlangen, Telefonqualifikationstimer und Ankunftswartezeiten werden nicht gespeichert. Die Größe ist auf 64 KiB begrenzt; ein zu großer oder nicht darstellbarer Stand wird als nicht wiederherstellbar markiert. Das Schreiben erfolgt ohne FHEM-Ereignisse oder userReadings-Callbacks; unveränderte Timerläufe serialisieren den Stand nicht erneut.
 
+Ein eigenes Änderungsmerkmal `checkpoint_dirty` ersetzt die Trace-Sequenz als Speicheranlass. Akzeptierte Ortsbeobachtungen, neue Verbrauchsstände, gültige Bewegungsnachträge und die tatsächliche Entfernung gespeicherter Bewegungs- oder Anzeigedaten markieren den Stand zur Speicherung. Identische Wiederholungen, abgewiesene Beobachtungen, Aktorrückmeldungen und reine Diagnoseeinträge erzeugen keinen neuen Checkpoint. Die Speicherfunktion prüft die Reisequalifikation vor dem schnellen Rücksprung unabhängig von diesem Merkmal; ein Widerruf erreicht deshalb auch bei blockierter Ausgabe das Reading. Ein verändertes oder gelöschtes Checkpoint-Reading wird aus dem aktuellen Zustand berichtigt. Nach erfolgreicher Wiederherstellung im aktuellen Format bleibt ein unveränderter Checkpoint einschließlich `saved_at` erhalten.
+
+Das JSON-Format Version 2 speichert aktuelle Verbrauchsstände aus `action_visits`, `action_last` und `trip.actions`; `notify_seen`, `notify_order` und `notify_last` entfallen im neuen Laufzeitzustand und Checkpoint. Bei der Wiederherstellung werden Verbrauchsschlüssel gegen die konfigurierten Regeln geprüft; verbrauchte Besuchsnummern dürfen den gespeicherten aktuellen Besuch nicht überschreiten. Die hierfür benötigten zulässigen Schlüssel werden je Konfiguration einmal aus dem vorhandenen Regelindex abgeleitet und zwischengespeichert.
+
+Schreiber und Leser verwenden dieselben privaten Listen für gemeinsame Reise- und Zustandsfelder. Die Verbrauchsfelder werden für jede Formatversion ausdrücklich ergänzt; der Schreiber übernimmt weiterhin ausschließlich vorhandene Felder. Die gemeinsame Feldauswahl ersetzt keine Pflichtfeld-, Typ- oder Nachweisprüfung.
+
+Gültige Checkpoints der Version 1 werden einmalig übernommen: Nur der aktuelle Verbrauch je Orts-/Gruppenbesuch, der Verbrauch des offenen Ausflugs und benötigte Cooldowns werden in Version 2 übertragen. Frühere Besuchsschlüssel werden verworfen. Derselbe Umstieg verdichtet beim Modulreload einen noch laufenden alten Zustand vor seiner ersten neuen Serialisierung; eine allein wegen alter Historien zu große Laufzeitkopie muss deshalb nicht zunächst als Version 1 geschrieben werden. Bereits gespeicherte Version-1-Datensätze unterliegen weiterhin der 64-KiB-Grenze und allen bisherigen Bindungs-, Struktur- und Zeitprüfungen. Die Umstellung behält Reise-ID, ursprüngliche Abwesenheitszeit und explizite Austritte; sie führt weder historische Aktionen aus noch stellt sie bereits entwertete Reisen wieder her. Nur diese Formatumstellung schreibt einen übernommenen alten Stand einmal neu; spätere unveränderte Timer-, Diagnose- und Wiederherstellungsläufe bleiben ohne erneute Serialisierung.
+
 Nach INITIALIZED oder REREADCFG sowie bei Modulreload wird unter aktiven Modi ein neuer Laufzeitkontext aufgebaut und ein vorhandener qualifizierter Checkpoint geprüft. Version und Struktur, Personen-/Telefon-/ROOMMATE-Bindung einschließlich Kennwortprüfwertbindung, Quellenprofil, Geometrie, Regeln und Aktoradapter müssen passen. Spätere gespeicherte Heimzustände des ROOMMATE oder lokale Telefonanwesenheit widersprechen dem Abwesenheitsnachweis. Zeitstempel müssen plausibel sein; die ursprüngliche Abwesenheitsbestätigung darf höchstens `trip_resume_max_age` alt sein, standardmäßig 172800 Sekunden beziehungsweise 48 Stunden. Speichern oder weitere Neustarts erneuern diesen Nachweis nicht. Ein abgelehnter Checkpoint wird entwertet; reine `absent`- oder `gp_arrival_armed`-Readings ohne vollständigen Checkpoint erzeugen keine Berechtigung.
 
 Ein gültiger Ausflug behält seine Kennung und seinen Ortsverlauf, startet im neuen Kontext als `away` und wartet auf eine neue gültige Home- oder Telefon-Rückkehr. Vorherige monotone Timerwerte werden nicht übernommen; Zeitabstände werden aus den ursprünglichen absoluten Nachweiszeiten auf die neue monotone Uhr abgebildet. Nach einem validierten Checkpoint darf eine neue Geo-Beobachtung unmittelbar nach dem Sitzungsbeginn verarbeitet werden; Ereignisse mit Beobachtungszeit vor oder gleich dem neuen Start bleiben ausgeschlossen. Ohne validierten Checkpoint gilt weiterhin die zusätzliche Geo-Anlaufgrenze durch future_tolerance. Bewegungsabhängige Ankunftsfristen und normale Frischeprüfung bleiben wirksam. Der Start selbst sendet keine Öffnung oder historische Nachricht. `gp_resume_status`, `gp_resume_reason` und der Bereich Restart recovery in explain nennen Übernahme oder Ablehnung.
@@ -428,7 +442,30 @@ GP-F11-002 prüft verspätete Home-, Annäherungs- und Outer-Austritte nach eine
 
 GP-F11-003 setzt `motion_max_age` auf zulässige 20 Sekunden. Ein verspäteter Austritt vor Home trifft erst nach Ablauf dieses Werts ein; die gespeicherte Home-Walking-Sperre muss bei Timer- und Telefonbestätigung erhalten bleiben. Gegenproben entfernen einen früheren Automotive-Nachweis und berücksichtigen spätere Walking-, Running- oder Cycling-Daten weiterhin anhand ihrer angenommenen Gültigkeit. Eine tatsächlich unterbrochene alte Fußwegsperre darf entfallen, und ein neuer gültiger Automotive-Nachweis darf die Entscheidung ändern. Die reale FHEM-Integration prüft die Walking-Sperre mit Timer und Telefon sowie die Teilentwertung eines Automotive-Nachweises.
 
+F-04 zählt JSON-Aufbereitungen und Checkpoint-Schreibzugriffe getrennt. Diagnosen, unveränderte Wiederholungen, abgewiesene Beobachtungen, Aktorrückmeldungen sowie ruhige Timer- und Wiederherstellungsläufe müssen ohne beides auskommen. Neue Ortsnachweise, Verbrauchsstände, Bewegungsnachträge, verspätete Bewegungswiderrufe und Zeitabläufe müssen dagegen gespeichert werden. Gegenproben entziehen eine zuvor saubere Reisequalifikation ohne Trace bei blockierter Ausgabe und berichtigen ein extern verändertes Reading. Die bestehenden Neustart- und synchronen Gerätecalls prüfen weiterhin die Speicherung des Verbrauchs vor der Ausgabe.
+
+F-03 prüft 2.101 aufeinanderfolgende verbrauchte Besuche mit anschließendem Neustart: Ein aktueller Verbrauchseintrag ersetzt die Historie, und der Checkpoint bleibt in dieser festen Konfiguration unter 4 KiB. Weitere Prüfungen wechseln gewöhnliche und reisegebundene Regeln derselben Aktion und Auswahl, erhalten die Trennung zwischen Einzelort und Gruppe und prüfen gemeinsame Cooldowns ohne vorzeitigen Verbrauch. Version-1-Wiederherstellung und Reload eines alten Laufzeitzustands erhalten aktuelle Nachrichten-, Schalt- und Öffnungsverbräuche, obwohl die alte vollständige Historie im Reload-Fall größer als 64 KiB wäre. Fehlende, unbekannte oder unmögliche Verbrauchsstände im neuen Format werden abgelehnt. Die reale FHEM-Integration übernimmt einen alten Checkpoint und prüft eine bereits verbrauchte Ortsaktion mit `cooldown 0` erneut; es darf kein zweiter Schaltbefehl entstehen.
+
+GP-F03-001 prüft gewöhnliche Nachrichten und Schaltaktionen während eines unbestätigten Home-Abgangs, mit `enter`/`exit`, Orts-/Gruppenauswahl und `cooldown 0`. Zweimalige Zurückweisung eines Outer-Abgangs bei gehaltener Telefonanwesenheit muss den Verbrauch derselben Reise erhalten. Neue Austrittsnachweise und neue Besuche dürfen die Aktion nicht wiederholen; ein tatsächlich neuer Ausflug darf sie mit neuen Nachweisen wieder erlauben. Die reale FHEM-Integration prüft diesen Ablauf über HTTP mit einem Dummy-Licht und unveränderten Tür-/Garagen-Dummys.
+
 ## 13. Änderungen seit der letzten Version
+
+Änderungen von Version 0.64 auf 0.65:
+
+- GP-F03-001: Ein beibehaltener unbestätigter Home-Abgang erhält den Verbrauch seiner Reiseaktionen.
+- Zurückgewiesene Entfernungs- und Austrittsnachweise bleiben verworfen; neue Nachweise erlauben keine erneute Ausgabe innerhalb derselben Reise.
+
+Änderungen von Version 0.63 auf 0.64:
+
+- Zweite Etappe von R-08, F-03: Aktuelle Verbrauchsstände ersetzen die Historie alter Besuche und deren Reihenfolgeliste.
+- Reisegebundener Verbrauch bleibt im Ausflug; gewöhnliche Orts-/Gruppenbesuche und gemeinsame Aktions-Cooldowns bleiben getrennt.
+- Checkpoint-Version 2 mit einmaliger Übernahme gültiger Version-1-Daten und Verdichtung alter Laufzeitzustände beim Reload.
+
+Änderungen von Version 0.62 auf 0.63:
+
+- Erste Etappe von R-08, F-04: Checkpoints folgen Änderungen der gespeicherten Fachdaten statt Diagnoseeinträgen.
+- Unveränderte Wiederherstellungen behalten den gespeicherten Stand; Bewegungs- und Anzeigeabläufe werden ausdrücklich erfasst.
+- Reisequalifikation wird vor dem schnellen Rücksprung geprüft; Widerruf und Verbrauch bleiben vor produktiven Ausgaben gespeichert.
 
 Änderungen von Version 0.61 auf 0.62:
 

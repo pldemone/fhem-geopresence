@@ -1731,6 +1731,73 @@ def run(source, encoding="bytestream", help_only=False):
                 check(command("deleteattr " + name + " " + pattern) == "", "real obsolete-attribute pattern accepted")
                 check(command("get GP validate Geo.Test").startswith("OK:"), "cleaned attributes refresh real validation")
                 check(command("set GP mode active") == "", "cleaned configuration activates without a reload")
+            # GP-F03-001: keeping the same unarmed Home departure must keep its
+            # route consumption, even after a new valid exit and another visit.
+            zones["RouteA"] = ("place", 0.0009, 20)
+            zones["RouteB"] = ("place", 0.00135, 20)
+            for text in ("set GP mode debug", "define retainedRouteLamp dummy",
+                         "define Z.RouteA GeoPresence location Geo.Test place", "attr Z.RouteA zoneId RouteA",
+                         "define Z.RouteB GeoPresence location Geo.Test place", "attr Z.RouteB zoneId RouteB",
+                         "define A.RetainedRoute GeoPresence action GP switch_on",
+                         "attr A.RetainedRoute target retainedRouteLamp", "attr A.RetainedRoute command on",
+                         "define R.RetainedRoute GeoPresence rule GP", "attr R.RetainedRoute residents Geo.Test",
+                         "attr R.RetainedRoute trigger enter", "attr R.RetainedRoute locations Z.RouteB",
+                         "attr R.RetainedRoute afterExit location:Z.RouteA", "attr R.RetainedRoute action A.RetainedRoute",
+                         "attr R.RetainedRoute cooldown 0", "set GP mode active"):
+                check(command(text) == "", "GP-F03-001 configures the real route: " + text)
+            advance(40)
+            for zone in ("RouteA", "RouteB"):
+                check(request(zone, 1)[0] == 200, "GP-F03-001 initializes nearby geometry")
+                advance(3)
+            command("{ GP_ResetController($defs{GP});; return 'reset' }")
+            advance(40)
+            phone_state("p1", "present")
+            phone_state("p2", "absent")
+            advance(5)
+            for target in ("retainedRouteLamp", "door", "garage"):
+                command(f"set {target} untouched")
+            check(request("Home", 0)[0] == 200, "GP-F03-001 accepts the unconfirmed Home departure")
+            advance(3)
+            retained = json.loads(command("get GP explain Geo.Test prod format=json"))["state"]["trip"]
+            for zone, entry in (("RouteA", 0), ("RouteB", 1)):
+                advance(10)
+                check(request(zone, entry)[0] == 200, "GP-F03-001 accepts the initial route observation")
+                advance(3)
+            check(command("{ ReadingsVal('retainedRouteLamp','state','') }") == "on",
+                  "GP-F03-001 first route command really reached the dummy")
+            consumed = json.loads(command("get GP explain Geo.Test prod format=json"))["state"]["trip"]["actions"]
+            command("set retainedRouteLamp untouched")
+            advance(10)
+            check(request("Outer", 0)[0] == 200, "GP-F03-001 accepts the contradictory outer observation")
+            advance(3)
+            state = json.loads(command("get GP explain Geo.Test prod format=json"))["state"]
+            check(state["trip"]["id"] == retained["id"] and state["trip"]["home_exit"] == retained["home_exit"]
+                  and state["trip"]["scope"] == "local" and not state["trip"]["armed"],
+                  "GP-F03-001 retains the same unarmed local trip")
+            check(state["trip"]["actions"] == consumed and not state["trip"].get("exits"),
+                  "GP-F03-001 retains consumption while discarding rejected exit evidence")
+            for zone, entry in (("RouteA", 1), ("RouteA", 0), ("RouteB", 0), ("RouteB", 1)):
+                advance(10)
+                check(request(zone, entry)[0] == 200, "GP-F03-001 accepts a new explicit route visit")
+                advance(3)
+            check(command("{ ReadingsVal('retainedRouteLamp','state','') }") == "untouched",
+                  "GP-F03-001 new exit evidence cannot repeat a consumed route in the same trip")
+            for zone, entry in (("Home", 1), ("Home", 0), ("RouteA", 0), ("RouteB", 1)):
+                advance(10)
+                check(request(zone, entry)[0] == 200, "GP-F03-001 accepts a genuinely new outing")
+                advance(3)
+            state = json.loads(command("get GP explain Geo.Test prod format=json"))["state"]
+            check(state["trip"]["id"] != retained["id"]
+                  and command("{ ReadingsVal('retainedRouteLamp','state','') }") == "on",
+                  "GP-F03-001 a new trip with new evidence may execute the route again")
+            check(command("{ ReadingsVal('door','state','') }") == "untouched"
+                  and command("{ ReadingsVal('garage','state','') }") == "untouched",
+                  "GP-F03-001 unconfirmed departures never open the door or garage")
+            for text in ("set GP mode debug", "delete R.RetainedRoute", "delete A.RetainedRoute",
+                         "delete Z.RouteA", "delete Z.RouteB", "delete retainedRouteLamp", "set GP mode active"):
+                check(command(text) == "", "GP-F03-001 cleans up the isolated route")
+            del zones["RouteA"], zones["RouteB"]
+
             # Real departures with lagging indoor presence (19/20 September),
             # including negatives already qualifying before the outer webhook.
             for label, outbound, away, early_negative, motion in (
@@ -2413,7 +2480,7 @@ def run(source, encoding="bytestream", help_only=False):
             for resident in ("Geo.PERSON", "Geo.Debug", "Geo.Test"):
                 command(f"set {resident} mode disabled")
             for name in ("recoveryDoor", "recoveryContact", "recoveryFeedback", "recoveryGarage",
-                         "recoveryGate", "recoveryUpper", "recoveryLower"):
+                         "recoveryGate", "recoveryUpper", "recoveryLower", "recoveryLamp"):
                 check(command(f"define {name} dummy") == "", "define isolated recovery actuator: " + name)
             for line in ("define rr_Recovery ROOMMATE", "attr rr_Recovery rr_locationUnderway underway", "attr rr_Recovery alias Rückkehr 🌙",
                          "define Geo.Recovery GeoPresence resident GP rr_Recovery",
@@ -2445,6 +2512,12 @@ def run(source, encoding="bytestream", help_only=False):
                              f"attr R.Recovery{kind} trigger arrival", f"attr R.Recovery{kind} action {action}"):
                     check(command(line) == "", "configure recovery rule")
             command("attr R.RecoveryGarage arrivalFilter vehicle")
+            for line in ("define A.RecoveryLight GeoPresence action GP switch_on", "attr A.RecoveryLight target recoveryLamp",
+                         "attr A.RecoveryLight command on", "define R.RecoveryLight GeoPresence rule GP",
+                         "attr R.RecoveryLight residents Geo.Recovery", "attr R.RecoveryLight trigger enter",
+                         "attr R.RecoveryLight locations Geo.Recovery.Work", "attr R.RecoveryLight action A.RecoveryLight",
+                         "attr R.RecoveryLight cooldown 0"):
+                check(command(line) == "", "configure ordinary recovery consumption")
             actor_time = datetime.datetime.fromtimestamp(time.time() - 360).strftime("%Y-%m-%d %H:%M:%S")
             for name, reading, value in (("recoveryContact", "state", "closed"), ("recoveryFeedback", "pulse_state", "idle"),
                                          ("recoveryGate", "state", "off"), ("recoveryUpper", "state", "open"),
@@ -2463,10 +2536,10 @@ def run(source, encoding="bytestream", help_only=False):
             command("{ GeoPresence_Timer($defs{GP});; return 'listener ready' }")
             check(command("get GP validate Geo.Recovery").startswith("OK:"), "recovery configuration and listener are ready")
 
-            def recovery_request(name, entry, motion=None):
+            def recovery_request(name, entry, motion=None, observed=None):
                 role, lat, radius = recovery_zones[name]
                 payload = {"device": "recovery-device", "id": "recovery-" + name.lower(), "entry": entry,
-                           "date": datetime.datetime.fromtimestamp(float(command("{ GP_Now() }")) - (80 if name == "Work" else 0), datetime.timezone.utc).isoformat(),
+                           "date": observed or datetime.datetime.fromtimestamp(float(command("{ GP_Now() }")) - (80 if name == "Work" else 0), datetime.timezone.utc).isoformat(),
                            "latitude": lat, "longitude": 0, "radius": radius}
                 if motion:
                     payload["motion"] = motion
@@ -2474,11 +2547,56 @@ def run(source, encoding="bytestream", help_only=False):
                            "Authorization": "Basic " + base64.b64encode(f"recovery-user:{password}".encode()).decode()}
                 return http_request("POST", "/fhem/geopresence", urllib.parse.urlencode(payload), headers)
 
-            check(recovery_request("Work", 1)[0] == 200, "real authenticated departure accepted before restart")
+            departure_observed = datetime.datetime.fromtimestamp(float(command("{ GP_Now() }")) - 80, datetime.timezone.utc).isoformat()
+            check(recovery_request("Work", 1, observed=departure_observed)[0] == 200, "real authenticated departure accepted before restart")
             time.sleep(2.2)
             command("{ GeoPresence_Timer($defs{GP});; return 'departure processed' }")
             check(json.loads(command("{ ReadingsVal('Geo.Recovery','gp_trip_checkpoint','{}') }"))["status"] == "qualified",
                   "qualified trip is stored before real process shutdown")
+            check(command("{ ReadingsVal('recoveryLamp','state','') }") == "on", "ordinary visit dispatched the dummy switch")
+            command("set recoveryLamp untouched")
+            checkpoint_before_retry = command("{ ReadingsVal('Geo.Recovery','gp_trip_checkpoint','') }")
+            checkpoint_timestamp = command("{ ReadingsTimestamp('Geo.Recovery','gp_trip_checkpoint','') }")
+            compact = json.loads(checkpoint_before_retry)
+            check(compact["version"] == 2 and compact["state"]["action_visits"] == {
+                "A.RecoveryLight|enter|location:Geo.Recovery.Work": 1}, "real checkpoint stores one current consumption slot")
+            check(not {"notify_seen", "notify_order", "notify_last"} & compact["state"].keys(),
+                  "real checkpoint contains no legacy action history")
+            check(recovery_request("Work", 1, observed=departure_observed)[0] == 200, "identical departure retry accepted by real HTTP listener")
+            time.sleep(2.2)
+            command("{ GeoPresence_Timer($defs{GP});; return 'retry processed' }")
+            check(command("{ GP_State($defs{GP},'Geo.Recovery',0)->{last_reason} }") == "duplicate event",
+                  "identical departure really reached duplicate handling")
+            check(command("{ ReadingsVal('Geo.Recovery','gp_trip_checkpoint','') }") == checkpoint_before_retry
+                  and command("{ ReadingsTimestamp('Geo.Recovery','gp_trip_checkpoint','') }") == checkpoint_timestamp,
+                  "duplicate webhook preserved checkpoint content and timestamp in real FHEM")
+            check(command("{ ReadingsVal('recoveryLamp','state','') }") == "untouched", "identical retry did not repeat the switch")
+            legacy = json.loads(checkpoint_before_retry)
+            legacy["version"] = 1
+            legacy["state"]["notify_seen"] = {"A.RecoveryLight|enter|1|location:Geo.Recovery.Work": 1}
+            legacy["state"]["notify_order"] = list(legacy["state"]["notify_seen"])
+            legacy["state"]["notify_last"] = legacy["state"].pop("action_last")
+            legacy["state"].pop("action_visits")
+            check(command(f"setstate Geo.Recovery {checkpoint_timestamp} gp_trip_checkpoint "
+                          + json.dumps(legacy, separators=(",", ":"))) == "", "prepare an ordinary version 1 checkpoint")
+            command("{ delete $defs{GP}{helper}{gp}{prod}{'Geo.Recovery'};; return 'old process state discarded' }")
+            check(command("reload 98_GeoPresence.pm") == "", "real reload imports the legacy checkpoint")
+            command("{ GeoPresence_Timer($defs{GP});; return 'legacy recovery processed' }")
+            migrated = json.loads(command("{ ReadingsVal('Geo.Recovery','gp_trip_checkpoint','{}') }"))
+            check(migrated["version"] == 2 and migrated["trip"]["id"] == compact["trip"]["id"]
+                  and migrated["trip"]["away_time"] == compact["trip"]["away_time"],
+                  "legacy import preserves the original qualified trip")
+            check(migrated["state"]["action_visits"] == compact["state"]["action_visits"]
+                  and migrated["state"]["action_last"] == compact["state"]["action_last"],
+                  "legacy import preserves current consumption and cooldown")
+            new_work_time = datetime.datetime.fromtimestamp(float(command("{ GP_Now() }")) + .25, datetime.timezone.utc).isoformat()
+            check(recovery_request("Work", 1, observed=new_work_time)[0] == 200, "new observation of the recovered current visit accepted")
+            time.sleep(2.2)
+            command("{ GeoPresence_Timer($defs{GP});; return 'recovered visit processed' }")
+            check(command("{ ReadingsVal('recoveryLamp','state','') }") == "untouched",
+                  "legacy recovery did not repeat the consumed visit even with zero cooldown")
+            checkpoint_before_retry = command("{ ReadingsVal('Geo.Recovery','gp_trip_checkpoint','') }")
+            checkpoint_timestamp = command("{ ReadingsTimestamp('Geo.Recovery','gp_trip_checkpoint','') }")
             saved_location = json.loads(command("get GP explain Geo.Recovery format=json"))["state"]["location"]
             for attempt in range(2):
                 check(command("save").startswith("Wrote configuration"), "save recovery fixture through normal FHEM")
@@ -2506,6 +2624,9 @@ def run(source, encoding="bytestream", help_only=False):
                 if not attempt:
                     check(restored["resume"]["status"] == "restored", "real recovery reason is visible in explain")
                     check(restored["location"] == saved_location, "Unicode location survives checkpoint and real state-file restoration")
+                    check(command("{ ReadingsVal('Geo.Recovery','gp_trip_checkpoint','') }") == checkpoint_before_retry
+                          and command("{ ReadingsTimestamp('Geo.Recovery','gp_trip_checkpoint','') }") == checkpoint_timestamp,
+                          "real process restart retained the unchanged checkpoint and its saved_at")
                 command("set recoveryDoor untouched")
                 command("set recoveryGarage untouched")
                 check(command("{ ReadingsVal('recoveryDoor','state','') }") == "untouched", "startup has not opened the dummy door")

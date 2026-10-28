@@ -1287,6 +1287,62 @@ subtest 'rejected outer events preserve a running Home absence qualification wit
     }
 };
 
+subtest 'GP-F03-001: retained Home departures preserve route consumption until a genuinely new trip' => sub {
+    for my $case ([notify=>'enter','location'],[notify=>'exit','group'],[switch_on=>'enter','group'],[switch_on=>'exit','location']) {
+        my ($type,$trigger,$selector)=@$case; my $label="$type/$trigger/$selector";
+        my ($c)=fixture(); mode('GP','debug'); attribute('Geo.Test','phoneSignalMode','state');
+        for my $spec (['Checkpoint',0.0009,'RouteOrigin'],['Sternensteg',0.00135,'RouteTarget']) {
+            my ($zone,$lat,$group)=@$spec;
+            my $g=JSON::PP::decode_json(GP_Read('Z.'.$zone,'gp_geometry',''));
+            @{$g}{qw(lat radius)}=($lat,20);
+            reading('Z.'.$zone,'gp_geometry',JSON::PP::encode_json($g),$now-1000);
+            attribute('Z.'.$zone,'groups',$group);
+        }
+        my $action='A.Msg';
+        if ($type eq 'switch_on') {
+            device('routeLamp','dummy'); gp_define('A.RouteLight','action GP switch_on');
+            attribute('A.RouteLight','target','routeLamp'); attribute('A.RouteLight','command','on'); $action='A.RouteLight';
+        }
+        gp_define('R.NearRoute','rule GP'); attribute('R.NearRoute','residents','Geo.Test');
+        attribute('R.NearRoute','trigger',$trigger); attribute('R.NearRoute','action',$action); attribute('R.NearRoute','cooldown',0);
+        attribute('R.NearRoute',$selector eq 'group' ? 'locationGroup':'locations',
+            $selector eq 'group' ? 'RouteTarget':'Z.Sternensteg');
+        attribute('R.NearRoute','afterExit',$selector eq 'group' ? 'group:RouteOrigin':'location:Z.Checkpoint');
+        mode('GP','active'); GeoPresence_Timer($c);
+        my $cfg=GP_Config($c,'Geo.Test'); my $s=GP_State($c,'Geo.Test',0); advance(40);
+        my $samples=negative_samples(); $samples->{p1}{value}='present'; phone_tick($s,$cfg,$samples);
+        my $observe=sub {
+            process($s,$cfg,@_); GP_Dispatch($c,'Geo.Test',$cfg,$s,0); GP_Publish($c,'Geo.Test',$cfg,$s);
+        };
+        my $issued=sub {$type eq 'notify' ? scalar(@messages):scalar(grep {$_ eq 'routeLamp on'} @commands)};
+        advance(1); $observe->('Home',0); my $id=$s->{trip}{id}; my $home_exit=$s->{trip}{home_exit};
+        advance(10); $observe->('Checkpoint',0);
+        my $entry=$trigger eq 'enter' ? 1:0;
+        advance(10); $observe->('Sternensteg',$entry);
+        is($issued->(),1,"$label: first route action really dispatched while departure is unarmed");
+        my %consumed=%{$s->{trip}{actions}}; my $last=$s->{action_last}{$action};
+        for my $repeat (1..2) {
+            advance(10); $observe->('Outer',0);
+            is($s->{trip}{id},$id,"$label: rejection $repeat retained the same trip");
+            is($s->{trip}{home_exit},$home_exit,'original Home exit retained');
+            ok(!$s->{trip}{armed} && $s->{trip}{scope} eq 'local','rejection granted no remote or opening permission');
+            is_deeply($s->{trip}{actions},\%consumed,'same trip retained its consumed actions');
+            ok(!exists($s->{trip}{exits}),'old exit evidence was still discarded');
+            for my $observation (['Checkpoint',1],['Checkpoint',0],['Sternensteg',$entry ? 0:1],['Sternensteg',$entry]) {
+                advance(10); $observe->(@$observation);
+            }
+            is($issued->(),1,'new exit evidence and another visit did not repeat a consumed route action');
+            is($s->{action_last}{$action},$last,'suppressed repetition did not renew the cooldown');
+        }
+        $defs{rr_Test}{CHANGED}=['home']; GeoPresence_Notify($c,$defs{rr_Test});
+        advance(10); $observe->('Home',0);
+        isnt($s->{trip}{id},$id,'a later Home departure really began a new trip');
+        advance(10); $observe->('Checkpoint',0); advance(10); $observe->('Sternensteg',$entry);
+        is($issued->(),2,'new trip with new exit evidence allowed the route action again');
+        is(scalar(grep {/^(?:door|garage) /} @commands),0,'unconfirmed departures never opened door or garage');
+    }
+};
+
 subtest 'Home or phone return revokes retained departure suspicion, including delayed observations' => sub {
     for my $return ('Home','phone','delayed phone','stale phone') {
         my ($c,$cfg,$s)=house_fixture();$cfg->{phoneSignalMode}='state';
@@ -2535,6 +2591,317 @@ sub simulate_process_restart {
     return (GP_Config($c,'Geo.Test'),GP_State($c,'Geo.Test',0));
 }
 
+sub checkpoint_work {
+    my ($call)=@_;
+    my ($encodes,$writes)=(0,0);
+    my $encode=JSON::PP->can('encode'); my $set=\&setReadingsVal;
+    no warnings qw(redefine once);
+    local *JSON::PP::encode=sub {
+        $encodes++ if ref($_[1]) eq 'HASH' && exists($_[1]{version}) && exists($_[1]{status});
+        return $encode->(@_);
+    };
+    local *setReadingsVal=sub {
+        $writes++ if $_[0]{NAME} eq 'Geo.Test' && $_[1] eq 'gp_trip_checkpoint';
+        return $set->(@_);
+    };
+    $call->();
+    return [$encodes,$writes];
+}
+
+subtest 'F-04: diagnostics, rejected observations and unchanged retries do no checkpoint work' => sub {
+    my ($c,$cfg,$s)=saved_trip_fixture('remote');
+    my $before={%{$defs{'Geo.Test'}{READINGS}{gp_trip_checkpoint}}};
+    my $observed=$s->{zones}{'Z.Work'}{time};
+    $s->{intents}=[];
+    for my $case (
+        ['idle',sub {}],
+        ['diagnostic',sub {GP_Trace($s,$now,'diagnostic only',{diagnostic_only=>1})}],
+        ['decision trace',sub {GP_Trace($s,$now,'nothing changed')}],
+        ['actuator result',sub {$s->{door_result}='confirmed';GP_Trace($s,$now,'actor feedback')}],
+        ['identical retry',sub {
+            my $e=ev('Work',1,$observed); $e->{received}=$now;
+            GP_Process($s,$cfg,$e,$now,$mono);
+        }],
+        ['expired event',sub {
+            my $e=ev('Work2',1,$now-$cfg->{action_max_age}-1); $e->{received}=$now;
+            GP_Process($s,$cfg,$e,$now,$mono);
+        }],
+        ['ordinary timer',sub {GeoPresence_Timer($c)}],
+    ) {
+        advance(1);
+        is_deeply(checkpoint_work(sub {
+            $case->[1]->(); GP_Dispatch($c,'Geo.Test',$cfg,$s,0); GP_Publish($c,'Geo.Test',$cfg,$s);
+        }),[0,0],"$case->[0] neither serializes nor writes the checkpoint");
+    }
+    is_deeply($defs{'Geo.Test'}{READINGS}{gp_trip_checkpoint},$before,'saved value and reading timestamp stay unchanged');
+};
+
+subtest 'F-04: accepted travel observations persist memberships, exits and visit consumption once' => sub {
+    my ($c,$cfg,$s)=saved_trip_fixture('remote');
+    my $id=$s->{trip}{id}; my $away=$s->{trip}{away_time};
+    advance(1); process($s,$cfg,'Work',0);
+    is_deeply(checkpoint_work(sub {
+        GP_Checkpoint($c,'Geo.Test',$cfg,$s); GP_Checkpoint($c,'Geo.Test',$cfg,$s);
+    }),[1,1],'new exit is encoded and written once');
+    my $cp=JSON::PP::decode_json(GP_Read('Geo.Test','gp_trip_checkpoint',''));
+    is($cp->{trip}{exits}{'group:Work'},$now,'explicit group exit persisted');
+    is($cp->{state}{members}{'Z.Work'}{entry},0,'explicit membership persisted');
+    advance(301); process($s,$cfg,'Work',1);
+    is_deeply(checkpoint_work(sub {GP_Dispatch($c,'Geo.Test',$cfg,$s,0); GP_Publish($c,'Geo.Test',$cfg,$s)}),
+        [1,1],'new visit and notification consumption share one checkpoint before dispatch');
+    $cp=JSON::PP::decode_json(GP_Read('Geo.Test','gp_trip_checkpoint',''));
+    is($cp->{state}{zone_visits}{'Z.Work'},2,'new location visit persisted');
+    is($cp->{state}{group_visits}{Work},2,'new group visit persisted');
+    is($cp->{state}{action_last}{'A.Msg'},$now,'notification cooldown persisted');
+    is_deeply($cp->{state}{action_visits},{'A.Msg|enter|group:Work'=>2},'only the latest consumed visit retained');
+    ok(!exists($cp->{trip}{exits}{'group:Work'}),'reentry removed the prior exit');
+    is($cp->{trip}{id},$id,'trip identity unchanged');
+    is($cp->{trip}{away_time},$away,'saving did not renew the departure');
+    ($cfg,$s)=simulate_process_restart($c);
+    is($s->{group_visits}{Work},2,'latest visit recovered after restart');
+    is($s->{action_last}{'A.Msg'},$cp->{state}{action_last}{'A.Msg'},'cooldown recovered after restart');
+    is(scalar @messages,1,'restart did not repeat the notification');
+};
+
+subtest 'F-04: opening consumption is saved while duplicate rules leave it unchanged' => sub {
+    my ($c,$cfg,$s)=saved_trip_fixture('remote'); advance(70);
+    $s->{intents}=[];
+    my $e=ev('Home',1,$now,'automotive');
+    GP_Rules($s,$cfg,'arrival',$e,$now,$mono);
+    is(scalar @{$s->{intents}},2,'both opening actions consumed');
+    is_deeply(checkpoint_work(sub {GP_Checkpoint($c,'Geo.Test',$cfg,$s)}),[1,1],'consumed actions persisted');
+    my $before=GP_Read('Geo.Test','gp_trip_checkpoint','');
+    advance(1);
+    is_deeply(checkpoint_work(sub {
+        GP_Rules($s,$cfg,'arrival',$e,$now,$mono); GP_Checkpoint($c,'Geo.Test',$cfg,$s);
+    }),[0,0],'already consumed actions do no checkpoint work');
+    is(GP_Read('Geo.Test','gp_trip_checkpoint',''),$before,'duplicate rules did not change consumption counters');
+    ($cfg,$s)=simulate_process_restart($c);
+    advance(40); arrive($s,$cfg,'automotive'); GP_Dispatch($c,'Geo.Test',$cfg,$s,0);
+    is(scalar(grep {/^(?:door|garage) /} @commands),0,'restart cannot repeat consumed opening actions');
+};
+
+subtest 'F-04: motion supplements and delayed revocations update the saved evidence' => sub {
+    my ($c,$cfg,$s)=saved_trip_fixture('remote');
+    advance(70); process($s,$cfg,'Drive',1); my $approach=$now;
+    GP_Checkpoint($c,'Geo.Test',$cfg,$s);
+    advance(1);
+    my $e=ev('Drive',1,$approach,'automotive'); $e->{received}=$now;
+    is_deeply(checkpoint_work(sub {
+        GP_Process($s,$cfg,$e,$now,$mono); GP_Checkpoint($c,'Geo.Test',$cfg,$s);
+    }),[1,1],'accepted movement supplement persisted');
+    my $cp=JSON::PP::decode_json(GP_Read('Geo.Test','gp_trip_checkpoint',''));
+    is($cp->{state}{motion},'automotive','supplemented motion saved');
+    is($cp->{state}{automotive},$approach,'original motion time retained');
+    advance(1); process($s,$cfg,'Home',1); GP_Checkpoint($c,'Geo.Test',$cfg,$s);
+    my $position=$s->{position_time};
+    advance(1); $e=ev('Drive',0,$approach+1); $e->{received}=$now;
+    is_deeply(checkpoint_work(sub {
+        GP_Process($s,$cfg,$e,$now,$mono); GP_Checkpoint($c,'Geo.Test',$cfg,$s);
+    }),[1,1],'delayed exit persisted the revoked movement evidence');
+    $cp=JSON::PP::decode_json(GP_Read('Geo.Test','gp_trip_checkpoint',''));
+    ok(!exists($cp->{state}{motion}) && !exists($cp->{state}{automotive}),'revoked movement is absent from checkpoint');
+    is($cp->{state}{position_time},$position,'delayed exit did not rewind the saved position');
+    is($cp->{status},'qualified','the valid Home arrival kept its trip');
+};
+
+subtest 'F-04: expired movement and display data are checkpointed once without inventing exits' => sub {
+    my ($c,$cfg,$s)=saved_trip_fixture('remote');
+    advance(70); process($s,$cfg,'Drive',1,'automotive'); GP_Checkpoint($c,'Geo.Test',$cfg,$s);
+    advance($cfg->{approach_timeout}+1);
+    is_deeply(checkpoint_work(sub {
+        GP_TickState($s,$cfg,$now,$mono); GP_Checkpoint($c,'Geo.Test',$cfg,$s);
+    }),[1,1],'approach timeout persisted removal of saved movement');
+    my $cp=JSON::PP::decode_json(GP_Read('Geo.Test','gp_trip_checkpoint',''));
+    ok(!exists($cp->{state}{automotive}) && !exists($cp->{state}{motion}),'expired approach movement removed');
+    advance(1);
+    is_deeply(checkpoint_work(sub {
+        GP_TickState($s,$cfg,$now,$mono); GP_Checkpoint($c,'Geo.Test',$cfg,$s);
+    }),[0,0],'completed timeout did not cause another write');
+    advance($cfg->{zone_display_max_age});
+    is_deeply(checkpoint_work(sub {
+        GP_TickState($s,$cfg,$now,$mono); GP_Checkpoint($c,'Geo.Test',$cfg,$s);
+    }),[1,1],'display expiry persisted once');
+    $cp=JSON::PP::decode_json(GP_Read('Geo.Test','gp_trip_checkpoint',''));
+    is($cp->{state}{zones}{'Z.Drive'}{entry},0,'expired displayed entry saved');
+    is($cp->{state}{location},'unknown','expired location saved');
+    is($cp->{state}{members}{'Z.Drive'}{entry},1,'explicit membership retained');
+    ok(!exists($cp->{trip}{exits}{'location:Z.Drive'}),'display expiry did not invent an explicit exit');
+    advance(1);
+    is_deeply(checkpoint_work(sub {
+        GP_TickState($s,$cfg,$now,$mono); GP_Trace($s,$now,'diagnostic after expiry');
+        GP_Checkpoint($c,'Geo.Test',$cfg,$s);
+    }),[0,0],'already expired display remained quiet');
+    ($cfg,$s)=simulate_process_restart($c);
+    is($s->{location},'unknown','restart retained the expired display');
+    is($s->{members}{'Z.Drive'}{entry},1,'restart retained the explicit membership');
+};
+
+subtest 'F-04: losing qualification invalidates a clean checkpoint even with blocked outputs' => sub {
+    for my $cause (qw(trip armed conflict phase geometry)) {
+        my ($c,$cfg,$s)=saved_trip_fixture('remote');
+        $c->{helper}{gp}{ready}=0;
+        if ($cause eq 'trip') {delete $s->{trip};}
+        elsif ($cause eq 'armed') {$s->{trip}{armed}=0;}
+        elsif ($cause eq 'conflict') {$s->{conflict}=1;}
+        elsif ($cause eq 'phase') {$s->{phase}='home';}
+        else {$cfg={%$cfg,geometry_ready=>0};}
+        is_deeply(checkpoint_work(sub {GP_Publish($c,'Geo.Test',$cfg,$s)}),[1,1],"$cause revoked the saved permission without a trace");
+        is(JSON::PP::decode_json(GP_Read('Geo.Test','gp_trip_checkpoint',''))->{status},'none',"$cause left no qualified checkpoint");
+        is(scalar @commands,0,'revocation emitted no command');
+        advance(1); GP_Trace($s,$now,'still revoked');
+        is_deeply(checkpoint_work(sub {GP_Publish($c,'Geo.Test',$cfg,$s)}),[0,0],'revoked checkpoint was not rewritten for diagnostics');
+    }
+};
+
+subtest 'F-04: restored checkpoints stay unchanged and externally edited readings are repaired' => sub {
+    my ($c,$cfg,$s)=saved_trip_fixture('remote');
+    my $before={%{$defs{'Geo.Test'}{READINGS}{gp_trip_checkpoint}}};
+    is_deeply(checkpoint_work(sub {($cfg,$s)=simulate_process_restart($c)}),[0,0],'process restart did not re-encode unchanged travel data');
+    is_deeply($defs{'Geo.Test'}{READINGS}{gp_trip_checkpoint},$before,'restart retained saved_at and the reading timestamp');
+    advance(1);
+    is_deeply(checkpoint_work(sub {GP_ResetController($c,'resume'); GeoPresence_Timer($c)}),[0,0],'module reload also preserved the unchanged checkpoint');
+    $cfg=GP_Config($c,'Geo.Test'); $s=GP_State($c,'Geo.Test',0);
+    reading('Geo.Test','gp_trip_checkpoint','{',$now);
+    is_deeply(checkpoint_work(sub {GP_Checkpoint($c,'Geo.Test',$cfg,$s)}),[1,1],'changed reading repaired from the live validated trip');
+    my $cp=JSON::PP::decode_json(GP_Read('Geo.Test','gp_trip_checkpoint',''));
+    is($cp->{status},'qualified','repaired checkpoint is usable');
+    is($cp->{trip}{id},$s->{trip}{id},'repair retained the live trip identity');
+    advance(1); GP_Trace($s,$now,'diagnostic after repair');
+    is_deeply(checkpoint_work(sub {GP_Checkpoint($c,'Geo.Test',$cfg,$s)}),[0,0],'repair did not cause repeated writes');
+};
+
+subtest 'F-03: thousands of visits retain one consumption slot and a small recoverable checkpoint' => sub {
+    my ($c)=fixture(); mode('GP','debug'); attribute('R.Work','cooldown',0);
+    mode('GP','active'); GeoPresence_Timer($c);
+    my $cfg=GP_Config($c,'Geo.Test'); my $s=GP_State($c,'Geo.Test',0); advance(40);
+    process($s,$cfg,'Work',1); GP_Publish($c,'Geo.Test',$cfg,$s);
+    my $initial=length(GP_Read('Geo.Test','gp_trip_checkpoint',''));
+    for (1..2100) {
+        advance(1); process($s,$cfg,'Work',0);
+        advance(1); process($s,$cfg,'Work',1);
+    }
+    GP_Checkpoint($c,'Geo.Test',$cfg,$s);
+    my $raw=GP_Read('Geo.Test','gp_trip_checkpoint',''); my $cp=JSON::PP::decode_json($raw);
+    is($cp->{version},2,'compact checkpoint format written');
+    is($cp->{status},'qualified','long-running ordinary activity did not discard the trip');
+    is_deeply($s->{action_visits},{'A.Msg|enter|group:Work'=>2101},'one slot replaces all 2101 consumed visits');
+    is_deeply($s->{action_last},{'A.Msg'=>$now},'one cooldown per action');
+    ok(!exists($s->{notify_seen}) && !exists($s->{notify_order}),'no legacy history retained at runtime');
+    ok(!exists($cp->{state}{notify_seen}) && !exists($cp->{state}{notify_order}),'no legacy history stored');
+    cmp_ok(length($raw),'<',4096,'checkpoint stays below 4 KiB for this configuration');
+    cmp_ok(length($raw)-$initial,'<',100,'size grows only with the counter digits, not the number of visits');
+    ($cfg,$s)=simulate_process_restart($c);
+    ok($s->{trip}{armed},'qualified trip recovered after thousands of visits');
+    advance(40); process($s,$cfg,'Work',1);
+    is(scalar @{$s->{intents}},0,'same visit cannot repeat after restart even with zero cooldown');
+    advance(1); process($s,$cfg,'Work',0); advance(1); process($s,$cfg,'Work',1);
+    is(scalar @{$s->{intents}},1,'a genuine new visit still schedules the action');
+};
+
+sub consumption_fixture {
+    my ($c)=fixture(); mode('GP','debug'); attribute('R.Work','cooldown',0);
+    for my $spec ([Route=>'exit'],[ArrivalMsg=>'arrival']) {
+        my ($name,$trigger)=@$spec; gp_define('R.'.$name,'rule GP');
+        attribute('R.'.$name,'residents','Geo.Test'); attribute('R.'.$name,'trigger',$trigger);
+        attribute('R.'.$name,'action','A.Msg'); attribute('R.'.$name,'cooldown',0);
+        if ($trigger eq 'exit') {
+            attribute('R.'.$name,'locations','Z.Sternensteg'); attribute('R.'.$name,'afterExit','group:Work');
+        }
+    }
+    mode('GP','active'); GeoPresence_Timer($c);
+    my $cfg=GP_Config($c,'Geo.Test'); my $s=GP_State($c,'Geo.Test',0); advance(40);
+    process($s,$cfg,'Work',1); advance(1); process($s,$cfg,'Work',0);
+    advance(1); process($s,$cfg,'Sternensteg',0); advance(70);
+    $s->{intents}=[]; GP_Rules($s,$cfg,'arrival',ev('Home',1,$now,'automotive'),$now,$mono);
+    GP_Publish($c,'Geo.Test',$cfg,$s); $s->{intents}=[]; @commands=(); @messages=();
+    return ($c,$cfg,$s);
+}
+
+sub legacy_consumption_checkpoint {
+    my ($past)=@_;
+    my $cp=JSON::PP::decode_json(GP_Read('Geo.Test','gp_trip_checkpoint','')); $cp->{version}=1;
+    my $state=$cp->{state}; my $id=$cp->{trip}{id}; my $current=$past+1;
+    $state->{zone_visits}{'Z.Work'}=$current; $state->{group_visits}{Work}=$current;
+    delete @{$state}{qw(action_visits action_last)};
+    $state->{notify_seen}={map {('A.Msg|enter|'.$_.'|group:Work')=>1} 1..$current};
+    $state->{notify_seen}{'A.Msg|exit|'.$id.'|location:Z.Sternensteg'}=1;
+    $state->{notify_seen}{'A.Msg|arrival|'.$id.'|arrival'}=1;
+    $state->{notify_order}=[sort keys %{$state->{notify_seen}}];
+    $state->{notify_last}={'A.Msg'=>$now,'A.Obsolete'=>$now};
+    $cp->{trip}{actions}={$id.'|door_open|door'=>1,$id.'|garage_open|garage'=>1};
+    return $cp;
+}
+
+subtest 'F-03: version 1 recovery imports current visits, trip consumption and cooldowns once' => sub {
+    my ($c,$cfg,$s)=consumption_fixture(); my $id=$s->{trip}{id}; my $away=$s->{trip}{away_time};
+    my $cp=legacy_consumption_checkpoint(300);
+    reading('Geo.Test','gp_trip_checkpoint',JSON::PP::encode_json($cp),$now);
+    is_deeply(checkpoint_work(sub {($cfg,$s)=simulate_process_restart($c)}),[1,1],'legacy recovery rewrites only the compact checkpoint once');
+    my $new=JSON::PP::decode_json(GP_Read('Geo.Test','gp_trip_checkpoint',''));
+    is($new->{version},2,'legacy format upgraded');
+    is($new->{trip}{id},$id,'original trip identity retained');
+    is($new->{trip}{away_time},$away,'original departure time retained');
+    is_deeply($new->{trip}{actions},{'door_open|door'=>1,'garage_open|garage'=>1,
+        'A.Msg|exit|location:Z.Sternensteg'=>1,'A.Msg|arrival|arrival'=>1},'only current trip consumption imported');
+    is_deeply($new->{state}{action_visits},{'A.Msg|enter|group:Work'=>301},'only the current consumed visit imported');
+    is_deeply($new->{state}{action_last},{'A.Msg'=>$cp->{state}{notify_last}{'A.Msg'}},'needed cooldown retained, obsolete action dropped');
+    ok(!exists($s->{notify_seen}) && !exists($s->{notify_order}) && !exists($s->{notify_last}),'old runtime fields removed');
+    advance(1); $s->{intents}=[];
+    GP_Rules($s,$cfg,'enter',{zone=>'Z.Work',group=>'Work',selector=>'group:Work',time=>$now,received=>$now},$now,$mono);
+    is(scalar @{$s->{intents}},0,'current ordinary visit was not replayed');
+    advance(1); process($s,$cfg,'Sternensteg',0);
+    is(scalar @{$s->{intents}},0,'current route action was not replayed');
+    advance(40); arrive($s,$cfg,'automotive'); GP_Dispatch($c,'Geo.Test',$cfg,$s,0);
+    is(scalar @commands,0,'consumed door and garage actions were not replayed');
+    is(scalar @messages,0,'consumed arrival notification was not replayed');
+};
+
+subtest 'F-03: module reload compacts a live oversized legacy history before writing it' => sub {
+    my ($c,$cfg,$s)=consumption_fixture(); my $id=$s->{trip}{id}; my $away=$s->{trip}{away_time};
+    my $cp=legacy_consumption_checkpoint(1997);
+    cmp_ok(length(JSON::PP::encode_json($cp)),'>',65536,'equivalent old history exceeded the checkpoint limit');
+    delete @{$s}{qw(action_visits action_last)};
+    $s->{$_}=$cp->{state}{$_} for keys %{$cp->{state}};
+    $s->{trip}{actions}=$cp->{trip}{actions}; delete $cfg->{consumption_slots};
+    GP_ResetController($c,'resume'); GeoPresence_Timer($c);
+    $s=GP_State($c,'Geo.Test',0); $cfg=GP_Config($c,'Geo.Test');
+    my $raw=GP_Read('Geo.Test','gp_trip_checkpoint',''); my $new=JSON::PP::decode_json($raw);
+    is($new->{status},'qualified','live trip saved despite the old oversized history');
+    is($new->{version},2,'live state converted before checkpoint encoding');
+    is($s->{trip}{id},$id,'live trip survived reload');
+    is($s->{trip}{away_time},$away,'reload did not renew departure evidence');
+    is_deeply($s->{action_visits},{'A.Msg|enter|group:Work'=>1998},'only the latest visit retained');
+    is(scalar(keys %{$s->{trip}{actions}}),4,'opening, route and arrival consumption retained');
+    cmp_ok(length($raw),'<',4096,'history replaced by a checkpoint below 4 KiB');
+    advance(1); GP_Trace($s,$now,'after legacy reload');
+    is_deeply(checkpoint_work(sub {GP_Checkpoint($c,'Geo.Test',$cfg,$s)}),[0,0],'ordinary diagnostics remain free of checkpoint work');
+    is(scalar @commands,0,'reload did not dispatch historical commands');
+    is(scalar @messages,0,'reload did not dispatch historical notifications');
+};
+
+subtest 'F-03: malformed or incomplete compact consumption cannot restore a permission' => sub {
+    for my $case (qw(missing_visits missing_cooldown missing_actions unknown_visit future_visit fractional_visit unknown_action action_value unknown_cooldown legacy_field)) {
+        my ($c,$cfg,$s)=saved_trip_fixture('remote');
+        my $cp=JSON::PP::decode_json(GP_Read('Geo.Test','gp_trip_checkpoint',''));
+        if ($case eq 'missing_visits') {delete $cp->{state}{action_visits};}
+        elsif ($case eq 'missing_cooldown') {delete $cp->{state}{action_last};}
+        elsif ($case eq 'missing_actions') {delete $cp->{trip}{actions};}
+        elsif ($case eq 'unknown_visit') {$cp->{state}{action_visits}{'Unknown|enter|group:Work'}=1;}
+        elsif ($case eq 'future_visit') {$cp->{state}{action_visits}{'A.Msg|enter|group:Work'}=2;}
+        elsif ($case eq 'fractional_visit') {$cp->{state}{action_visits}{'A.Msg|enter|group:Work'}=0.5;}
+        elsif ($case eq 'unknown_action') {$cp->{trip}{actions}{'door_open|unknown'}=1;}
+        elsif ($case eq 'action_value') {$cp->{trip}{actions}{'door_open|door'}=2;}
+        elsif ($case eq 'unknown_cooldown') {$cp->{state}{action_last}{Unknown}=$now;}
+        else {$cp->{state}{notify_seen}={};}
+        reading('Geo.Test','gp_trip_checkpoint',JSON::PP::encode_json($cp),$now);
+        ($cfg,$s)=simulate_process_restart($c);
+        is($s->{resume}{status},'rejected',"$case rejected");
+        ok(!$s->{trip},'invalid consumption restored no trip');
+        is(scalar @commands,0,'invalid checkpoint caused no command');
+    }
+};
+
 subtest 'qualified local and remote trips survive a process restart and open on a new return' => sub {
     for my $scope (qw(local remote)) {
         my ($c,$cfg,$s)=saved_trip_fixture($scope);
@@ -2568,7 +2935,7 @@ subtest 'restart restores prior exits and notification consumption without repla
     ($cfg,$s)=simulate_process_restart($c);
     is(GP_ExitEvidence($s,'group:Work',$now),$exit,'explicit Work exit remains in the same trip');
     is(scalar @messages,0,'restoration sends no historical message');
-    ok(keys(%{$s->{notify_seen}}),'consumed notification history retained');
+    ok(keys(%{$s->{action_visits}}),'current notification consumption retained');
     advance(40); arrive($s,$cfg,'walking');
     is(scalar(grep {$_->{kind} eq 'garage_open'} @{$s->{intents}}),0,'fresh walking still vetoes garage after remote restoration');
 };

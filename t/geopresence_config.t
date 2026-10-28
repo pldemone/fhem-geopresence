@@ -141,6 +141,11 @@ subtest 'ordinary version 1 checkpoints retain their pre-R01 binding' => sub {
     advance(40); my $s=GP_State($c,'Geo.A',0);
     GP_Process($s,$cfg,{kind=>'geo',zone=>'A.Work',entry=>0,time=>$now,received=>$now,key=>'old-trip'},$now,$mono);
     GP_Checkpoint($c,'Geo.A',$cfg,$s);
+    my $checkpoint=JSON::PP::decode_json(GP_Read('Geo.A','gp_trip_checkpoint',''));
+    $checkpoint->{version}=1;
+    delete @{$checkpoint->{state}}{qw(action_visits action_last)};
+    @{$checkpoint->{state}}{qw(notify_seen notify_order notify_last)}=({},[],{});
+    $defs{'Geo.A'}{READINGS}{gp_trip_checkpoint}{VAL}=JSON::PP::encode_json($checkpoint);
     # Simulate process loss without reserializing a live journey during reload.
     delete $c->{helper}{gp}{prod}{'Geo.A'};
     advance(1); GP_ResetController($c,'resume');
