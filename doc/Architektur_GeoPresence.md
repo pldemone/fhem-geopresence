@@ -1,6 +1,6 @@
 # GeoPresence – Architektur
 
-**Version 0.65 · Stand 27.10.2026 · Handbuch 2.27**
+**Version 0.66 · Stand 29.10.2026 · Handbuch 2.28**
 
 Diese Beschreibung spezifiziert den aktuellen Aufbau von `FHEM/98_GeoPresence.pm`. Einrichtung und Bedienung stehen im [Handbuch](GeoPresence_Handbuch.md); Prüfabläufe und Testprogramm sind in der [Testanleitung](GeoPresence_Testanleitung.md) beschrieben. Gerätenamen wie `Geo.PERSON` und `Geo.PERSON.ORT` sind austauschbare Beispiele.
 
@@ -394,6 +394,8 @@ Nach INITIALIZED oder REREADCFG sowie bei Modulreload wird unter aktiven Modi ei
 
 Ein gültiger Ausflug behält seine Kennung und seinen Ortsverlauf, startet im neuen Kontext als `away` und wartet auf eine neue gültige Home- oder Telefon-Rückkehr. Vorherige monotone Timerwerte werden nicht übernommen; Zeitabstände werden aus den ursprünglichen absoluten Nachweiszeiten auf die neue monotone Uhr abgebildet. Nach einem validierten Checkpoint darf eine neue Geo-Beobachtung unmittelbar nach dem Sitzungsbeginn verarbeitet werden; Ereignisse mit Beobachtungszeit vor oder gleich dem neuen Start bleiben ausgeschlossen. Ohne validierten Checkpoint gilt weiterhin die zusätzliche Geo-Anlaufgrenze durch future_tolerance. Bewegungsabhängige Ankunftsfristen und normale Frischeprüfung bleiben wirksam. Der Start selbst sendet keine Öffnung oder historische Nachricht. `gp_resume_status`, `gp_resume_reason` und der Bereich Restart recovery in explain nennen Übernahme oder Ablehnung.
 
+`GP_NewState` bildet jede neue Kontextkennung einmalig als Hash aus dem bisherigen Kontextbezug, einem Zufallswert, Prozesskennung sowie absoluter und monotoner Startzeit. Die Kennung hat auch bei langen Gerätenamen eine feste Länge. Neue Reise-IDs bestehen weiterhin aus der Kontextkennung und einem lokalen Zähler; zurückgesetzte Start- und Reisezähler allein erzeugen damit nach einem Prozessneustart keine alten IDs mehr. Produktion und Debug sowie wiederholte Debug-Resets erhalten jeweils eigene Kennungen, auch bei gleichen Uhrzeiten. Eine wiederhergestellte Reise behält dagegen ihre gespeicherte ID; erst spätere neue Reisen verwenden die neue Kennung. Die Berechnung erfolgt nur bei der Zustandsanlage, ohne zusätzliche Persistenz oder Änderung des Checkpoint-Formats.
+
 Eine abgeschlossene oder widerrufene Reise schreibt einen nicht qualifizierten Checkpoint. Das gilt auch bei blockierten Ausgaben oder vorübergehend gestörtem Listener. Die Entwertung wird vor produktiven Aktoraufrufen geschrieben, sodass synchrones Speichern oder Reload innerhalb eines Gerätecalls keine bereits verbrauchte Reise wiederbelebt. Modus- und relevante Konfigurationsänderungen entwerten den Stand ausdrücklich; Debug und Lernen erzeugen keine produktiven Checkpoints. Laufende Aktorrückmeldungen können bei Reload weiterhin passiv beobachtet werden, während ein Prozessneustart daraus keine neuen Befehle erzeugt.
 
 FHEM speichert die Checkpoint-Readings zusammen mit den übrigen Zustandsreadings. Ein geordnetes Beenden schreibt die Zustandsdatei; GeoPresence ruft nicht selbst `save` auf. Bei abruptem Absturz ist nur der zuletzt erfolgreich gespeicherte Stand verfügbar, und während eines Ausfalls verpasste Beobachtungen lassen sich nicht rekonstruieren. Eine zusätzliche SQL-Datenbank oder eigene Auftragsdatei wird nicht verwendet.
@@ -448,7 +450,15 @@ F-03 prüft 2.101 aufeinanderfolgende verbrauchte Besuche mit anschließendem Ne
 
 GP-F03-001 prüft gewöhnliche Nachrichten und Schaltaktionen während eines unbestätigten Home-Abgangs, mit `enter`/`exit`, Orts-/Gruppenauswahl und `cooldown 0`. Zweimalige Zurückweisung eines Outer-Abgangs bei gehaltener Telefonanwesenheit muss den Verbrauch derselben Reise erhalten. Neue Austrittsnachweise und neue Besuche dürfen die Aktion nicht wiederholen; ein tatsächlich neuer Ausflug darf sie mit neuen Nachweisen wieder erlauben. Die reale FHEM-Integration prüft diesen Ablauf über HTTP mit einem Dummy-Licht und unveränderten Tür-/Garagen-Dummys.
 
+F-15 prüft neue Kontexte und wiederholte Debug-Resets bei identischer absoluter und monotoner Zeit. Offene Reisen behalten ihre ID und ihren Zähler; neue Reisen und Kontexte erhalten verschiedene IDs. Gespeicherte alte IDs werden aus Checkpoints der Versionen 1 und 2 unverändert übernommen, dürfen nach Abschluss aber nicht an die nächste Reise vergeben werden. Die reale FHEM-Integration prüft neue Sitzungskennungen über zwei Prozessneustarts, die unveränderte ID der fortgesetzten Reise und einen späteren neuen Ausflug mit eigener ID und eigenem Checkpoint.
+
 ## 13. Änderungen seit der letzten Version
+
+Änderungen von Version 0.65 auf 0.66:
+
+- Dritte Etappe von R-08, F-15: Neue Kontextkennungen erhalten einmalig einen zufälligen Sitzungsanteil gegen die erneute Vergabe alter Reise-IDs nach Prozessneustarts.
+- Wiederhergestellte Reisen behalten ihre ID; neue Reisen verwenden die neue Kennung und den lokalen Zähler.
+- Checkpoint-Format und Übernahme gültiger Daten der Versionen 1 und 2 bleiben erhalten.
 
 Änderungen von Version 0.64 auf 0.65:
 

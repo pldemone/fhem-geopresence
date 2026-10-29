@@ -2597,7 +2597,10 @@ def run(source, encoding="bytestream", help_only=False):
                   "legacy recovery did not repeat the consumed visit even with zero cooldown")
             checkpoint_before_retry = command("{ ReadingsVal('Geo.Recovery','gp_trip_checkpoint','') }")
             checkpoint_timestamp = command("{ ReadingsTimestamp('Geo.Recovery','gp_trip_checkpoint','') }")
-            saved_location = json.loads(command("get GP explain Geo.Recovery format=json"))["state"]["location"]
+            saved_state = json.loads(command("get GP explain Geo.Recovery format=json"))["state"]
+            saved_location = saved_state["location"]
+            saved_trip_id = saved_state["trip"]["id"]
+            previous_generation = saved_state["generation"]
             for attempt in range(2):
                 check(command("save").startswith("Wrote configuration"), "save recovery fixture through normal FHEM")
                 if not attempt:
@@ -2618,11 +2621,14 @@ def run(source, encoding="bytestream", help_only=False):
                 else:
                     raise AssertionError("Recovery FHEM failed to restart")
                 restored = json.loads(command("get GP explain Geo.Recovery format=json"))["state"]
+                check(restored["generation"] != previous_generation, "each real process restart gets a fresh session identity")
+                previous_generation = restored["generation"]
                 check(bool(restored.get("trip", {}).get("armed")) == (attempt == 0),
                       "real restart restores a qualified trip once, never a consumed one")
                 check(not restored.get("arrival") and not restored.get("intents"), "real startup creates no pending action")
                 if not attempt:
                     check(restored["resume"]["status"] == "restored", "real recovery reason is visible in explain")
+                    check(restored["trip"]["id"] == saved_trip_id, "real restart preserves the unfinished trip ID")
                     check(restored["location"] == saved_location, "Unicode location survives checkpoint and real state-file restoration")
                     check(command("{ ReadingsVal('Geo.Recovery','gp_trip_checkpoint','') }") == checkpoint_before_retry
                           and command("{ ReadingsTimestamp('Geo.Recovery','gp_trip_checkpoint','') }") == checkpoint_timestamp,
@@ -2645,6 +2651,17 @@ def run(source, encoding="bytestream", help_only=False):
                       "fresh car return opens garage once using saved held end contacts")
                 check(json.loads(command("{ ReadingsVal('Geo.Recovery','gp_trip_checkpoint','{}') }"))["status"] == "none",
                       "real return consumes the persistent trip checkpoint")
+            advance(40)
+            next_departure = datetime.datetime.fromtimestamp(float(command("{ GP_Now() }")), datetime.timezone.utc).isoformat()
+            check(recovery_request("Work", 1, observed=next_departure)[0] == 200, "new departure accepted after the consumed-trip restart")
+            advance(3)
+            next_trip = json.loads(command("get GP explain Geo.Recovery format=json"))["state"]["trip"]
+            check(next_trip["armed"] and next_trip["id"] != saved_trip_id, "new trip after real restart has its own ID")
+            check(json.loads(command("{ ReadingsVal('Geo.Recovery','gp_trip_checkpoint','{}') }"))["trip"]["id"] == next_trip["id"],
+                  "real checkpoint stores the new trip identity")
+            check(command("{ ReadingsVal('recoveryDoor','state','') }") == "untouched"
+                  and command("{ ReadingsVal('recoveryGarage','state','') }") == "untouched",
+                  "new departure does not replay an opening")
             command("delete GP")
             check(command("{ scalar grep { /^GeoPresenceHTTP:/ } keys %selectlist }") == "0", "undef releases all listener select entries")
             log = (root / "log/fhem.log").read_text()

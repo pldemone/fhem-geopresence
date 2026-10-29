@@ -2591,6 +2591,68 @@ sub simulate_process_restart {
     return (GP_Config($c,'Geo.Test'),GP_State($c,'Geo.Test',0));
 }
 
+subtest 'F-15: fresh contexts do not reuse trip IDs when clocks and startup counters repeat' => sub {
+    my ($c)=fixture();
+    my %ids;
+    for (1..3) {
+        my $s=new_state();
+        my $trip=GP_StartTrip($s,ev('Home',0,$now),'local');
+        ok(!$ids{$trip->{id}}++,'fresh context has a new trip ID at identical wall and monotonic times');
+        is(GP_StartTrip($s,ev('Outer',0,$now),'remote'),$trip,'existing trip keeps its identity');
+        is($s->{seq},1,'reusing an open trip does not advance the local counter');
+        delete $s->{trip};
+        my $next=GP_StartTrip($s,ev('Home',0,$now),'local');
+        ok(!$ids{$next->{id}}++,'next trip in the same context also has a new ID');
+        is($s->{seq},2,'new trip advances only the local counter');
+        like($next->{id},qr/\A[A-Za-z0-9_.:\-]{1,256}\z/,'new ID fits the existing checkpoint contract');
+    }
+    my $prod=GP_State($c,'Geo.Test',0);
+    my $prod_id=GP_StartTrip($prod,ev('Home',0,$now),'local')->{id};
+    for (1..2) {
+        is(GeoPresence_Set($c,'GP','debugReset','Geo.Test'),
+            'Debug session reset; no productive changes','debug reset succeeds without advancing either clock');
+        my $debug=GP_State($c,'Geo.Test',1);
+        my $id=GP_StartTrip($debug,ev('Home',0,$now),'local')->{id};
+        ok(!$ids{$id}++ && $id ne $prod_id,'each debug reset gets its own trip identity');
+        is($prod->{trip}{id},$prod_id,'debug reset preserves the productive trip');
+    }
+    my $long=GP_NewState($now,$mono,'1:prod:'.('r'x230).':0');
+    cmp_ok(length(GP_StartTrip($long,ev('Home',0,$now),'local')->{id}),'<=',256,
+        'long device names do not exceed the existing checkpoint ID limit');
+};
+
+subtest 'F-15: a restored legacy ID is retained while subsequent trips use the new session' => sub {
+    for my $version (1,2) {
+        my ($c,$cfg,$s)=saved_trip_fixture('remote');
+        my $cp=JSON::PP::decode_json(GP_Read('Geo.Test','gp_trip_checkpoint',''));
+        my $id=$cp->{trip}{id}='1:prod:Geo.Test:0:1';
+        $cp->{version}=$version;
+        if ($version==1) {
+            delete $cp->{state}{action_visits};
+            $cp->{state}{notify_seen}={'A.Msg|enter|1|group:Work'=>1};
+            $cp->{state}{notify_order}=['A.Msg|enter|1|group:Work'];
+            $cp->{state}{notify_last}=delete $cp->{state}{action_last};
+        }
+        reading('Geo.Test','gp_trip_checkpoint',JSON::PP::encode_json($cp),$now);
+        ($cfg,$s)=simulate_process_restart($c);
+        is($s->{resume}{status},'restored',"version $version checkpoint accepted");
+        is($s->{trip}{id},$id,'restored trip keeps the saved ID');
+        is($s->{trip}{away_time},$cp->{trip}{away_time},'restoration keeps the original departure evidence');
+        ok(!$s->{arrival} && !@{$s->{intents}},'restoration creates no pending action');
+        is(scalar @commands,0,'restart alone dispatches no command');
+        advance(40); arrive($s,$cfg,'walking'); GP_Dispatch($c,'Geo.Test',$cfg,$s,0,$now,$mono);
+        is(scalar(grep {/^door /} @commands),1,'new return completes the restored trip once');
+        ok(!$s->{trip},'completed trip is closed');
+        advance(61); process($s,$cfg,'Work',1); GP_Checkpoint($c,'Geo.Test',$cfg,$s);
+        ok($s->{trip}{armed},'new distance observation authorizes a genuinely new trip');
+        isnt($s->{trip}{id},$id,'new trip cannot reuse the restored legacy ID');
+        is_deeply($s->{trip}{actions},{},'new trip starts with its own unconsumed actions');
+        my $new=JSON::PP::decode_json(GP_Read('Geo.Test','gp_trip_checkpoint',''));
+        is($new->{trip}{id},$s->{trip}{id},'new checkpoint contains the new trip ID');
+        is($new->{version},2,'ID change needs no new checkpoint format');
+    }
+};
+
 sub checkpoint_work {
     my ($call)=@_;
     my ($encodes,$writes)=(0,0);

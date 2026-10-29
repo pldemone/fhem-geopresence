@@ -1,6 +1,6 @@
 # GeoPresence – Testanleitung
 
-**Version 4.23 · Stand 27.10.2026 · Handbuch 2.27 · Architektur 0.65**
+**Version 4.24 · Stand 29.10.2026 · Handbuch 2.28 · Architektur 0.66**
 
 Diese Anleitung beschreibt die Prüfung einer eingerichteten GeoPresence-Anlage. Die Testanwendung simuliert Alltagswege und prüft deren neue Diagnosezeilen; gezielte App-Tests prüfen eigene Orts- und Gruppenregeln. Einrichtung, Begriffe und Parameter stehen im [Handbuch](GeoPresence_Handbuch.md).
 
@@ -321,10 +321,11 @@ Die Wiederherstellung betrifft ausschließlich produktive, bestätigte Ausflüge
 |---|---|---|---|
 | 1 | Tatsächlich Home verlassen und den normalen Abwesenheitsnachweis entstehen lassen | `get System.GeoPresence explain Geo.PERSON` | Departure ist Confirmed; ein aktiver lokaler oder ferner Trip ist vorhanden. Reines absent ohne Bestätigung genügt nicht. |
 | 2 | FHEM bei einem beabsichtigten Neustarttest regulär neu starten | Vorher `list Geo.PERSON gp_trip_checkpoint` sichern | Der gespeicherte JSON-Stand hat status qualified. Ein geordnetes Beenden schreibt FHEMs Zustandsdatei. |
-| 3 | Nach dem Start ungefähr zwei Sekunden für den ersten Timerlauf abwarten | `get System.GeoPresence explain Geo.PERSON` | Aktive Modi, bestätigte Abwesenheit und Restart recovery: Restored; keine Öffnung allein durch den Start. |
+| 3 | Nach dem Start ungefähr zwei Sekunden für den ersten Timerlauf abwarten | `get System.GeoPresence explain Geo.PERSON` | Aktive Modi, bestätigte Abwesenheit und Restart recovery: Restored; die Reise-ID bleibt erhalten. Keine Öffnung allein durch den Start. |
 | 4 | Tatsächlich nach Hause zurückkehren; Geofency meldet einen neuen Home-Eintritt | Normales Log und explain beobachten | Die normale bewegungsabhängige Ankunftsfrist startet. Bei walking öffnet nur die Tür; bei berechtigter Fahrzeugankunft kann zusätzlich die Garage öffnen. Eine neue Telefon-Rückkehr kann den Home-Webhook im kombinierten Profil ersetzen. |
 | 5 | Nach bestätigter Heimkehr den Checkpoint lesen | `list Geo.PERSON gp_trip_checkpoint` | status none: Der abgeschlossene Ausflug kann nicht erneut verwendet werden. |
 | 6 | Bei einer späteren regulären Neustartprüfung zu Hause bleiben | `get System.GeoPresence explain Geo.PERSON` | Kein aktiver bestätigter Ausflug, kein nachgeholter Öffnungsimpuls. |
+| 7 | Beim nächsten tatsächlichen Ausflug die Reise-ID vergleichen | `get System.GeoPresence explain Geo.PERSON` | Die neue Reise hat eine andere ID als der zuvor fortgesetzte und abgeschlossene Ausflug. |
 
 Im Diagnosefile heißt die erfolgreiche Übernahme `qualified unfinished trip restored; waiting for a new return`, Quelle restart. `gp_resume_status=rejected` beziehungsweise Restart recovery: Rejected nennt einen konkreten Grund, etwa abweichende Konfiguration, spätere Heimkehr oder einen abgelaufenen Abwesenheitsnachweis. Der Standard für die Wiederaufnahme beträgt 48 Stunden ab ursprünglicher Abwesenheitsbestätigung; die Ankunftsfristen selbst werden dadurch nicht verändert.
 
@@ -333,5 +334,7 @@ Ohne neue Fachdaten bleiben Inhalt, `saved_at` und Reading-Zeitstempel von `gp_t
 Ein gültiger alter Checkpoint der Version 1 wird beim Update einmal in Version 2 übertragen. Dabei bleiben der ursprüngliche Ausflug, aktuelle Verbrauchsstände und benötigte Cooldowns erhalten; nach diesem einmaligen Formatwechsel gilt wieder die unveränderte Speicherung aus dem vorigen Absatz. Auch mit `cooldown 0` darf dieselbe bereits verbrauchte Ortsaktion nach der Übernahme oder einem weiteren Neustart nicht erneut ausgeführt werden. Erst ein neuer gültiger Besuch beziehungsweise Ausflug kann sie nach ihrem Regelvertrag erneut erlauben.
 
 Die Regression GP-F03-001 prüft zusätzlich den Verbrauch während eines unbestätigten Home-Abgangs. Wird eine Fernmeldung bei gehaltener Telefonanwesenheit zurückgewiesen, muss derselbe beibehaltene Ausflug bereits verbrauchte `afterExit`-Aktionen auch nach neuen Austrittsnachweisen unterdrücken. Erst eine tatsächliche Heimkehr und ein neuer Ausflug mit neuen Nachweisen erlauben die Aktion wieder. Die automatisierten Prüfungen verwenden hierfür Nachrichten beziehungsweise Dummy-Aktoren.
+
+F-15 prüft zusätzlich wiederholte Kontext- und Debug-Resets bei unveränderten Uhrzeiten sowie die unveränderte Übernahme alter Reise-IDs aus beiden unterstützten Checkpoint-Versionen. Erst die nächste neue Reise erhält eine ID aus der neuen Sitzung. Die reale FHEM-Integration vergleicht Sitzungskennungen über zwei Prozessneustarts und prüft anschließend eine neue Reise samt Checkpoint, ohne einen alten Öffnungsbefehl zu wiederholen.
 
 Die Softwaretests prüfen diese Verträge zusätzlich in einem echten temporären FHEM-Prozess mit Dummy-Aktoren: normal speichern, Prozess beenden, neu starten, eine neue Rückkehr melden und beide Öffnungsbefehle prüfen. Die alten Kontaktzeitstempel bleiben dabei bestehen. Ein weiterer Neustart mit anschließender Home-Meldung darf keinen verbrauchten Auftrag wiederholen. Modultests decken zusätzlich Spaziergänge, Telefon-Fallback, sofortige neue Rückkehr, bewahrte explizite Austritte, ungültige oder widersprüchliche Checkpoints, Moduswechsel und neue Abschlussrückmeldungen ab.
