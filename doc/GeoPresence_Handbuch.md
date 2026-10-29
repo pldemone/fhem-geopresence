@@ -1,6 +1,6 @@
 # GeoPresence – Handbuch
 
-**Version 2.28 · Stand 29.10.2026 · Architektur 0.66**
+**Version 2.35 · Stand 29.10.2026 · Architektur 0.73**
 
 GeoPresence ist eine Anwesenheits- und Ortssteuerung für FHEM. Es wertet aus, wer zu Hause ist, wer das Haus verlassen hat und wer zurückkehrt, und verbindet diese Informationen mit konfigurierbaren Automationen. So lässt sich beispielsweise beim Betreten eines Gartenbereichs ein Licht einschalten, beim Erreichen eines Arbeitsortes eine Nachricht senden oder bei einer berechtigten Heimkehr die vorhandene Tür- und Garagensteuerung ansprechen. Ziel ist, solche Aktionen passend zur Situation auszuführen und Fehlreaktionen auf einzelne unzuverlässige Meldungen zu vermeiden.
 
@@ -228,6 +228,18 @@ attr Geo.PERSON sourceMode geofency_only
 ```
 
 Ein einzelner positiver Haussensor genügt für Anwesenheit. Alle eingetragenen Sensoren müssen für die Abwesenheitsqualifikation negativ sein; ein Raumwechsel oder mehrere gleichzeitig positive Sensoren ergeben keine neue Heimkehr. `state` ist für Sensoren bestimmt, die unveränderte Werte nicht regelmäßig erneut melden; Fehler müssen die Sensorgeräte selbst erkennbar melden.
+
+Im Zustandsmodus dürfen die Sensoren bereits vor dem Home-Austritt negativ geworden sein, etwa weil der Funkbereich kleiner als der Home-Kreis ist. Nach dem Austritt beginnt trotzdem eine neue vollständige Abwesenheitsfrist; frühere Wartezeit zählt nicht mit. Neue identische Sensormeldungen sind dafür nicht nötig. Im Messmodus müssen dagegen neue Messungen nach dem Austritt eintreffen und regelmäßig erneuert werden. Alte Startwerte allein und erkannte Sensorfehler bestätigen keinen Ausflug.
+
+Verspätet ausgewertete, weiterhin gültige Telefonanwesenheit kann eine alte Reiseberechtigung widerrufen und wartende Öffnungen abbrechen. Sie löst selbst keine Öffnung aus, wenn die Rückkehrmeldung dafür schon zu alt ist. Auch ein Home-Eintritt vor Ende der Abwesenheitsfrist wird nicht nachträglich berechtigt, nur weil GeoPresence beide Vorgänge später gemeinsam verarbeitet.
+
+Melden mehrere Sensoren gleichzeitig Anwesenheit mit unterschiedlichen Beobachtungszeiten, zählt während einer laufenden Reise für die Rückkehr die früheste neu angenommene Meldung nach dem maßgeblichen Abgang. Eine jüngere Meldung aus einem anderen Raum macht eine verspätete Rückkehr nicht wieder frisch und verlängert ihre Mindestabwesenheit oder ihr Ausgabebudget nicht. Ältere Beobachtungen vor einem tatsächlich späteren neuen Ausflug gehören nicht zu dessen Rückkehr.
+
+Ohne laufende Reise kann die jüngste gültige positive Meldung den reinen Anwesenheitsstatus bestätigen. Das gilt auch nach einer früher abgeschlossenen Reise und einer neueren nahen Ortsmeldung. Eine gleichzeitig ältere Sensormeldung verhindert deshalb nicht, dass GeoPresence und ROOMMATE wieder `home` melden. Dafür sind keine erneuten identischen Sensormeldungen nötig; eine neue Öffnungsberechtigung entsteht nicht. Der reine Statusbetrieb bei `phone_only` verwendet denselben Ablauf.
+
+Eine nachgelieferte positive Meldung kann auch einen schon gesammelten Abwesenheitsabschluss widerlegen; ein älterer Home-Abgang darf dabei als unbestätigter Verdacht erhalten bleiben. Eine normale nahe Zwischenposition unterbricht die weiterhin gültige Abwesenheitsfrist nicht. Im Messmodus zählt die letzte noch erforderliche Erneuerung zur Bestätigung: Ob eine gleich alte Rückkehr im selben oder in einem späteren Bündel eintrifft, ändert ihre Berechtigung nicht.
+
+Ist die erforderliche Erneuerung eines Sensors bereits nachgewiesen, verschieben weitere identische Negativmessungen das Fristende nicht. Eine gültige Rückkehr nach dem Fristende bleibt deshalb auch dann berechtigt, wenn vor der nächsten GeoPresence-Abfrage noch eine weitere Messung eintrifft.
 
 Erzeuge jetzt ein neues zufälliges Webhook-Kennwort mit 24–128 zulässigen Zeichen, beispielsweise aus Buchstaben, Ziffern, `_` und `-`. Verwende für jede Person einen eigenen Account und ein eigenes Kennwort.
 
@@ -732,6 +744,10 @@ GeoPresence behält dafür aktuelle Verbrauchsstände und Cooldowns statt einer 
 Nach Neustart, rereadcfg oder Modulreload prüft GeoPresence den gespeicherten Stand. Identität, Kennwortbindung, Quellenprofil, relevante Konfiguration und Geometrie müssen passen; eine spätere lokale Anwesenheit oder ein späteres ROOMMATE `home` widerspricht dem Ausflug. Die ursprüngliche Abwesenheitsbestätigung darf standardmäßig höchstens 48 Stunden alt sein. `trip_resume_max_age` am Controller legt diese Grenze in Sekunden fest; Speichern oder wiederholtes Neustarten erneuert den Nachweis nicht.
 
 Ein fortgesetzter Ausflug behält seine Reise-ID. Neue Ausflüge verwenden die neue Sitzungskennung mit einem zufälligen Anteil und einem laufenden Zähler. So führt ein nach dem Neustart zurückgesetzter Zähler nicht zur erneuten Vergabe der alten Reise-ID. Das gilt auch für neue Simulationen; vorhandene gültige Checkpoints bleiben lesbar.
+
+Wird eine gesunde gehaltene Anwesenheitsmeldung erst nach der Übernahme des Ausflugs nachgeliefert, kann sie dessen ältere Berechtigung noch widerrufen, auch wenn ihre Beobachtung vor dem Neustart lag. Sie holt keine historische Öffnung nach und setzt keine jüngere bekannte Position zurück.
+
+Eine gleichzeitig neuere Anwesenheitsmeldung eines anderen Sensors verdeckt diesen Gegenbeweis nicht. Die ältere widerlegte Reise kann deshalb auch bei einer aktuellen Telefon-Rückkehr keine Öffnung mehr freigeben. Ein tatsächlich späterer neuer Ausflug behält seine normale Berechtigung.
 
 Reine Oberflächenattribute wie `room` an einer Aktion gehören nicht zur Bindung neuer Checkpoints. Ein Wechsel der Raumzuordnung verhindert deren Wiederherstellung daher nicht. Beim erstmaligen Wechsel auf Architektur 0.54 können ältere Checkpoints mit solchen zusätzlichen Aktorattributen verworfen werden, weil ihr bisheriger Fingerabdruck abweicht. Dann ist ein neuer Abwesenheitsnachweis erforderlich; es wird keine Öffnung nachgeholt.
 

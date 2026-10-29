@@ -59,6 +59,7 @@ my $GP_JSON = JSON::PP->new->canonical->utf8;
 my $GP_CHECKPOINT_JSON = JSON::PP->new->canonical->ascii;
 my @GP_CHECKPOINT_TRIP_FIELDS = qw(id start home_exit scope armed away_time away_reason actions exits);
 my @GP_CHECKPOINT_STATE_FIELDS = qw(location position_time boundary zones members zone_visits group_visits motion motion_time automotive);
+my $GP_PHONE_DEPARTURE_REASON = 'Home exit and qualified phone absence';
 my %GP_AUTH;
 
 sub GP_UsesSource {
@@ -1073,10 +1074,9 @@ sub GP_GeometrySync {
         # same fresh exit can start a NEW suspicion, never confirm departure.
         # Only the changed-geometry batch supplies mono; incomplete geometry
         # and ordinary status-only synchronization cannot create a trip here.
-        my $t=GP_StartTrip($s,$e,'local'); $t->{home_exit}=$e->{time}; $t->{leave_mono}=$mono;
-        GP_ResetNegative($s,$e->{time});
+        GP_LeaveHome($s,$cfg,$e,$mono);
         $s->{zones}{$e->{zone}}={entry=>0,time=>$e->{time},role=>'home'};
-        $s->{phase}='leaving'; $s->{location}='underway';
+        $s->{location}='underway';
         $s->{last_observed}=$e->{time}; $s->{last_received}=$e->{received}; $s->{last_key}=$e->{key};
         return GP_Trace($s,$now,'Home departure pending after geometry update; new departure confirmation required',
             {home_exit=>$e->{time},departure_armed=>0});
@@ -1438,7 +1438,7 @@ sub GP_NewPhone {
 sub GP_ResetNegative {
     my ($s,$after)=@_;
     my $p=$s->{phone};
-    delete @{$p}{qw(negative_since negative_wall negative_first qualified negative_emitted)};
+    delete @{$p}{qw(negative_since negative_wall negative_first negative_renewed_at negative_renewed_mono qualified)};
     $p->{negative_generation}=($p->{negative_generation}//0)+1 if defined $after;
     $p->{negative_after}=$after if defined($after) && $after>($p->{negative_after}//0);
 }
@@ -1493,6 +1493,26 @@ sub GP_StartTrip {
     return $s->{trip};
 }
 
+sub GP_LeaveHome {
+    my ($s,$cfg,$e,$mono)=@_;
+    my $trip=GP_StartTrip($s,$e,'local');
+    $trip->{home_exit}=$e->{time}; $trip->{leave_mono}=$mono;
+    GP_ResetNegative($s,$e->{time});
+    # A new full interval may use held negatives observed in this session.
+    # Measurement sources still need actual new observations after the exit.
+    $s->{phone}{negative_after}=$s->{start} if ($cfg->{phoneSignalMode}//'state') eq 'state';
+    $s->{phase}='leaving';
+}
+
+sub GP_DepartureTime {
+    my ($trip)=@_;
+    return unless $trip;
+    my $time=$trip->{away_time}//$trip->{start};
+    return $trip->{home_exit} if defined($trip->{home_exit})
+        && (!defined($time) || $trip->{home_exit}>$time);
+    return $time;
+}
+
 sub GP_Fresh {
     my ($cfg,$e,$now)=@_;
     return $now-$e->{time}<=$cfg->{action_max_age} && $e->{time}<=$now+$cfg->{future_tolerance}
@@ -1508,6 +1528,20 @@ sub GP_AfterStart {
     my $margin=$e->{kind} eq 'geo' && !$recovered
         ? $cfg->{future_tolerance}:0;
     return $e->{time}>$s->{start}+$margin;
+}
+
+sub GP_AwayLongEnough {
+    my ($cfg,$trip,$e,$mono)=@_;
+    my $phone=($trip->{away_reason}//'') eq $GP_PHONE_DEPARTURE_REASON;
+    my $proof=$trip->{phone_qualification};
+    my $minimum=$cfg->{minimum_away};
+    $minimum=$cfg->{phone_absence_window} if $phone && $cfg->{phone_absence_window}>$minimum;
+    # A delayed or future-dated return cannot acquire an absence confirmation
+    # which had not completed when it was observed and received.
+    return $e->{time}-$trip->{away_time}>=$minimum
+        && ($e->{received_mono}//$mono)-$trip->{away_mono}>=$minimum
+        && (!$proof || ($e->{time}>=$proof->{qualified_at}
+            && ($e->{received_mono}//$mono)>=$proof->{qualified_mono}));
 }
 
 sub GP_RememberEvent {
@@ -1575,15 +1609,21 @@ sub GP_MergeBatchMotion {
     }
 }
 
+sub GP_PhoneVeto {
+    my ($s,$cfg,$time)=@_;
+    my $p=$s->{phone};
+    return GP_UsesSource($cfg->{sourceMode},'phone') && $p->{state} eq 'present'
+        && (($p->{latest}//0)>=$time || $p->{health} eq 'handover'
+            || (($cfg->{phoneSignalMode}//'state') eq 'state' && $p->{health} eq 'held'));
+}
+
 sub GP_Arm {
     my ($s,$cfg,$e,$now,$mono,$scope,$previous_position)=@_;
     # Measurement timestamps order evidence. A latched positive state remains
     # current until a transition or fault; an old timestamp does not imply absence.
     # A short handover preserves this continuity in either source mode, including
     # its veto of contradictory Geo departures before another room sees the phone.
-    if (GP_UsesSource($cfg->{sourceMode},'phone') && $s->{phone}{state} eq 'present' && (($s->{phone}{latest}//0)>=$e->{time}
-        || $s->{phone}{health} eq 'handover'
-        || (($cfg->{phoneSignalMode}//'state') eq 'state' && $s->{phone}{health} eq 'held'))) {
+    if (GP_PhoneVeto($s,$cfg,$e->{time})) {
         # Held presence vetoes this outer observation, but does not disprove an
         # earlier Home exit observed AFTER the last actual positive phone sample.
         # Retain only that unarmed local suspicion, never remote/work permissions.
@@ -1746,8 +1786,7 @@ sub GP_Rules {
             unless (GP_UsesSource($cfg->{sourceMode},'geo')) { $skip->('source profile does not authorize arrival actions'); next; }
             unless ($cfg->{geometry_ready}) { $skip->('geometry not ready'); next; }
             unless ($s->{trip} && $s->{trip}{armed} && !$s->{conflict}) { $skip->('departure not confirmed'); next; }
-            if ($e->{time}-$s->{trip}{away_time}<$cfg->{minimum_away}
-                || $mono-$s->{trip}{away_mono}<$cfg->{minimum_away}) { $skip->('return before minimum away time'); next; }
+            unless (GP_AwayLongEnough($cfg,$s->{trip},$e,$mono)) { $skip->('return before minimum away time'); next; }
         }
         if ($opening) {
             unless ($trigger eq 'arrival') { $skip->('opening requires confirmed arrival'); next; }
@@ -1827,8 +1866,7 @@ sub GP_BeginArrival {
     # opening permission merely by waiting out minimum_away at Home. An older
     # approach supplement cannot replace the Home event that qualified the wait.
     unless ($s->{trip} && $s->{trip}{armed} && !$s->{conflict}
-        && $home->{time}-$s->{trip}{away_time}>=$cfg->{minimum_away}
-        && $mono-$s->{trip}{away_mono}>=$cfg->{minimum_away}) {
+        && GP_AwayLongEnough($cfg,$s->{trip},$home,$mono)) {
         return GP_Arrive($s,$cfg,$e,$now,$mono);
     }
     if (!$p) {
@@ -1911,6 +1949,11 @@ sub GP_Arrive {
     GP_Rules($s,$cfg,'arrival',$e,$now,$mono);
     $s->{last_trip}=$s->{trip} if $s->{trip};
     delete $s->{trip};
+    GP_Home($s,$cfg,$e->{time});
+}
+
+sub GP_Home {
+    my ($s,$cfg,$time)=@_;
     my ($home)=map {$cfg->{zones}{$_}} @{$cfg->{roles}{home}//[]};
     # Return makes distant memberships obsolete, but is not their exit event.
     # Keep overlapping/home memberships so another Home webhook is no new visit.
@@ -1923,7 +1966,7 @@ sub GP_Arrive {
     }
     $s->{phase}='home';
     $s->{location}='home';
-    my $boundary=($s->{position_time}//0)>$e->{time} ? $s->{position_time}:$e->{time};
+    my $boundary=($s->{position_time}//0)>$time ? $s->{position_time}:$time;
     $s->{boundary}=$boundary if $boundary>$s->{boundary};
     delete @{$s}{qw(approach automotive conflict)};
     $s->{desired_status}='home';
@@ -1973,6 +2016,93 @@ sub GP_BatchConflict {
     return 0;
 }
 
+sub GP_ProcessPhone {
+    my ($s,$cfg,$e,$now,$mono)=@_;
+    # Historical presence cannot authorize a current arrival. It may still
+    # disprove an older restored departure or a specific phone qualification.
+    return GP_Trace($s,$now,'phone observation belongs to previous session')
+        unless ($e->{generation}//'') eq $s->{generation};
+    if ($e->{kind} eq 'phone_absent') {
+        my $p=$s->{phone};
+        return GP_Trace($s,$now,'phone absence qualification revoked') unless ($e->{negative_generation}//-1)==($p->{negative_generation}//0);
+        return GP_Trace($s,$now,'phone absence contradicted by presence') if $e->{revoked};
+        # Continuity may begin after Home exit while its held source values are
+        # older. Keep both times; polling must not rewrite an observation date.
+        my $since=$e->{negative_wall};
+        my $time=$e->{qualified_at};
+        return GP_Trace($s,$now,'phone absence older than current boundary')
+            if defined($p->{negative_after}) && $e->{time}<=$p->{negative_after};
+        # Keep the source observation time. After 180 s of qualification its age
+        # may exceed action_max_age; this event never invokes action rules.
+        if ($cfg->{geometry_ready} && $s->{trip} && !$s->{trip}{armed} && defined($s->{trip}{home_exit})
+            && $since>=$s->{trip}{home_exit}) {
+            my $t=$s->{trip};
+            $t->{armed}=1; $t->{away_time}=$e->{negative_wall}; $t->{away_mono}=$e->{negative_since};
+            $t->{away_reason}=$GP_PHONE_DEPARTURE_REASON;
+            $t->{phone_qualification}=$e;
+        }
+        my $changed=$s->{phase} ne 'away' ? 1:0;
+        GP_CancelArrival($s,$now,'new phone absence');
+        # Further samples after completion do not supersede a return between
+        # that completion and this poll. The source date itself stays intact.
+        my $position=$e->{time}<$time ? $e->{time}:$time;
+        if (!defined($s->{position_time}) || $position>$s->{position_time}) {
+            $s->{checkpoint_dirty}=1; $s->{position_time}=$position;
+        }
+        $s->{phase}='away'; $s->{desired_status}='absent';
+        return GP_Trace($s,$now,'phone absence qualified',{changed=>$changed,departure_armed=>$s->{trip} && $s->{trip}{armed} ? 1:0});
+    }
+    return unless $e->{kind} eq 'phone_present' || $e->{kind} eq 'phone_snapshot';
+    my $snapshot=$e->{kind} eq 'phone_snapshot';
+    my $fresh=!$snapshot && GP_Fresh($cfg,$e,$now);
+    my $current=!$snapshot && GP_AfterStart($s,$cfg,$e);
+    my $trip=$s->{trip}//$s->{last_trip};
+    my $departure=GP_DepartureTime($trip);
+    my $position=$s->{position_time}//0;
+    my $limit=defined($departure) && $departure>$position ? $departure:$position;
+    my $veto=!$snapshot && $trip && $trip->{armed} && ($s->{phone}{latest}//0)==$e->{time} && GP_PhoneVeto($s,$cfg,$limit);
+    my $proof=$trip ? $trip->{phone_qualification}:undef;
+    my $positive=$e->{positive_time}//$e->{time};
+    my $contradicts=$proof && $positive<$proof->{qualified_at};
+    my $restored=$snapshot && $trip && defined($s->{resume_event_floor}) && $s->{resume_event_floor}==$s->{start}
+        && ($trip->{away_time}//$s->{start})<$s->{start} && defined($departure) && $e->{time}>=$departure;
+    # Valid presence can disprove departure after its action budget expired.
+    # A fresh actual return retains the normal arrival path and its permissions.
+    my $revoke=$trip && defined($departure) && $e->{time}<=$now
+        && ($restored || $contradicts || ($current && ($e->{time}<$departure
+            ? $veto
+            : (!$trip->{armed} || !$fresh || !GP_AwayLongEnough($cfg,$trip,$e,$mono)
+                || (!$e->{arrival} && ($e->{time}>=$position || $veto))))));
+    if ($revoke) {
+        delete @{$s}{qw(trip last_trip automotive motion motion_time)};
+        GP_CancelArrival($s,$now,'local phone presence revoked departure');
+        GP_RevokeOutputs($s);
+        if ($e->{time}>=$position) {
+            $s->{position_time}=$e->{time}; GP_Home($s,$cfg,$e->{time});
+        } else {
+            GP_ResetNegative($s,$e->{time});
+            $s->{phase}='away' if $s->{phase} eq 'returning' || $s->{phase} eq 'leaving';
+        }
+        GP_Trace($s,$now,!$trip->{armed} ? 'pending Home departure revoked by newer phone presence'
+            : !$e->{arrival} ? 'continuous local presence; departure revoked':'local phone presence; departure revoked');
+        return;
+    }
+    if ($snapshot) {
+        return GP_Trace($s,$now,'startup phone snapshot superseded') if defined($s->{position_time}) || $s->{trip};
+        $s->{phase}='home'; $s->{location}='home'; $s->{desired_status}='home';
+        $s->{position_time}=$s->{start};
+        GP_ResetNegative($s,$s->{start});
+        return GP_Trace($s,$now,'held phone snapshot; status only');
+    }
+    return GP_Trace($s,$now,'event too old or future') unless $fresh && $e->{time}<=$now;
+    return GP_Trace($s,$now,'event precedes session boundary') unless $current;
+    return GP_Trace($s,$now,'duplicate event') if $e->{key} && $s->{seen}{$e->{key}};
+    GP_RememberEvent($s,$e);
+    return GP_Trace($s,$now,'observation older than current position') if $e->{time}<$position;
+    $s->{position_time}=$e->{time};
+    return GP_Arrive($s,$cfg,$e,$now,$mono);
+}
+
 sub GP_Process {
     my ($s,$cfg,$e,$now,$mono)=@_;
     # Keep the cause on every decision made for this observation. Dynamic scope
@@ -1988,51 +2118,9 @@ sub GP_Process {
     GP_CheckClock($s,$cfg,$now,$mono);
     GP_Trace($s,$now,'observation received',{diagnostic_only=>1,source=>$e->{kind},zone=>$e->{zone},entry=>$e->{entry},
         motion=>$e->{motion},zone_position=>$e->{zone_position},current_position=>$e->{current_position}});
-    # Held startup snapshots synchronize status only. They cannot supersede any
-    # current-session observation or participate in an opening decision.
-    if ($e->{kind} eq 'phone_snapshot' || $e->{kind} eq 'phone_absent') {
-        return GP_Trace($s,$now,'phone observation belongs to previous session')
-            unless ($e->{generation}//'') eq $s->{generation};
-    }
-    if ($e->{kind} eq 'phone_snapshot') {
-        return GP_Trace($s,$now,'startup phone snapshot superseded') if defined($s->{position_time}) || $s->{trip};
-        $s->{phase}='home'; $s->{location}='home'; $s->{desired_status}='home';
-        $s->{position_time}=$s->{start};
-        GP_ResetNegative($s,$s->{start});
-        return GP_Trace($s,$now,'held phone snapshot; status only');
-    }
-    if ($e->{kind} eq 'phone_absent') {
-        my $p=$s->{phone};
-        return GP_Trace($s,$now,'phone absence qualification revoked') unless ($e->{negative_generation}//-1)==($p->{negative_generation}//0);
-        return GP_Trace($s,$now,'phone absence older than current position') if $e->{time}<($s->{position_time}//0)
-            || (defined($p->{negative_after}) && $e->{time}<=$p->{negative_after});
-        # Keep the source observation time. After 180 s of qualification its age
-        # may exceed action_max_age; this event never invokes action rules.
-        if ($cfg->{geometry_ready} && $s->{trip} && !$s->{trip}{armed} && defined($s->{trip}{home_exit})
-            && $e->{time}>$s->{trip}{home_exit} && $e->{negative_wall}>=$s->{trip}{home_exit}) {
-            my $t=$s->{trip};
-            $t->{armed}=1; $t->{away_time}=$e->{negative_wall}; $t->{away_mono}=$e->{negative_since};
-            $t->{away_reason}='Home exit and qualified phone absence';
-        }
-        my $changed=$s->{phase} ne 'away' ? 1:0;
-        GP_CancelArrival($s,$now,'new phone absence');
-        $s->{checkpoint_dirty}=1 if !defined($s->{position_time}) || $s->{position_time}!=$e->{time};
-        $s->{position_time}=$e->{time};
-        $s->{phase}='away'; $s->{desired_status}='absent';
-        return GP_Trace($s,$now,'phone absence qualified',{changed=>$changed,departure_armed=>$s->{trip} && $s->{trip}{armed} ? 1:0});
-    }
-    # A positive source observation at/after an unarmed Home exit disproves
-    # that suspicion. Even a late sample can revoke it without becoming a
-    # fresh arrival or rewinding a newer position. Never use a future sample.
-    if ($e->{kind} eq 'phone_present' && $e->{time}<=$now && $s->{trip} && !$s->{trip}{armed}
-        && defined($s->{trip}{home_exit}) && $e->{time}>=$s->{trip}{home_exit}) {
-        delete $s->{trip};
-        GP_Trace($s,$now,'pending Home departure revoked by newer phone presence');
-    }
+    return GP_ProcessPhone($s,$cfg,$e,$now,$mono) if $e->{kind} =~ /^phone_/;
     return GP_Trace($s,$now,'event too old or future') unless GP_Fresh($cfg,$e,$now);
-    if (!GP_AfterStart($s,$cfg,$e)) {
-        return GP_Trace($s,$now,'event precedes session boundary');
-    }
+    return GP_Trace($s,$now,'event precedes session boundary') unless GP_AfterStart($s,$cfg,$e);
     if ($e->{key}) {
         if ($s->{seen}{$e->{key}}) {
             return if GP_EnrichDuplicate($s,$cfg,$e,$now,$mono);
@@ -2066,15 +2154,6 @@ sub GP_Process {
             }
         }
         return GP_Trace($s,$now,'observation older than current position');
-    }
-    if ($e->{kind} eq 'phone_present') {
-        my $p=$s->{phone};
-        if ($s->{trip} && $s->{trip}{armed} && !$e->{arrival}) {
-            delete $s->{trip}; GP_CancelArrival($s,$now,'continuous local presence');
-            GP_Trace($s,$now,'continuous local presence; departure revoked');
-        }
-        $s->{position_time}=$e->{time};
-        return GP_Arrive($s,$cfg,$e,$now,$mono);
     }
     return unless $e->{kind} eq 'geo';
     my $zone=$cfg->{zones}{$e->{zone}} or return;
@@ -2117,9 +2196,7 @@ sub GP_Process {
     GP_CancelArrival($s,$now,'Home or surrounding area exited')
         if !$e->{entry} && $role =~ /\A(?:home|approach|outer)\z/;
     if (!$e->{entry} && $role eq 'home') {
-        my $t=GP_StartTrip($s,$e,'local'); $t->{home_exit}=$e->{time}; $t->{leave_mono}=$mono;
-        GP_ResetNegative($s,$e->{time});
-        $s->{phase}='leaving';
+        GP_LeaveHome($s,$cfg,$e,$mono);
     }
     my $area_exit=!$e->{entry} && ($role eq 'approach' || $role eq 'outer');
     # Without independent indoor sensors, a near-identical surrounding circle
@@ -2182,16 +2259,14 @@ sub GP_PhoneSamples {
     return \%samples;
 }
 
-# State sources latch present/absent until a change or fault. Measurement sources
-# additionally require periodic measurements and a TTL. Neither contract refreshes
-# the source timestamp just because GeoPresence polls the reading.
-sub GP_Phone {
-    my ($s,$cfg,$samples,$now,$mono)=@_;
-    return unless GP_UsesSource($cfg->{sourceMode},'phone');
+sub GP_PhoneEvidence {
+    my ($s,$cfg,$samples,$now)=@_;
     my $p=$s->{phone};
     my $state_mode=($cfg->{phoneSignalMode}//'state') eq 'state';
-    my (%valid,@positive);
-    my $new_positive=0;
+    my ($latest,$observed,$arrival_time);
+    my $departure=GP_DepartureTime($s->{trip});
+    my $new_positive;
+    my $negative=0;
     for my $name (@{$cfg->{proxies}}) {
         my $v=$samples->{$name}//{};
         my $t=$v->{time};
@@ -2205,15 +2280,42 @@ sub GP_Phone {
         next if defined($p->{invalidated}{$name}) && $t<=$p->{invalidated}{$name};
         next if $t<($p->{samples}{$name}//0);
         delete $p->{invalidated}{$name};
-        $valid{$name}=$v;
         if ($v->{value} eq 'present') {
-            push @positive,$t;
-            $new_positive=1 if $t>($p->{samples}{$name}//0);
+            $latest=$t if !defined($latest) || $t>$latest;
+            if ($t>($p->{samples}{$name}//0)) {
+                $new_positive=$t if !defined($new_positive) || $t<$new_positive;
+                $arrival_time=$t if defined($departure) && $t>=$departure
+                    && (!defined($arrival_time) || $t<$arrival_time);
+            }
+        } else {
+            $negative++;
+            $observed=$t if !defined($observed) || ($state_mode ? $t>$observed:$t<$observed);
         }
         $p->{samples}{$name}=$t;
     }
-    if (@positive) {
-        my $latest=(sort {$b<=>$a} @positive)[0];
+    # A positive wins; absence requires every configured source. Return only
+    # the times needed by continuity, without copying or sorting sample lists.
+    return ($latest,$new_positive,$negative==@{$cfg->{proxies}} ? $observed:undef,$arrival_time);
+}
+
+# State sources latch present/absent until a change or fault. Measurement sources
+# additionally require periodic measurements and a TTL. Neither contract refreshes
+# the source timestamp just because GeoPresence polls the reading.
+sub GP_Phone {
+    my ($s,$cfg,$samples,$now,$mono)=@_;
+    return unless GP_UsesSource($cfg->{sourceMode},'phone');
+    my $p=$s->{phone};
+    my $state_mode=($cfg->{phoneSignalMode}//'state') eq 'state';
+    my ($latest,$new_positive,$observed,$arrival_time)=GP_PhoneEvidence($s,$cfg,$samples,$now);
+    if (defined($latest)) {
+        if (defined($new_positive)) {
+            # Invalidate the records themselves, not a global generation: an
+            # actual return AFTER a completed interval keeps that interval valid.
+            for my $event (@{$s->{queued_phones}//[]}) {
+                next unless ref($event) eq 'HASH' && $event->{kind} eq 'phone_absent' && !$event->{revoked};
+                $event->{revoked}=1 if $new_positive<$event->{qualified_at};
+            }
+        }
         # The person may move between rooms, with several or temporarily no
         # sensors detecting them. Only a qualified absence or a long observation
         # gap ends continuity; a short handover is never a new arrival.
@@ -2223,33 +2325,55 @@ sub GP_Phone {
         $p->{state}='present'; $p->{health}=$state_mode?'held':'fresh'; $p->{latest}=$latest; $p->{ever_present}=1;
         GP_ResetNegative($s,undef);
         delete $p->{missing_since};
-        return unless $new_positive;
-        return {kind=>'phone_snapshot',time=>$latest,received=>$now,received_mono=>$mono,generation=>$s->{generation}} if $state_mode && $latest<=$s->{start};
-        return {kind=>'phone_present',time=>$latest,received=>$now,received_mono=>$mono,arrival=>$arrival,
-            key=>'phone:'.$latest.':'.$old_state} if $s->{phase} ne 'home' || $s->{trip};
-        return;
+        return unless defined($new_positive);
+        # An active trip keeps its first relevant return for freshness and budgets.
+        # Later status changes use the latest source, independent of completed trips.
+        my $time=$arrival_time//$latest;
+        my $snapshot=$state_mode && $time<=$s->{start};
+        my $proof=($s->{last_trip}//{})->{phone_qualification};
+        return unless $snapshot || $s->{phase} ne 'home' || $s->{trip}
+            || ($proof && $new_positive<$proof->{qualified_at});
+        my $event={kind=>$snapshot ? 'phone_snapshot':'phone_present',time=>$time,
+            received=>$now,received_mono=>$mono,generation=>$s->{generation}};
+        $event->{positive_time}=$new_positive if $new_positive<$time;
+        @{$event}{qw(arrival key)}=($arrival,'phone:'.$time.':'.$old_state) unless $snapshot;
+        return $event;
     }
     $p->{missing_since}//=$mono;
-    # Each sensor covers part of the house. A negative quorum cannot establish
-    # absence: every configured sensor must have a usable negative state.
-    my $all_negative=@{$cfg->{proxies}} && !grep {!$valid{$_} || $valid{$_}{value} ne 'absent'} @{$cfg->{proxies}};
-    if ($all_negative) {
-        my @times=sort {$a<=>$b} map {$valid{$_}{time}} @{$cfg->{proxies}};
-        # State mode uses the last observation establishing all-negative state.
-        # Measurement mode needs every sensor to have measured after a boundary.
-        my $observed=$state_mode ? $times[-1]:$times[0];
+    if (defined($observed)) {
         if (defined($p->{negative_after}) && $observed<=$p->{negative_after}) {
             GP_ResetNegative($s,undef);
         } else {
+            return if $p->{qualified};
             $p->{negative_since}//=$mono;
             $p->{negative_wall}//=$now;
-            $p->{negative_first}//={map {$_=>$valid{$_}{time}} @{$cfg->{proxies}}};
-            my $renewed=$state_mode || !grep {$valid{$_}{time}<=$p->{negative_first}{$_}} @{$cfg->{proxies}};
+            my $renewed=1;
+            unless ($state_mode) {
+                # Retain only sources still awaiting their first renewal. Later
+                # identical measurements cannot move a satisfied deadline.
+                my $pending=$p->{negative_first}//={map {$_=>$samples->{$_}{time}} @{$cfg->{proxies}}};
+                for my $name (keys %$pending) {
+                    my $time=$samples->{$name}{time};
+                    next if $time<=$pending->{$name};
+                    delete $pending->{$name};
+                    $p->{negative_renewed_at}=$time if !defined($p->{negative_renewed_at}) || $time>$p->{negative_renewed_at};
+                    my $source_mono=$mono-($now-$time);
+                    $p->{negative_renewed_mono}=$source_mono
+                        if !defined($p->{negative_renewed_mono}) || $source_mono>$p->{negative_renewed_mono};
+                }
+                $renewed=!keys %$pending;
+            }
             if ($renewed && $mono-$p->{negative_since}>=$cfg->{phone_absence_window}) {
-                $p->{state}='absent'; $p->{health}=$state_mode?'held':'fresh'; $p->{qualified}=1;
-                return if $p->{negative_emitted};
-                $p->{negative_emitted}=1;
+                $p->{state}='absent'; $p->{health}=$state_mode?'held':'fresh';
+                $p->{qualified}=1;
+                my $qualified_at=$p->{negative_wall}+$cfg->{phone_absence_window};
+                my $qualified_mono=$p->{negative_since}+$cfg->{phone_absence_window};
+                unless ($state_mode) {
+                    $qualified_at=$p->{negative_renewed_at} if $p->{negative_renewed_at}>$qualified_at;
+                    $qualified_mono=$p->{negative_renewed_mono} if $p->{negative_renewed_mono}>$qualified_mono;
+                }
                 return {kind=>'phone_absent',time=>$observed,received=>$now,received_mono=>$mono,generation=>$s->{generation},
+                    qualified_at=>$qualified_at,qualified_mono=>$qualified_mono,
                     negative_generation=>$p->{negative_generation}//0,
                     negative_wall=>$p->{negative_wall},negative_since=>$p->{negative_since}};
             }
@@ -2660,6 +2784,11 @@ sub GP_ResumeTrip {
     $s->{trip}=$trip;
     $s->{trip}{away_mono}=$mono-($now-$trip->{away_time});
     $s->{trip}{leave_mono}=$mono-($now-$trip->{home_exit}) if defined $trip->{home_exit};
+    # Saved qualified data supplies a conservative return fence at saved_at.
+    # Original departure/window checks remain; no collection or timer is resumed.
+    $s->{trip}{phone_qualification}={qualified_at=>$checkpoint->{saved_at},
+        qualified_mono=>$mono-($now-$checkpoint->{saved_at})}
+        if ($trip->{away_reason}//'') eq $GP_PHONE_DEPARTURE_REASON;
     $s->{phase}='away';
     $s->{checkpoint_dirty}=$legacy ? 1:0;
     $s->{checkpoint_trip}=$trip->{id};
@@ -3386,6 +3515,7 @@ sub GP_TimerStep {
         next if @errors;
         my @pools=$mode eq 'active' ? (0) : (1);
         push @pools,1 if $mode eq 'active' && exists $rt->{debug}{$r};
+        my $live_samples;
         for my $debug (@pools) {
             my $target=$r.($debug ? ' (debug)':' (production)');
             my $cfg=$debug==$first_debug ? $first_cfg : GP_Profile($c,'configuration',$target,sub {GP_Config($c,$r,$debug)});
@@ -3398,7 +3528,7 @@ sub GP_TimerStep {
                 my $samples;
                 if ($debug && ($s->{phone_mode}//'live') eq 'simulated') {
                     $samples={map {$_=>{value=>$s->{sim_phone}//'absent',time=>$wall,ttl=>150,healthy=>1}} @{$cfg->{proxies}}};
-                } else { $samples=GP_Profile($c,'phone_readings',$target,sub {GP_PhoneSamples($cfg,$now)}); }
+                } else { $samples=$live_samples//=GP_Profile($c,'phone_readings',$target,sub {GP_PhoneSamples($cfg,$now)}); }
                 my $phone=GP_Profile($c,'phone',$target,sub {GP_Phone($s,$cfg,$samples,$wall,$clock)});
                 if ($phone) {
                     push @{$s->{queued_phones}},$phone;
@@ -3448,7 +3578,10 @@ sub GP_TimerStep {
                 my $phones=delete($s->{queued_phones})//[];
                 push @events,@$phones unless $geometry_changed;
                 my @pending;
-                for my $e (sort {$a->{time}<=>$b->{time} || ($a->{zone}//'') cmp ($b->{zone}//'')} @events) {
+                # Absence becomes a usable fact only after its complete window.
+                # An earlier Home return must revoke it before it can arm a trip.
+                for my $e (sort {($a->{qualified_at}//$a->{time})<=>($b->{qualified_at}//$b->{time})
+                    || ($a->{zone}//'') cmp ($b->{zone}//'')} @events) {
                     last if $conflict;
                     if ($geometry_changed) {
                         GP_GeometrySync($s,$cfg,$e,$wall,$clock) if $e->{time}>=($s->{position_time}//0);
@@ -4349,6 +4482,9 @@ set Geo.PERSON mode debug</pre>
   <h5>Indoor phone presence</h5>
   <p>Indoor sensors are used only by geofency_phone and phone_only. In geofency_only, phone state and health are explicitly disabled; no sensors are polled, no phone simulation is accepted, and a lost Home webhook has no phone fallback.</p>
   <p>One detecting indoor sensor is enough for presence. Changing rooms or being seen by multiple sensors does not create another arrival. Absence requires all configured sensors to be negative for phone_absence_window. A short reception gap preserves presence and cannot authorize a new opening. Phone arrival can replace a missing Home webhook after a qualified trip. A local walk can authorize the door; the garage additionally needs driving evidence or a remote trip without fresh contradictory walking/running/cycling evidence.</p>
+  <p>In state mode, valid negatives observed before Home exit may start a new full absence window after the exit without another identical sensor message. Earlier elapsed time and pre-start snapshots alone cannot authorize that departure. Measurement mode still needs new, renewed measurements after the exit. A return observed or received before the full window completes cannot become eligible through later processing. A valid return after the actual deadline remains eligible even if the next poll confirms the elapsed window later.</p>
+  <p>Valid phone presence can revoke an old trip and pending outputs even after its action freshness budget expires. For an active trip, the first newly accepted positive observation at or after the relevant departure anchors a phone return, including its freshness, minimum absence and output budget. A later positive reading from another sensor cannot make a delayed return fresh or extend these limits. Without an active trip, the latest valid positive observation supplies presence status, including phone_only and later status cycles after a completed trip. An older simultaneous reading cannot hide current presence behind a newer nearby location. The completed trip remains available for revocation and pending output checks; its departure times and output budgets are not renewed. This status update creates no trip permission. The trip checks also cover pre-start presence delivered only after an older trip was restored, including independently qualified Geo trips; it cannot execute a historical arrival or rewind a newer position. Observations before a genuinely later new trip do not anchor that new return. A positive observation before an absence completion invalidates that collected record, while an actual later return preserves a valid earlier completion. Polling never refreshes source timestamps.</p>
+  <p>A nearby ordinary location does not interrupt valid held absence continuity. A phone-qualified trip retains its actual absolute and monotonic completion bounds for later returns, including measurement renewal after the nominal window. Only the first required renewal of each source contributes to those bounds; further identical measurements do not move an already satisfied deadline or supersede an eligible return before the next poll. The same early return is rejected in shared and separate batches. Independently qualified Geo trips and phone_only status changes retain their own contracts.</p>
   <h5>Home arrival confirmation</h5>
   <p>If held indoor presence rejects an outer departure, an earlier unarmed local Home exit remains pending when it is newer than the last actual positive phone observation. Only complete phone absence qualification can authorize that trip; rejected distance or prior-exit evidence is not retained. A new Home entry or positive phone observation cancels the unarmed suspicion. Short reception gaps therefore cannot open either actor.</p>
   <p>A qualified Home entry is provisional (<code>returning</code>). Default confirmation waits:</p>
@@ -4785,7 +4921,8 @@ get Geo.PERSON explain debug</pre>
         <li><code>state</code>: retain each sensor value until a change or detected error. Use this for sensors that report only changes.</li>
         <li><code>measurement</code>: require repeated fresh measurements from every sensor. Freshness is twice the longer sensor interval plus 30 seconds.</li>
       </ul>
-      <p>An explicit failure interrupts absence qualification.</p>
+      <p>After Home exit, state mode may use still-valid negatives from before the exit for a new complete absence window. Time before the exit does not count. Measurement mode requires new observations after the exit and renewed measurements during qualification. Pre-start snapshots alone cannot authorize a new trip.</p>
+      <p>An explicit failure interrupts absence qualification; recovery alone does not restore invalidated old observations.</p>
       <p>A silent unreported sensor failure cannot be detected reliably from held state alone.</p>
       <p><b>Example:</b></p>
       <pre style="white-space: pre-wrap; overflow-wrap: anywhere;">attr Geo.PERSON phoneSignalMode state</pre>

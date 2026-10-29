@@ -616,7 +616,7 @@ subtest 'older observations from another zone or phone cannot rewind position' =
     advance(70);process($s,$cfg,'Outer',0);
     my $e=ev('Home',1,$now-10);$e->{received}=$now;
     GP_Process($s,$cfg,$e,$now,$mono);is($s->{phase},'away','older Home cannot replace newer outer exit');
-    $e={kind=>'phone_present',time=>$now-5,received=>$now,arrival=>1,key=>'older-phone'};
+    $e={kind=>'phone_present',time=>$now-5,received=>$now,generation=>$s->{generation},arrival=>1,key=>'older-phone'};
     GP_Process($s,$cfg,$e,$now,$mono);is($s->{phase},'away','older positive cannot replace newer departure');
     is(scalar @{$s->{intents}},0,'no actions from cross-source reorder');
 };
@@ -1386,6 +1386,583 @@ subtest 'old negative phone observations cannot undo Home or DriveIn arrival' =>
     }
 };
 
+sub r05_review_fixture {
+    my ($signal,%options)=@_;
+    my ($c)=fixture();mode('GP','debug');
+    attribute('Geo.Test','phoneSignalMode',$signal);
+    attribute('Geo.Test','phoneProxies','p1,p2');
+    attribute('GP',$_,$options{$_}) for sort keys %options;
+    my $geometry=JSON::PP::decode_json(GP_Read('Z.Checkpoint','gp_geometry',''));
+    @{$geometry}{qw(lat radius)}=(0.00135,20);
+    reading('Z.Checkpoint','gp_geometry',JSON::PP::encode_json($geometry),$now-1000);
+    $defs{$_}{INTERVAL_NORMAL}=120 for qw(p1 p2);
+    mode('GP','active');GeoPresence_Timer($c);
+    actor_fresh();
+    my $base=$now;
+    my $at=sub {advance($base+$_[0]-$now);};
+    my $sample=sub {
+        my ($name,$value,$time)=@_;
+        reading($name,'state',$value,$base+$time);reading($name,'presence',$value,$base+$time);
+    };
+    return ($c,GP_Config($c,'Geo.Test'),GP_State($c,'Geo.Test',0),$at,$sample,$base);
+}
+
+subtest 'GP-R05-001: only contradicted queued absence completions are revoked' => sub {
+    for my $case (qw(contradiction mixed_positive genuine_return)) {
+        my ($c,$cfg,$s,$at,$sample,$base)=r05_review_fixture('state',phone_absence_window=>20,reorder_window=>10);
+        $at->(50);$sample->($_,'absent',50) for qw(p1 p2);
+        GeoPresence_Timer($c);actor_fresh();
+        $at->(100);my $exit=form($cfg,'Home',0,$now);http($c,$exit);
+        $at->(110);GeoPresence_Timer($c);my $id=$s->{trip}{id};
+        $at->(115);GeoPresence_Timer($c);
+        $at->(134);http($c,$exit);
+        $at->(135);GeoPresence_Timer($c);
+        ok(grep({$_->{kind} eq 'phone_absent'} @{$s->{queued_phones}}),'completion is held by the pending Geo batch');
+        if ($case eq 'contradiction') {
+            $at->(140);$sample->('p1','present',90);GeoPresence_Timer($c);
+            $at->(144);GeoPresence_Timer($c);
+            is(($s->{trip}//{})->{id},$id,'older presence preserved the later Home departure suspicion');
+            ok(!($s->{trip}//{})->{armed},'contradicted completion could not arm it');
+            $at->(190);http($c,form($cfg,'Home',1,$now,motion=>'walking'));
+            $at->(200);GeoPresence_Timer($c);$at->(261);GeoPresence_Timer($c);
+        } else {
+            $at->(190);
+            $sample->('p1','present',$case eq 'mixed_positive' ? 90:190);
+            $sample->('p2','present',185) if $case eq 'mixed_positive';
+            GeoPresence_Timer($c);
+        }
+        is_deeply([grep {/^(?:door|garage) /} @commands],
+            $case eq 'genuine_return' ? ['door lock unlocked']:[],
+            "$case: a later actual return keeps the valid completion, a contradictory source cannot authorize opening");
+    }
+};
+
+subtest 'GP-R05-002: delayed pre-start presence revokes only an older restored trip' => sub {
+    for my $case (qw(restored newer_position older_presence new_trip)) {
+        my ($c,$cfg,$s,$at,$sample,$base)=r05_review_fixture('state');
+        $at->(50);$sample->($_,'absent',50) for qw(p1 p2);
+        GeoPresence_Timer($c);$at->(70);process($s,$cfg,'Work',0);
+        $at->(80);GP_Publish($c,'Geo.Test',$cfg,$s);my $id=$s->{trip}{id};
+        $at->(100);delete $c->{helper}{gp};$mono=5;GP_ResetController($c,'resume');GeoPresence_Timer($c);
+        $cfg=GP_Config($c,'Geo.Test');$s=GP_State($c,'Geo.Test',0);
+        is($s->{resume}{status},'restored','qualified old trip restored against the available negative source');
+        if ($case eq 'newer_position') {$at->(120);process($s,$cfg,'Checkpoint',1);}
+        if ($case eq 'new_trip') {
+            $at->(120);arrive($s,$cfg,'walking');$s->{intents}=[];
+            $at->(130);process($s,$cfg,'Work',0);$id=$s->{trip}{id};
+        }
+        my $position=$s->{position_time};@commands=();
+        $at->(150);$sample->('p1','present',$case eq 'older_presence' ? 60:90);GeoPresence_Timer($c);
+        if ($case eq 'older_presence' || $case eq 'new_trip') {
+            is(($s->{trip}//{})->{id},$id,'historical presence cannot override a later departure');
+        } else {
+            ok(!$s->{trip} && !$s->{arrival},'historical presence revoked the older restored authorization');
+            is(JSON::PP::decode_json(GP_Read('Geo.Test','gp_trip_checkpoint',''))->{status},'none','revocation reached the checkpoint');
+            cmp_ok($s->{position_time},'>=',$position,'historical presence did not rewind a newer position');
+            $at->(200);http($c,form($cfg,'Home',1,$now,motion=>'automotive'));
+            $at->(203);GeoPresence_Timer($c);$at->(264);GeoPresence_Timer($c);
+        }
+        is(scalar(grep {/^(?:door|garage) /} @commands),0,'historical presence creates no arrival action');
+    }
+};
+
+subtest 'GP-R05-005: current presence cannot hide historical counterevidence to a restored trip' => sub {
+    for my $case (qw(mixed three_positive older_presence new_trip)) {
+        my ($c,$cfg,$s,$at,$sample,$base)=r05_review_fixture('state');
+        my @sensors=qw(p1 p2);
+        if ($case eq 'three_positive') {
+            mode('GP','debug');attribute('Geo.Test','phoneProxies','p1,p2,p3');mode('GP','active');
+            GeoPresence_Timer($c);$cfg=GP_Config($c,'Geo.Test');$s=GP_State($c,'Geo.Test',0);
+            push @sensors,'p3';
+        }
+        $at->(50);$sample->($_,'absent',50) for @sensors;GeoPresence_Timer($c);
+        $at->(70);process($s,$cfg,'Work',0);
+        $at->(80);GP_Publish($c,'Geo.Test',$cfg,$s);
+        $at->(100);delete $c->{helper}{gp};$mono=5;GP_ResetController($c,'resume');GeoPresence_Timer($c);
+        $cfg=GP_Config($c,'Geo.Test');$s=GP_State($c,'Geo.Test',0);
+        is($s->{resume}{status},'restored',"$case: independent Geo trip restored");
+        if ($case eq 'new_trip') {
+            $at->(120);arrive($s,$cfg,'walking');$s->{intents}=[];
+            $at->(130);process($s,$cfg,'Work',0);
+        }
+        @commands=();$at->($case eq 'new_trip' ? 200:150);actor_fresh();
+        $sample->('p1','present',$case eq 'older_presence' || $case eq 'three_positive' ? 60:90);
+        $sample->('p2','present',$case eq 'new_trip' ? 200:150);
+        $sample->('p3','present',90) if $case eq 'three_positive';
+        GeoPresence_Timer($c);
+        my $eligible=$case eq 'older_presence' || $case eq 'new_trip';
+        is_deeply([grep {/^(?:door|garage) /} @commands],$eligible ? ['door lock unlocked','garage on']:[],
+            "$case: historical counterevidence is independent of the latest positive sensor");
+        if (!$eligible) {
+            ok(!$s->{trip} && !$s->{arrival},'mixed observations revoked the old authorization');
+            is(JSON::PP::decode_json(GP_Read('Geo.Test','gp_trip_checkpoint',''))->{status},'none',
+                'revoked checkpoint cannot restore the trip again');
+        }
+    }
+};
+
+subtest 'GP-R05-008: a newer sensor cannot replace the actual return time within one session' => sub {
+    for my $case (qw(combined_stale separate_stale fresh_early separate_early early_pending_home
+        early_newer_position fresh_valid three_positive new_trip newer_position output_budget)) {
+        my ($c,$cfg,$s,$at,$sample,$base)=r05_review_fixture('state');
+        my @sensors=qw(p1 p2);
+        if ($case eq 'three_positive') {
+            mode('GP','debug');attribute('Geo.Test','phoneProxies','p1,p2,p3');mode('GP','active');
+            GeoPresence_Timer($c);$cfg=GP_Config($c,'Geo.Test');$s=GP_State($c,'Geo.Test',0);
+            push @sensors,'p3';
+        }
+        $at->(50);$sample->($_,'absent',50) for @sensors;GeoPresence_Timer($c);
+        $at->(80);http($c,form($cfg,'Home',0,$now));GeoPresence_Timer($c);
+        $at->(82);GeoPresence_Timer($c);$at->(85);GeoPresence_Timer($c);
+        $at->(100);http($c,form($cfg,'Outer',0,$now));GeoPresence_Timer($c);
+        $at->(102);GeoPresence_Timer($c);
+        ok($s->{trip}{armed} && !$s->{trip}{phone_qualification},"$case: Geo independently confirmed the departure");
+        if ($case eq 'new_trip') {
+            $at->(150);process($s,$cfg,'Home',1,'walking');$s->{intents}=[];
+            $at->(160);process($s,$cfg,'Work',0);
+        } elsif ($case =~ /position/) {
+            $at->($case eq 'newer_position' ? 200:160);process($s,$cfg,'Checkpoint',1);
+        } elsif ($case eq 'early_pending_home') {
+            $at->(165);process($s,$cfg,'Home',1,'walking');
+            ok($s->{arrival},'newer Home return is waiting before the delayed short return arrives');
+        }
+        my $position=$s->{position_time};
+        my $received=$case =~ /early/ ? 170:230;
+        $at->($received-5);GeoPresence_Timer($c);
+        $at->($received);actor_fresh();
+        my $first=$case eq 'fresh_valid' || $case eq 'output_budget' ? 180:120;
+        $sample->('p1','present',$case eq 'three_positive' ? 90:$first);
+        if ($case !~ /^separate_/) {
+            $sample->('p2','present',$case eq 'three_positive' ? 120:$received);
+            $sample->('p3','present',$received) if $case eq 'three_positive';
+        }
+        $on_command=sub {advance(45) if $_[0] =~ /^door /;} if $case eq 'output_budget';
+        GeoPresence_Timer($c);$on_command=undef;
+        if ($case =~ /^separate_/) {
+            $at->($received+5);$sample->('p2','present',$received+5);GeoPresence_Timer($c);
+        }
+        my $eligible=$case eq 'fresh_valid' || $case eq 'new_trip' || $case eq 'output_budget';
+        my $expected=$eligible ? ['door lock unlocked',($case eq 'output_budget' ? ():'garage on')]:[];
+        is_deeply([grep {/^(?:door|garage) /} @commands],$expected,
+            "$case: decisions use the first relevant positive observation");
+        ok(!$s->{trip} && !$s->{arrival},'the return consumed or revoked the old permission');
+        is(JSON::PP::decode_json(GP_Read('Geo.Test','gp_trip_checkpoint',''))->{status},'none',
+            'the old trip cannot be restored again');
+        cmp_ok($s->{position_time},'>=',$position,'earlier return evidence did not rewind the known position');
+        is(GP_ReadingTime('p1','presence'),$base+($case eq 'three_positive' ? 90:$first),
+            'source observation time stayed unchanged');
+        if (!$eligible) {
+            $at->(300);http($c,form($cfg,'Home',1,$now,motion=>'walking'));
+            $at->(303);GeoPresence_Timer($c);$at->(364);GeoPresence_Timer($c);
+            is(scalar(grep {/^(?:door|garage) /} @commands),0,'later Home entry cannot reuse the old trip');
+        }
+    }
+};
+
+subtest 'GP-R05-009: current presence updates status without a trip despite older positive sources' => sub {
+    for my $case (qw(state reverse three_positive measurement combined_no_trip)) {
+        my $signal=$case eq 'measurement' ? 'measurement':'state';
+        my ($c,$cfg,$s,$at,$sample,$base)=r05_review_fixture($signal);
+        mode('GP','debug');
+        attribute('Geo.Test','sourceMode','phone_only') unless $case eq 'combined_no_trip';
+        my @sensors=$case eq 'three_positive' ? qw(p1 p2 p3):qw(p1 p2);
+        attribute('Geo.Test','phoneProxies',join(',',@sensors));
+        mode('GP','active');GeoPresence_Timer($c);
+        $cfg=GP_Config($c,'Geo.Test');$s=GP_State($c,'Geo.Test',0);
+        $defs{$_}{INTERVAL_NORMAL}=120 for @sensors;
+        $at->(50);$sample->($_,'absent',50) for @sensors;GeoPresence_Timer($c);
+        if ($signal eq 'measurement') {
+            $at->(100);$sample->($_,'absent',100) for @sensors;GeoPresence_Timer($c);
+        }
+        $at->(225);GeoPresence_Timer($c);$at->(230);GeoPresence_Timer($c);
+        ok(!$s->{trip} && !$s->{last_trip},"$case: status-only absence has no trip permission");
+        is($s->{phase},'away','full absence window set GeoPresence away');
+        is(GP_Read('rr_Test','state',''),'absent','full absence window set ROOMMATE absent');
+        $at->(235);
+        $sample->('p1','present',$case eq 'reverse' ? 235:120);
+        $sample->('p2','present',$case eq 'reverse' ? 120:235);
+        $sample->('p3','present',130) if $case eq 'three_positive';
+        GeoPresence_Timer($c);
+        is($s->{phone}{state},'present','healthy positive sources set phone presence');
+        is($s->{phone}{latest},$base+235,'actual current positive observation remains visible');
+        is($s->{phase},'home','current positive source also sets GeoPresence home');
+        is(GP_Read('rr_Test','state',''),'home','current positive source also sets ROOMMATE home');
+        is_deeply([map {GP_ReadingTime($_,'presence')} @sensors],
+            [map {$base+$_} ($case eq 'reverse' ? (235,120):(120,235),$case eq 'three_positive' ? 130:())],
+            'polling preserved every actual source date');
+        for my $time (240,420) {
+            $at->($time);GeoPresence_Timer($c);
+            is($s->{phase},'home','home remains stable without another positive event');
+            is(GP_Read('rr_Test','state',''),'home','ROOMMATE remains home without another positive event');
+        }
+        ok(!$s->{trip} && !$s->{last_trip} && !$s->{arrival},'status change created no trip or arrival permission');
+        is(scalar(grep {/^(?:door|garage) /} @commands),0,'status change opened neither door nor garage');
+    }
+};
+
+subtest 'GP-R05-010: a completed trip cannot hold later status changes to an old return' => sub {
+    for my $case (qw(geo phone_qualified stale_old new_active)) {
+        my ($c,$cfg,$s,$at,$sample,$base)=r05_review_fixture('state');
+        $at->(50);$sample->($_,'absent',50) for qw(p1 p2);GeoPresence_Timer($c);
+        $at->(80);http($c,form($cfg,'Home',0,$now));GeoPresence_Timer($c);
+        $at->(82);GeoPresence_Timer($c);$at->(85);GeoPresence_Timer($c);
+        if ($case eq 'phone_qualified') {
+            $at->(265);GeoPresence_Timer($c);
+            ok($s->{trip}{phone_qualification},'full phone absence qualified the first local trip');
+        } else {
+            $at->(100);http($c,form($cfg,'Outer',0,$now));GeoPresence_Timer($c);
+            $at->(102);GeoPresence_Timer($c);
+        }
+        my $returned=$case eq 'phone_qualified' ? 300:200;
+        $at->($returned);$sample->('p1','present',$returned);actor_fresh();GeoPresence_Timer($c);
+        ok(!$s->{trip} && $s->{last_trip},"$case: first return completed the trip");
+        is($s->{phase},'home','first return set GeoPresence home');
+        my $old_trip=$s->{last_trip};
+        my @old_bounds=@{$old_trip}{qw(id away_time away_mono)};
+        my $old_intent=$c->{helper}{gp}{actors}{door}{intent};
+        ok($old_intent,'the completed arrival had a real door output plan');
+        my $old_expiry=$old_intent->{expires_mono};
+        $at->($returned+1);
+        reading('feedback','pulse_state','confirmed',$now);reading('gate','state','on',$now);
+        reading('upper','state','closed',$now);reading('lower','state','open',$now);
+        GeoPresence_Timer($c);@commands=();
+        $at->($returned+70);$sample->($_,'absent',$returned+70) for qw(p1 p2);GeoPresence_Timer($c);
+        $at->($returned+220);http($c,form($cfg,'Checkpoint',1,$now));
+        $at->($returned+222);GeoPresence_Timer($c);
+        my $position=$s->{position_time};
+        $at->($returned+250);GeoPresence_Timer($c);
+        ok(!$s->{trip},'later phone absence and nearby position created no new trip');
+        is($s->{phase},'away','full later phone absence set GeoPresence away');
+        is(GP_Read('rr_Test','state',''),'absent','full later phone absence set ROOMMATE absent');
+        is($s->{position_time},$position,'held negatives did not rewind the nearby position');
+        my $received=$returned+255;
+        my $earlier=$case eq 'stale_old' ? 300:$returned+190;
+        if ($case eq 'new_active') {
+            $at->(470);http($c,form($cfg,'Work',0,$now));GeoPresence_Timer($c);
+            $at->(472);GeoPresence_Timer($c);
+            ok($s->{trip}{armed},'a genuinely new independent trip is active');
+            ($earlier,$received)=(490,600);
+        }
+        $at->($received);$sample->('p1','present',$earlier);$sample->('p2','present',$received);
+        my $source_dates=[map {GP_ReadingTime($_,'presence')} qw(p1 p2)];
+        GeoPresence_Timer($c);
+        is($s->{phone}{state},'present','both positive sources set current phone presence');
+        if ($case eq 'new_active') {
+            ok(!$s->{trip} && !$s->{arrival},'old positive evidence still revoked the active new trip');
+        } else {
+            is($s->{phase},'home','current presence set GeoPresence home despite the old trip');
+            is(GP_Read('rr_Test','state',''),'home','current presence set ROOMMATE home');
+            is($s->{position_time},$base+$received,'current status used its actual newer source date');
+            is_deeply([@{$s->{last_trip}}{qw(id away_time away_mono)}],\@old_bounds,
+                'status change did not renew the old trip identity or departure bounds');
+            is($old_intent->{e}{time},$base+$returned,'old output retains its original return observation');
+            is($old_intent->{expires_mono},$old_expiry,'current status did not renew the old output deadline');
+            my @ready=GP_OutputReady($c,'Geo.Test',$cfg,$s,0,$old_intent);
+            is(scalar @ready,0,'an old output plan remains blocked after the current status update');
+            is($s->{last_reason},'intent expired','the old output is still checked against its own expired budget');
+            ok(!$s->{trip} && !$s->{arrival},'status change created no new trip or arrival permission');
+            for my $time ($received+5,$received+185) {
+                $at->($time);GeoPresence_Timer($c);
+                is($s->{phase},'home','home remains stable without another positive source event');
+                is(GP_Read('rr_Test','state',''),'home','ROOMMATE remains home without another source event');
+            }
+        }
+        is_deeply([map {GP_ReadingTime($_,'presence')} qw(p1 p2)],$source_dates,'source observation dates remain unchanged');
+        is(scalar(grep {/^(?:door|garage) /} @commands),0,'later presence never replays an opening from the old trip');
+        is(JSON::PP::decode_json(GP_Read('Geo.Test','gp_trip_checkpoint',''))->{status},'none',
+            'the completed or revoked trip remains non-restorable');
+    }
+};
+
+subtest 'GP-R05-006: additional negative samples do not move an already satisfied deadline' => sub {
+    for my $case (qw(regular staggered state)) {
+        my ($c,$cfg,$s,$at,$sample,$base)=r05_review_fixture(
+            $case eq 'state' ? 'state':'measurement',phone_poll=>7);
+        $defs{$_}{INTERVAL_NORMAL}=$case eq 'staggered' ? 120:7 for qw(p1 p2);
+        my $base_mono=$mono;
+        $at->(98);GeoPresence_Timer($c);
+        $at->(100);http($c,form($cfg,'Home',0,$now));GeoPresence_Timer($c);
+        $at->(102);GeoPresence_Timer($c);
+        $at->(105);$sample->($_,'absent',105) for qw(p1 p2);GeoPresence_Timer($c);
+        for (my $time=112;$time<=280;$time+=7) {
+            $at->($time);$sample->('p1','absent',$time);
+            $sample->('p2','absent',$time) unless $case eq 'staggered' && $time<280;
+            GeoPresence_Timer($c) unless $case eq 'staggered' && $time==280;
+        }
+        $at->(286);actor_fresh();http($c,form($cfg,'Home',1,$now,motion=>'walking'));
+        $at->(287);$sample->('p1','absent',287);
+        $sample->('p2','absent',287) unless $case eq 'staggered';
+        GeoPresence_Timer($c);
+        my ($completion)=grep {$_->{kind} eq 'phone_absent'} @{$s->{queued_phones}};
+        is($completion->{qualified_at},$base+285,"$case: extra measurements preserve the actual absolute completion");
+        is($completion->{qualified_mono},$base_mono+285,"$case: extra measurements preserve the monotonic completion");
+        $at->(288);GeoPresence_Timer($c);
+        ok($s->{arrival},"$case: valid return before the next poll starts its normal arrival wait");
+        $at->(347);GeoPresence_Timer($c);
+        is_deeply([grep {/^(?:door|garage) /} @commands],['door lock unlocked'],
+            "$case: the valid walking return opens only the door");
+    }
+};
+
+subtest 'GP-R05-003: ordinary nearby observations do not consume a held absence completion' => sub {
+    my ($c,$cfg,$s,$at,$sample,$base)=r05_review_fixture('state');
+    $at->(50);$sample->($_,'absent',50) for qw(p1 p2);GeoPresence_Timer($c);
+    $at->(100);http($c,form($cfg,'Home',0,$now));GeoPresence_Timer($c);$at->(102);GeoPresence_Timer($c);
+    $at->(105);GeoPresence_Timer($c);my $since=$s->{phone}{negative_since};
+    $at->(120);http($c,form($cfg,'Checkpoint',1,$now));$at->(122);GeoPresence_Timer($c);
+    is($s->{position_time},$base+120,'nearby place advanced the position without independent distance evidence');
+    ok(!$s->{trip}{armed},'nearby place did not authorize the trip');
+    $at->(285);GeoPresence_Timer($c);
+    ok($s->{trip}{armed},'full held absence still confirmed the local departure');
+    is($s->{trip}{scope},'local','nearby place supplied no remote permission');
+    is($s->{phone}{negative_since},$since,'nearby place did not restart the source interval');
+    ok($s->{members}{'Z.Checkpoint'}{entry},'absence invented no explicit place exit');
+    is(GP_ReadingTime('p1','presence'),$base+50,'held source timestamp stayed unchanged');
+    $at->(300);actor_fresh();http($c,form($cfg,'Home',1,$now,motion=>'walking'));
+    $at->(303);GeoPresence_Timer($c);$at->(361);GeoPresence_Timer($c);
+    is_deeply([grep {/^(?:door|garage) /} @commands],['door lock unlocked'],'normal local return remained eligible');
+};
+
+subtest 'GP-R05-004: measurement completion bounds returns across batches and source types' => sub {
+    for my $case (qw(same_batch separate_batch phone_counter after_deadline after_deadline_before_poll independent_geo)) {
+        my ($c,$cfg,$s,$at,$sample,$base)=r05_review_fixture('measurement');
+        $at->(100);http($c,form($cfg,'Home',0,$now));GeoPresence_Timer($c);$at->(102);GeoPresence_Timer($c);
+        $at->(105);$sample->($_,'absent',105) for qw(p1 p2);GeoPresence_Timer($c);
+        process($s,$cfg,'Work',0) if $case eq 'independent_geo';
+        $at->(300);$sample->('p1','absent',300);GeoPresence_Timer($c);
+        is(!!$s->{trip}{armed},$case eq 'independent_geo' ? 1:'','only independent Geo evidence can qualify before the source renewal');
+        $at->(309);http($c,form($cfg,'Home',1,$base+305,motion=>'walking')) if $case eq 'same_batch';
+        $at->(310);$sample->('p2','absent',310);
+        GeoPresence_Timer($c) unless $case eq 'after_deadline_before_poll';
+        if ($case eq 'phone_counter') {
+            $at->(315);$sample->('p1','present',305);GeoPresence_Timer($c);
+            ok(!$s->{trip},'late positive source observation contradicted the completed phone proof');
+        } elsif ($case ne 'same_batch') {
+            $at->(315);http($c,form($cfg,'Home',1,$base+($case eq 'separate_batch' || $case eq 'independent_geo' ? 305:315),motion=>'walking'));
+        }
+        $at->($case eq 'same_batch' ? 311:317);GeoPresence_Timer($c);
+        my $eligible=$case =~ /^after_deadline/ || $case eq 'independent_geo';
+        if ($eligible) {
+            ok($s->{arrival},'actual return after the completed proof remained eligible before the next poll');
+        } else {ok(!$s->{arrival},'return before the final required measurement cannot start an eligible arrival');}
+        $at->(378);GeoPresence_Timer($c);
+        is_deeply([grep {/^(?:door|garage) /} @commands],
+            $eligible ? ['door lock unlocked']:[],
+            "$case uses the same completion boundary");
+        if ($case eq 'separate_batch') {
+            $at->(390);actor_fresh();http($c,form($cfg,'Home',1,$now,motion=>'walking'));
+            $at->(393);GeoPresence_Timer($c);$at->(451);GeoPresence_Timer($c);
+            is(scalar(grep {/^(?:door|garage) /} @commands),0,'later Home entries cannot revive the already ended premature return');
+        }
+    }
+};
+
+subtest 'GP-R05-004: a later single positive measurement still updates phone-only status' => sub {
+    my ($c,$cfg)=fixture();$cfg={%$cfg,sourceMode=>'phone_only',phoneSignalMode=>'measurement',proxies=>[qw(p1 p2)]};
+    my $s=new_state();advance(105);my $samples=negative_samples();$samples->{$_}{ttl}=270 for keys %$samples;
+    phone_tick($s,$cfg,$samples);advance(195);$samples->{p1}{time}=$now;phone_tick($s,$cfg,$samples);
+    advance(10);$samples->{p2}{time}=$now;phone_tick($s,$cfg,$samples);
+    is($s->{phase},'away','all renewed measurements confirmed status-only absence');
+    advance(5);$samples->{p1}={value=>'present',time=>$now-10,ttl=>270,healthy=>1};phone_tick($s,$cfg,$samples);
+    is($s->{phase},'home','one valid positive source wins even before the other source measurement');
+    is(scalar @{$s->{intents}},0,'phone-only status never acquires an opening');
+};
+
+subtest 'F-10: delayed valid phone presence revokes a trip without allowing a stale arrival' => sub {
+    for my $signal_mode (qw(state measurement)) {
+        for my $pending (0,1) {
+            my ($c,$cfg)=fixture();$cfg->{phoneSignalMode}=$signal_mode;
+            my $s=GP_State($c,'Geo.Test',0);advance(40);actor_fresh();
+            process($s,$cfg,'Work',1);advance(1);phone_tick($s,$cfg,negative_samples());
+            advance(180);phone_tick($s,$cfg,negative_samples());
+            is($s->{phone}{state},'absent','phone absence was confirmed');
+            advance(1);my $positive=negative_samples();$positive->{p1}{value}='present';
+            my $observed=$now;
+            if ($pending) {advance(1);process($s,$cfg,'Home',1,'walking');ok($s->{arrival},'Home return is waiting');}
+            my $position=$s->{position_time};
+            advance(100);my $event=phone_tick($s,$cfg,$positive);
+            ok($event && $event->{arrival},"$signal_mode still recognizes the actual phone return");
+            is($event->{time},$observed,'collector preserved the source observation time');
+            ok(!$s->{trip},'late presence revoked the old trip');
+            ok(!$s->{arrival} && !$s->{approach},'late presence cancelled all pending return evidence');
+            cmp_ok($s->{position_time},'>=',$position,'revocation did not rewind a newer position');
+            GP_ConfirmArrival($s,$cfg,$now,$mono);GP_Dispatch($c,'Geo.Test',$cfg,$s,0);
+            GP_Publish($c,'Geo.Test',$cfg,$s);
+            is(JSON::PP::decode_json(GP_Read('Geo.Test','gp_trip_checkpoint',''))->{status},'none','revoked trip cannot resume');
+            is(scalar(grep {/^(?:door|garage) /} @commands),0,'stale phone return did not open either actor');
+            advance(1);arrive($s,$cfg,'automotive');GP_Dispatch($c,'Geo.Test',$cfg,$s,0);
+            is(scalar(grep {/^(?:door|garage) /} @commands),0,'fresh Home entry cannot reuse the revoked departure');
+        }
+    }
+};
+
+subtest 'F-10: status-only phone return clears distant membership for the next actual visit' => sub {
+    my ($c,$cfg)=fixture();$cfg->{phoneSignalMode}='state';my $s=new_state();advance(40);
+    process($s,$cfg,'Work',1);advance(1);phone_tick($s,$cfg,negative_samples());
+    advance(180);phone_tick($s,$cfg,negative_samples());
+    advance(1);my $positive=negative_samples();$positive->{p1}{value}='present';
+    advance(100);phone_tick($s,$cfg,$positive);
+    is($s->{phase},'home','held presence synchronized Home without an arrival action');
+    is(scalar @{$s->{intents}},0,'status-only return planned no action');
+    advance(1);process($s,$cfg,'Home',0);advance(1);phone_tick($s,$cfg,negative_samples());
+    advance(180);phone_tick($s,$cfg,negative_samples());advance(1);process($s,$cfg,'Work',1);
+    is($s->{group_visits}{Work},2,'new actual Work visit was not suppressed by the prior trip membership');
+    is_deeply([map {$_->{kind}} @{$s->{intents}}],['notify'],'new visit still schedules its ordinary notification');
+};
+
+subtest 'F-10: older measurements, future and invalid phone samples cannot revoke a later trip' => sub {
+    for my $case (qw(older_measurement future unhealthy expired_measurement)) {
+        my ($c,$cfg)=fixture();$cfg->{phoneSignalMode}=$case =~ /measurement/ ? 'measurement':'state';
+        my $s=new_state();advance(40);my $positive=negative_samples();$positive->{p1}{value}='present';
+        advance(1);process($s,$cfg,'Work',1);my $id=$s->{trip}{id};$s->{intents}=[];
+        if ($case eq 'future') {$positive->{p1}{time}=$now+10;}
+        elsif ($case eq 'unhealthy') {$positive->{p1}{healthy}=0;}
+        elsif ($case eq 'expired_measurement') {advance(200);}
+        else {advance(100);}
+        phone_tick($s,$cfg,$positive);
+        is(($s->{trip}//{})->{id},$id,"$case sample preserved the later departure");
+        is(scalar @{$s->{intents}},0,'sample created no action');
+    }
+};
+
+subtest 'F-10: discovering held presence after Geo departure applies the same veto as before departure' => sub {
+    for my $delay (80,100) {
+        my ($c,$cfg)=fixture();$cfg->{phoneSignalMode}='state';my $s=new_state();
+        advance(40);my $held=negative_samples();$held->{p1}{value}='present';
+        advance(1);process($s,$cfg,'Work',1);$s->{intents}=[];
+        advance($delay);phone_tick($s,$cfg,$held);
+        ok(!$s->{trip},'still-valid held presence revoked the Geo departure even with an earlier observation date');
+        is(scalar @{$s->{intents}},0,'earlier held presence could not become a new arrival');
+        advance(1);arrive($s,$cfg,'automotive');
+        is(scalar @{$s->{intents}},0,'later Home entry could not reuse the contradicted departure');
+    }
+};
+
+subtest 'R-05: held presence observed before an unconfirmed Home exit preserves the departure suspicion' => sub {
+    for my $delay (80,100) {
+        my ($c,$cfg)=fixture();$cfg->{phoneSignalMode}='state';my $s=new_state();advance(40);
+        my $positive=negative_samples();$positive->{p1}{value}='present';
+        advance(1);process($s,$cfg,'Home',0);my $id=$s->{trip}{id};
+        advance($delay);phone_tick($s,$cfg,$positive);
+        is(($s->{trip}//{})->{id},$id,'older held presence preserved the later unconfirmed Home exit');
+        ok(!$s->{trip}{armed},'held presence did not authorize it');
+        advance(1);my $held=negative_samples();phone_tick($s,$cfg,$held);
+        advance(180);phone_tick($s,$cfg,$held);
+        ok($s->{trip}{armed},'actual negative transition and a full new interval still qualify this departure');
+        advance(1);arrive($s,$cfg,'walking');
+        is_deeply([map {$_->{kind}} @{$s->{intents}}],['door_open'],'legitimate later walk retains its door permission');
+    }
+};
+
+subtest 'F-14: held negatives before Home exit start a new full interval without another measurement' => sub {
+    for my $already_qualified (0,1) {
+        my ($c,$cfg)=fixture();$cfg->{phoneSignalMode}='state';
+        my $s=GP_State($c,'Geo.Test',0);advance(40);actor_fresh();
+        my $held=negative_samples();my $source_time=$now;
+        phone_tick($s,$cfg,$held);
+        if ($already_qualified) {advance(180);phone_tick($s,$cfg,$held);ok($s->{phone}{qualified},'earlier absence was qualified');}
+        advance(10);process($s,$cfg,'Home',0);my $exit=$now;
+        phone_tick($s,$cfg,$held);my $since=$s->{phone}{negative_since};
+        ok(defined($since),'unchanged valid negatives started a new qualification after Home exit');
+        ok(!$s->{trip}{armed},'Home exit did not reuse the previous interval');
+        advance(179);phone_tick($s,$cfg,$held);
+        ok(!$s->{trip}{armed},'179 seconds of the new interval are not enough');
+        advance(1);my $event=phone_tick($s,$cfg,$held);
+        ok($event && $event->{kind} eq 'phone_absent','full interval produced a qualified absence');
+        is(($event//{})->{time},$source_time,'source timestamp was not replaced by a poll time');
+        ok($s->{trip}{armed},'maintained absence confirmed the new Home departure');
+        is($s->{trip}{scope},'local','phone evidence did not create remote scope');
+        is($s->{trip}{away_time},$exit,'departure evidence began with the new interval');
+        is($s->{position_time},$exit,'older held observations did not rewind the Home exit');
+        is_deeply([map {$held->{$_}{time}} sort keys %$held],[($source_time)x3],'no sensor timestamp was refreshed');
+        advance(1);arrive($s,$cfg,'walking');GP_Dispatch($c,'Geo.Test',$cfg,$s,0);
+        is_deeply([grep {/^(?:door|garage) /} @commands],['door lock unlocked'],'qualified local walk opens only the door');
+    }
+};
+
+subtest 'F-14: a Home exit revokes a collected absence and measurement sources still need new observations' => sub {
+    for my $signal_mode (qw(state measurement)) {
+        my ($c,$cfg)=fixture();$cfg->{phoneSignalMode}=$signal_mode;
+        my $s=new_state();advance(40);my $held=negative_samples();phone_tick($s,$cfg,$held);
+        advance(180);$held=negative_samples() if $signal_mode eq 'measurement';
+        my $old=GP_Phone($s,$cfg,$held,$now,$mono);ok($old,'absence was collected before departure');
+        advance(10);process($s,$cfg,'Home',0);
+        GP_Process($s,$cfg,$old,$now,$mono);
+        ok(!$s->{trip}{armed},'collected old event cannot authorize the new trip');
+        phone_tick($s,$cfg,$held);advance(180);phone_tick($s,$cfg,$held);
+        if ($signal_mode eq 'state') {ok($s->{trip}{armed},'new held-state interval can qualify');}
+        else {
+            ok(!$s->{trip}{armed},'old measurements cannot qualify after the Home exit');
+            advance(1);phone_tick($s,$cfg,negative_samples());
+            advance(179);phone_tick($s,$cfg,negative_samples());ok(!$s->{trip}{armed},'new measurements need the full interval');
+            advance(1);phone_tick($s,$cfg,negative_samples());ok($s->{trip}{armed},'renewed measurements still qualify normally');
+        }
+    }
+};
+
+subtest 'R-05: production and live debug read one immutable phone snapshot per timer' => sub {
+    my ($c,$cfg)=fixture();my $prod=GP_State($c,'Geo.Test',0);my $debug=GP_State($c,'Geo.Test',1);
+    advance(40);my $samples=negative_samples();$samples->{p1}{value}='present';
+    my $raw=JSON::PP::encode_json($samples);my $reads=0;
+    no warnings qw(redefine once);
+    local *GP_PhoneSamples=sub {$reads++;return $samples;};
+    GeoPresence_Timer($c);
+    is($reads,1,'both due contexts shared one source read');
+    is($prod->{phone}{state},'present','production processed the source');
+    is($debug->{phone}{state},'present','live debug processed the same source');
+    isnt($prod->{phone},$debug->{phone},'phone continuity belongs to each context');
+    is(JSON::PP::encode_json($samples),$raw,'neither context mutated the shared snapshot');
+    advance(5);GeoPresence_Timer($c);is($reads,2,'next due poll read the sources only once again');
+    $debug->{phone_mode}='simulated';$debug->{sim_phone}='absent';
+    advance(5);GeoPresence_Timer($c);is($reads,3,'simulated debug did not add a live-source read');
+    ok(defined($debug->{phone}{negative_since}) && !defined($prod->{phone}{negative_since}),
+        'simulated debug qualification did not change production continuity');
+};
+
+subtest 'R-05: a later completed absence cannot retroactively authorize an earlier Home entry' => sub {
+    for my $negative_before_exit (0,1) {
+        for my $return (qw(before_deadline future_date late_observation after_deadline)) {
+            my ($c)=fixture();mode('GP','debug');attribute('Geo.Test','phoneSignalMode','state');
+            mode('GP','active');GeoPresence_Timer($c);
+            my $cfg=GP_Config($c,'Geo.Test');my $s=GP_State($c,'Geo.Test',0);
+            my $sensors=sub {
+                for my $name (qw(p1 p2 p3)) {
+                    my $value=$name eq 'p1' && $_[0] ? 'present':'absent';
+                    reading($name,'state',$value,$now);reading($name,'presence',$value,$now);
+                }
+            };
+            advance(40);actor_fresh();$sensors->(!$negative_before_exit);GeoPresence_Timer($c);
+            advance(10);http($c,form($cfg,'Home',0,$now));advance(3);GeoPresence_Timer($c);
+            advance(5);$sensors->(0) unless $negative_before_exit;GeoPresence_Timer($c);
+            my $since=$s->{phone}{negative_since};ok(defined($since),'new absence interval is running');
+            advance($return eq 'before_deadline' ? 100:$return eq 'after_deadline' ? 181:170);
+            my $body=form($cfg,'Home',1,$now+($return eq 'future_date' ? 20:0),motion=>'walking');
+            if ($return eq 'late_observation') {advance(10);GeoPresence_Timer($c);}
+            http($c,$body);
+            advance($return eq 'after_deadline' || $return eq 'late_observation' ? 3:180-($mono-$since));
+            GeoPresence_Timer($c);
+            if ($return eq 'after_deadline') {
+                ok($s->{trip}{armed} && $s->{arrival},'return after the actual deadline stays eligible even before the next poll');
+            } else {ok(!$s->{arrival},"$return cannot acquire a later absence confirmation");}
+            is(scalar(grep {/^(?:door|garage) /} @commands),0,'no premature actor command');
+            advance(61);GeoPresence_Timer($c);
+            is_deeply([grep {/^(?:door|garage) /} @commands],$return eq 'after_deadline' ? ['door lock unlocked']:[],
+                "$return: only a return after the full window can open");
+        }
+    }
+};
+
+subtest 'R-05: a fresh but delayed phone return must follow its full absence window' => sub {
+    my ($c,$cfg)=fixture();$cfg->{phoneSignalMode}='state';my $s=new_state();advance(40);
+    process($s,$cfg,'Home',0);advance(1);my $negative=negative_samples();phone_tick($s,$cfg,$negative);
+    advance(170);my $positive=negative_samples();$positive->{p1}{value}='present';
+    advance(10);phone_tick($s,$cfg,$negative);ok($s->{trip}{armed},'absence confirmation was processed first');
+    advance(1);my $event=phone_tick($s,$cfg,$positive);
+    ok($event && $event->{arrival},'delayed actual phone return remained fresh');
+    ok(!$s->{trip} && !$s->{arrival},'return observed before the full window closed the outing');
+    is(scalar @{$s->{intents}},0,'late processing did not grant that early return an opening');
+};
+
 subtest 'state-only sensors qualify absence without periodic repeat messages' => sub {
     for my $walk (0,1) {
         my ($c,$cfg)=fixture();$cfg->{sourceMode}='phone_only' unless $walk;
@@ -1441,6 +2018,32 @@ subtest 'held source faults invalidate old samples and restart the full absence 
     advance(1);$held->{p2}{time}=$now;phone_tick($s,$cfg,$held);
     advance(179);phone_tick($s,$cfg,$held);ok(!$s->{trip}{armed},'new observation starts a complete 180 s interval');
     advance(1);phone_tick($s,$cfg,$held);ok($s->{trip}{armed},'new observation and stable coverage requalify');
+};
+
+subtest 'qualified phone absence still detects faults and requires a full renewed interval' => sub {
+    for my $signal (qw(state measurement)) {
+        my ($c,$cfg)=fixture();$cfg->{sourceMode}='phone_only';$cfg->{phoneSignalMode}=$signal;
+        my $s=new_state();advance(40);my $samples=negative_samples();phone_tick($s,$cfg,$samples);
+        advance(90);$samples=negative_samples() if $signal eq 'measurement';phone_tick($s,$cfg,$samples);
+        advance(90);phone_tick($s,$cfg,$samples);
+        ok($s->{phone}{qualified},"$signal: full renewed interval qualified absence");
+        advance(5);ok(!phone_tick($s,$cfg,$samples),'continued qualified absence emits no second event');
+        is($s->{phone}{state},'absent','healthy unchanged negatives retain absence');
+        is($s->{phone}{health},$signal eq 'state' ? 'held':'fresh','healthy unchanged negatives retain source health');
+        advance(1);$samples->{p2}{healthy}=0;phone_tick($s,$cfg,$samples);
+        ok(!$s->{phone}{qualified},'source fault invalidates an already completed qualification');
+        is($s->{phone}{health},'unknown','fault remains visible after prior qualification');
+        advance(1);$samples->{p2}{healthy}=1;phone_tick($s,$cfg,$samples);
+        advance(180);phone_tick($s,$cfg,$samples);
+        ok(!$s->{phone}{qualified},'recovery with old observations cannot restore qualification');
+        advance(1);$samples=negative_samples();phone_tick($s,$cfg,$samples);
+        advance(90);$samples=negative_samples();phone_tick($s,$cfg,$samples);
+        advance(89);phone_tick($s,$cfg,$samples);
+        ok(!$s->{phone}{qualified},'179 seconds of the new interval are insufficient');
+        advance(1);my $event=phone_tick($s,$cfg,$samples);
+        ok($event && $s->{phone}{qualified},'new observations and the full interval requalify absence');
+        is(scalar @{$s->{intents}},0,'status-only qualification grants no action');
+    }
 };
 
 subtest 'negative events are ordered and cannot survive an arrival or a clock reset' => sub {
@@ -2000,7 +2603,7 @@ subtest '15 second false Home visit during an armed walk cancels and later arriv
 subtest 'new phone arrival confirms early, continuous room presence does not' => sub {
     for my $arrival (0,1) {
         my ($c,$cfg,$s)=pending_fixture('walking');advance(5);
-        GP_Process($s,$cfg,{kind=>'phone_present',time=>$now,received=>$now,arrival=>$arrival,key=>'new-phone'},$now,$mono);
+        GP_Process($s,$cfg,{kind=>'phone_present',time=>$now,received=>$now,generation=>$s->{generation},arrival=>$arrival,key=>'new-phone'},$now,$mono);
         is($s->{phase},'home','local phone establishes home');ok(!$s->{arrival},'pending wait cleared');
         is(scalar @{$s->{intents}},$arrival ? 1:0,'only an actual return supplies the early opening');
         GP_Dispatch($c,'Geo.Test',$cfg,$s,0,$now,$mono);
@@ -2013,7 +2616,7 @@ subtest 'phone detected 200 seconds after walking entry cannot issue another doo
     my ($c,$cfg,$s)=pending_fixture('walking');advance(60);GP_ConfirmArrival($s,$cfg,$now,$mono);
     GP_Dispatch($c,'Geo.Test',$cfg,$s,0,$now,$mono);
     actor_event($c,'feedback','pulse_state','confirmed');GP_ActorFeedback($c,$now,$mono);
-    advance(140);GP_Process($s,$cfg,{kind=>'phone_present',time=>$now,received=>$now,arrival=>1,key=>'later-phone'},$now,$mono);
+    advance(140);GP_Process($s,$cfg,{kind=>'phone_present',time=>$now,received=>$now,generation=>$s->{generation},arrival=>1,key=>'later-phone'},$now,$mono);
     GP_Dispatch($c,'Geo.Test',$cfg,$s,0,$now,$mono);
     is_deeply(\@commands,['door lock unlocked'],'one trip, one opening even after completed feedback');
 };
@@ -2318,7 +2921,8 @@ subtest 'recent phone decisions retain their actual source without inheriting st
     is($s->{trace}[-1]{source},'phone_snapshot','held snapshot records source');
     advance(60);
     GP_Process($s,$cfg,{kind=>'phone_absent',time=>$now-1,received=>$now,generation=>$s->{generation},
-        negative_generation=>$s->{phone}{negative_generation}},$now,$mono);
+        negative_generation=>$s->{phone}{negative_generation},negative_wall=>$now-1,negative_since=>$mono-1,
+        qualified_at=>$now-1,qualified_mono=>$mono-1},$now,$mono);
     is($s->{trace}[-1]{reason},'phone absence qualified','phone absence was processed');
     is($s->{trace}[-1]{source},'phone_absent','qualified absence records source');
     ok(!exists($s->{trace_context}),'temporary observation context does not survive processing');
@@ -3554,7 +4158,8 @@ subtest 'GP-F11-001: an interrupted or superseded approach cannot donate motion 
         advance(1);
         if ($boundary eq 'phone') {
             GP_Process($s,$cfg,{kind=>'phone_absent',generation=>$s->{generation},time=>$now,received=>$now,
-                negative_generation=>$s->{phone}{negative_generation}//0,negative_wall=>$now,negative_since=>$mono},$now,$mono);
+                negative_generation=>$s->{phone}{negative_generation}//0,negative_wall=>$now,negative_since=>$mono,
+                qualified_at=>$now,qualified_mono=>$mono},$now,$mono);
             ok(!$s->{approach} && $s->{phase} eq 'away','qualified phone absence ends the approach before Home');
         } elsif ($boundary eq 'timeout') {
             $cfg->{approach_timeout}=5;advance(5);GP_TickState($s,$cfg,$now,$mono);

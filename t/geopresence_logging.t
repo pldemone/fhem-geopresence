@@ -188,14 +188,15 @@ subtest 'Readable zone changes; reject duplicates and stale observations' => sub
 
 subtest 'Phone state summaries and normal verbose filter' => sub {
     fixture();
-    my $e={kind=>'phone_present',time=>$wall,received=>$wall,key=>'phone-1'};
+    my $e={kind=>'phone_present',time=>$wall,received=>$wall,generation=>$s->{generation},key=>'phone-1'};
     GP_Process($s,$cfg,$e,$wall,$mono); flush();
     like(output(),qr/Arrived home \(phone detected\)/,'phone arrival summary');
     tick(); GP_Process($s,$cfg,{%$e,time=>$wall,received=>$wall,key=>'phone-2'},$wall,$mono); flush();
     is(scalar @normal,1,'continuous phone presence not repeated');
     tick();
     my $away={kind=>'phone_absent',time=>$wall,received=>$wall,generation=>$s->{generation},
-        negative_generation=>$s->{phone}{negative_generation},negative_wall=>$wall,negative_since=>$mono};
+        negative_generation=>$s->{phone}{negative_generation},negative_wall=>$wall,negative_since=>$mono,
+        qualified_at=>$wall,qualified_mono=>$mono};
     GP_Process($s,$cfg,$away,$wall,$mono); flush();
     like(output(),qr/Marked absent \(phone absence confirmed\)/,'qualified phone absence summary');
     GP_Process($s,$cfg,$away,$wall,$mono); flush();
