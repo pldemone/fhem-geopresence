@@ -275,7 +275,7 @@ def check_parameter_cleanup(command, repo, check):
     before = json.loads(command(snapshot))
     device_list = "{ join(' ',sort grep { !$defs{$_}{TEMPORARY} } keys %defs) }"
     devices = command(device_list)
-    secret = command("{ (getKeyValue('GeoPresence_Geo.Test_auth'))[1] }")
+    secret = command("{ (GP_ReadAuth('Geo.Test'))[1] }")
     # Represent an in-memory configuration loaded by the preceding module.
     # These names must not be registerable with the new module itself.
     command("{ $attr{'Geo.Test'}{phoneAggregate}='phone';; $attr{'Geo.Test'}{absenceProxies}='p1';; "
@@ -294,7 +294,7 @@ def check_parameter_cleanup(command, repo, check):
           "cleanup retains residents, locations, actions, rules, sensors, aggregation and FHEMWEB devices")
     check(command("reload 98_GeoPresence.pm") == "", "clean configuration reloads with the new module")
     check(json.loads(command(snapshot)) == before, "reload retains resident modes and configured sources")
-    check(command("{ (getKeyValue('GeoPresence_Geo.Test_auth'))[1] }") == secret,
+    check(command("{ (GP_ReadAuth('Geo.Test'))[1] }") == secret,
           "cleanup and reload preserve the existing webhook password record")
     check(command("get GP validate").startswith("OK:"), "cleaned configuration validates after reload")
     for device, removed in (("GP", "webDevice"), ("Geo.Test", "phoneAggregate"), ("Geo.Test", "absenceProxies")):
@@ -574,6 +574,132 @@ def check_http_quotas(command, http_request, request, auth_headers, password, ch
                 "GP_ResetController($defs{GP});; GeoPresence_Timer($defs{GP});; return 'quota fixture cleared' }")
 
 
+def check_auth_key_names(command, http_request, auth_headers, password, check):
+    """Use the real regex-based FHEM store with colliding legacy names."""
+    other_password = "other_password_0123456789"
+    for line in ("define rr_Key ROOMMATE", "define GeoBA GeoPresence resident GP rr_Key",
+                 "attr GeoBA sourceMode geofency_only", "attr GeoBA webhookUser key-user",
+                 f"set GeoBA webhookPassword {other_password}", "set GeoBA mode debug"):
+        result = command(line)
+        check("stored" in result if "webhookPassword" in line else result == "",
+              "prepare independent key-store login: " + " ".join(line.split()[:3])
+              + ("" if "webhookPassword" in line else ": " + result))
+    other_headers = dict(auth_headers(), Authorization="Basic " + base64.b64encode(f"key-user:{other_password}".encode()).decode())
+
+    def post(headers):
+        return http_request("POST", "/fhem/geopresence", "isTest=invalid", headers)[0]
+
+    def check_foreign_lines():
+        check(command("{ my ($err,@lines)=FileRead('./FHEM/FhemUtils/uniqueID');; "
+                      "return !$err && (grep {$_ eq 'GeoPresence_GeoCA_auth:foreign value'} @lines) "
+                      "&& (grep {$_ eq '# GP-R11-001 retained comment'} @lines) ? 1:0 }") == "1",
+              "GP-R11-001 exact cleanup preserves foreign entries and comments")
+
+    try:
+        check(command("rename Geo.Test Geo.A") == "", "GP-R11-001 prepare dotted person name")
+        check(command("{ my $file='./FHEM/FhemUtils/uniqueID';; my ($err,@lines)=FileRead($file);; die $err if $err;; "
+                      "my $a=GP_AuthKey('Geo.A');; my $b=GP_AuthKey('GeoBA');; "
+                      "my $first=(GP_ReadAuth('Geo.A'))[1];; my $second=(GP_ReadAuth('GeoBA'))[1];; "
+                      "return FileWrite($file,(grep {index($_,$a.':')!=0 && index($_,$b.':')!=0} @lines),"
+                      "'GeoPresence_GeoBA_auth:'.$second,'GeoPresence_Geo.A_auth:'.$first,"
+                      "'GeoPresence_GeoCA_auth:foreign value','# GP-R11-001 retained comment') // 'seeded' }") == "seeded",
+              "GP-R11-001 seed exact old-format entries with distinct passwords")
+        command("{ GP_ResetController($defs{GP});; GeoPresence_Timer($defs{GP});; return 'reset' }")
+        check(post(auth_headers()) == 400 and post(other_headers) == 400,
+              "GP-R11-001 legacy lookup does not confuse names matched by a dot")
+        check(command("{ defined((getKeyValue(GP_AuthKey('Geo.A')))[1]) ? 1:0 }") == "0",
+              "GP-R11-001 reading a legacy password does not write a new key")
+        for old, new in (("Geo.A", "GeoXA"), ("GeoXA", "Geo.A")):
+            check(command(f"rename {old} {new}") == "", "GP-R11-001 rename succeeds: " + old + " to " + new)
+            command("{ GP_ResetController($defs{GP});; GeoPresence_Timer($defs{GP});; return 'reset' }")
+            check(post(auth_headers()) == 400, "GP-R11-001 migrated password authenticates with a cold cache")
+            check(post(other_headers) == 400, "GP-R11-001 unrelated password authenticates with a cold cache")
+            check(command("{ defined((GP_ReadAuth('" + old + "'))[1]) ? 1:0 }") == "0",
+                  "GP-R11-001 old exact key is absent")
+            check_foreign_lines()
+        command("{ my $file='./FHEM/FhemUtils/uniqueID';; my ($err,@lines)=FileRead($file);; die $err if $err;; "
+                "return FileWrite($file,@lines,'GeoPresence_Geo.A_auth:'.(GP_ReadAuth('Geo.A'))[1]) }")
+        check("stored" in command(f"set Geo.A webhookPassword {password}"), "GP-R11-001 password change cleans a dotted legacy key")
+        check(post(auth_headers()) == 400 and post(other_headers) == 400, "GP-R11-001 password change preserves both logins")
+        check_foreign_lines()
+    finally:
+        command("{ CommandRename(undef,'GeoXA Geo.Test') if $defs{GeoXA};; "
+                "CommandRename(undef,'Geo.A Geo.Test') if $defs{'Geo.A'};; return 'restored' }")
+        command("delete GeoBA")
+        command("delete rr_Key")
+        command("{ GP_ResetController($defs{GP});; GeoPresence_Timer($defs{GP});; return 'reset' }")
+    check(command("get GP validate").startswith("OK:"), "GP-R11-001 original configuration validates after key-store checks")
+
+
+def check_lifecycle(command, request, advance, web_port, check):
+    """Check real FHEM renames, credential storage and ROOMMATE failures."""
+    original_offset = float(command("{ $main::GP_fixture_offset }"))
+    try:
+        with socket.create_connection(("127.0.0.1", web_port), timeout=4) as partial:
+            partial.sendall(b"POST /fhem/geopresence HTTP/1.1\r\n")
+            for _ in range(10):
+                if command("{ scalar keys %{$defs{GP}{helper}{gp_http}{clients}} }") == "1":
+                    break
+            else:
+                raise AssertionError("rename test client was not accepted")
+            check(command("rename GP GP.Renamed") == "", "F-13 real controller rename succeeds")
+            check(command("{ exists $selectlist{'GeoPresenceHTTP:GP'} ? 1:0 }") == "0", "F-13 old listener is deregistered")
+            check(partial.recv(1) == b"", "F-13 partial old client is closed")
+        command("{ GeoPresence_Timer($defs{'GP.Renamed'});; return 'ticked' }")
+        check(command("{ $defs{'GP.Renamed'}{helper}{gp_http}{server}{OWNER} }") == "GP.Renamed",
+              "F-13 reopened listener belongs to the renamed controller")
+        check(command("{ $defs{'Geo.Test'}{DEF} }") == "resident GP.Renamed rr_Test", "F-13 resident definition follows controller")
+        check(command("{ $defs{'A.Door'}{DEF} }") == "action GP.Renamed door_open", "F-13 action definition follows controller")
+        check(request("Home", 1, debug=True)[0] == 200, "F-13 renamed controller accepts a real authenticated webhook")
+        command("save")
+        check(command("{ my ($err,@lines)=FileRead('test.cfg');; return scalar grep {/^define Geo.Test GeoPresence resident GP.Renamed rr_Test/} @lines }") == "1",
+              "F-13 save persists the repaired parent definition")
+        check(command("rename GP.Renamed GP") == "", "F-13 controller can be renamed back")
+        command("{ GeoPresence_Timer($defs{GP});; return 'ticked' }")
+        secret = command("{ (GP_ReadAuth('Geo.Test'))[1] }")
+        check(command("rename Geo.Test Geo.Renamed") == "", "F-13 real resident rename succeeds")
+        check(command("{ (GP_ReadAuth('Geo.Renamed'))[1] }") == secret, "F-13 verifier moved in the real key store")
+        check(command("{ defined((GP_ReadAuth('Geo.Test'))[1]) ? 1:0 }") == "0", "F-13 old credential key was removed")
+        check(command("{ $defs{'Z.Home'}{DEF} }") == "location Geo.Renamed home", "F-13 private location definition follows resident")
+        check(request("Home", 1, debug=True)[0] == 200, "F-13 renamed resident keeps its existing webhook login")
+        check("unknown resident Geo.Test" in command("get GP validate"), "F-13 unresolved public rule references remain visible")
+        command("save")
+        check(command("{ my ($err,@lines)=FileRead('test.cfg');; return scalar grep {/^define Z.Home GeoPresence location Geo.Renamed home/} @lines }") == "1",
+              "F-13 save persists the repaired resident binding")
+        check(command("rename Geo.Renamed Geo.Test") == "", "F-13 resident can be renamed back")
+        command("save")
+        check(command("get GP validate").startswith("OK:"), "F-13 original public configuration validates again")
+
+        check(command("set Geo.Test mode active") == "", "F-17 resident activation succeeds")
+        check(command("set GP mode active") == "", "F-17 controller activation succeeds")
+        command("set rr_Test state absent")
+        advance(40)
+        command("{ $main::GP_r11_set_fn=$modules{ROOMMATE}{SetFn};; "
+                "no warnings 'redefine';; *GP_R11RoommateSet=sub { return 'temporary ROOMMATE failure' };; "
+                "$modules{ROOMMATE}{SetFn}='GP_R11RoommateSet';; return 'failure installed' }")
+        check(request("Home", 1)[0] == 200, "F-17 status-only Home observation enters through HTTP")
+        advance(3)
+        check("temporary ROOMMATE failure" in command("{ ReadingsVal('Geo.Test','gp_roommate_error','') }"),
+              "F-17 real CommandSet failure is exposed in the resident Reading")
+        check(command("{ $defs{GP}{helper}{gp}{prod}{'Geo.Test'}{desired_status} }") == "home",
+              "F-17 unsuccessful status request remains pending")
+        command("{ $modules{ROOMMATE}{SetFn}=$main::GP_r11_set_fn;; return 'restored' }")
+        advance(1)
+        check(command("{ ReadingsVal('rr_Test','state','') }") == "home", "F-17 next timer retry uses the real ROOMMATE adapter")
+        check(command("{ ReadingsVal('Geo.Test','gp_roommate_error','missing') }") == "", "F-17 recovery clears the error Reading")
+        check(command("{ ReadingsVal('door','state','untouched') }") == "untouched"
+              and command("{ ReadingsVal('garage','state','untouched') }") == "untouched",
+              "F-17 retry does not create an opening permission")
+    finally:
+        command("{ $modules{ROOMMATE}{SetFn}=$main::GP_r11_set_fn if defined $main::GP_r11_set_fn;; "
+                "CommandRename(undef,'Geo.Renamed Geo.Test') if $defs{'Geo.Renamed'};; "
+                "CommandRename(undef,'GP.Renamed GP') if $defs{'GP.Renamed'};; return 'restored' }")
+        command("set GP mode debug")
+        command("set Geo.Test mode debug")
+        command(f"{{ $main::GP_fixture_offset={original_offset};; GP_ResetController($defs{{GP}});; "
+                "GeoPresence_Timer($defs{GP});; return 'fixture restored' }")
+
+
 def run(source, encoding="bytestream", help_only=False):
     repo = Path(__file__).resolve().parents[1]
     with tempfile.TemporaryDirectory(prefix="geopresence-test-") as directory:
@@ -778,6 +904,8 @@ def run(source, encoding="bytestream", help_only=False):
             # Controlled clock affects only this copied module in this process.
             command("{ no warnings 'redefine';; $main::GP_fixture_offset=0;; *GP_Now=sub { ($main::GP_fixture_fixed_wall // Time::HiRes::time())+$main::GP_fixture_offset };; *GP_Mono=sub { Time::HiRes::clock_gettime(Time::HiRes::CLOCK_MONOTONIC())+$main::GP_fixture_offset };; return 'clock set' }")
             check_http_quotas(command, http_request, request, auth_headers, password, check)
+            check_lifecycle(command, request, advance, web_port, check)
+            check_auth_key_names(command, http_request, auth_headers, password, check)
             check(command("attr GP verbose 4") == "", "normal controller verbosity accepted")
             check(command("attr GP logFile ./log/geopresence-%Y-%m.log") == "", "separate monthly diagnostic log configured")
             check(command("define GP.LogFile FileLog ./log/geopresence-%Y-%m.log .* readonly") == "", "optional FHEMWEB log viewer syntax accepted")
@@ -1694,6 +1822,8 @@ def run(source, encoding="bytestream", help_only=False):
             check(command("define rr_R07 ROOMMATE") == "", "prepare unrelated R-07 resident")
             for reason, callback in (("manual Home", "set rr_Test home"),
                                      ("expired", "{ Time::HiRes::sleep(1.5) }"),
+                                     ("controller rename", "{ CommandRename(undef,'GP GP.R11'), CommandRename(undef,'GP.R11 GP') }"),
+                                     ("resident rename", "{ CommandRename(undef,'Geo.Test Geo.R11Temp'), CommandRename(undef,'Geo.R11Temp Geo.Test') }"),
                                      ("unrelated configuration", "define Geo.R07 GeoPresence resident GP rr_R07"),
                                      ("alias", "attr Geo.Test alias R07 name"),
                                      ("alias deletion", "deleteattr Geo.Test alias"),
@@ -1735,12 +1865,15 @@ def run(source, encoding="bytestream", help_only=False):
                 check(command("{ ReadingsVal('door','state','') }") == "lock unlocked",
                       "R-07 first door command executes: " + reason)
                 unrelated = reason == "unrelated configuration"
-                allowed = reason not in ("manual Home", "expired", "clock correction during wait", "ROOMMATE functional pattern")
+                renamed = reason in ("controller rename", "resident rename")
+                allowed = not renamed and reason not in ("manual Home", "expired", "clock correction during wait", "ROOMMATE functional pattern")
                 check(command("{ ReadingsVal('garage','state','') }") == ("on" if allowed else "untouched"),
                       "R-07 remaining garage command respects current permission: " + reason)
                 changed = json.loads(command("get GP explain Geo.Test prod format=json"))["state"]
                 if allowed:
                     permission_valid = changed["output_revision"] == planned["output_revision"]
+                elif renamed:
+                    permission_valid = not changed or changed["generation"] != planned["generation"]
                 elif reason in ("manual Home", "ROOMMATE functional pattern"):
                     permission_valid = changed["output_revision"] > planned["output_revision"]
                 else:
@@ -1754,7 +1887,7 @@ def run(source, encoding="bytestream", help_only=False):
                     check(command("{ GP_Config($defs{GP},'Geo.Test',0)->{label} }") == "rr_Test",
                           "ROOMMATE pattern refreshes the cached message label")
                     check(command("attr rr_Test rr_locationUnderway underway") == "", "restore ROOMMATE guard")
-                if reason.startswith("controller"):
+                if reason in ("controller pattern", "controller all"):
                     check("Controller configuration requires" in command("{ $main::GP_fixture_delete_result }"),
                           "R-07 rejects the real controller bulk deletion before committing it")
                     check(command("{ AttrVal('GP','action_max_age','missing') }") == "2",
@@ -1769,7 +1902,8 @@ def run(source, encoding="bytestream", help_only=False):
                     actor_reading("lower", "state", "closed")
                 actor_reading("feedback", "pulse_state", "confirmed")
                 advance(1)
-                check(json.loads(command("get GP explain Geo.Test prod format=json"))["state"]["door_result"] == "confirmed",
+                completed = json.loads(command("get GP explain Geo.Test prod format=json"))
+                check("door" not in completed["pending_actors"] if renamed else completed["state"]["door_result"] == "confirmed",
                       "R-07 retains feedback for the issued door command")
             check(command("delete rr_R07") == "", "remove unrelated R-07 ROOMMATE")
             command("set GP mode debug")

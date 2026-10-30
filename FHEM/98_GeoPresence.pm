@@ -164,9 +164,50 @@ sub GP_UpdateAttrLists {
     }
 }
 
+sub GP_AuthKey { return 'GeoPresence_auth_v2_'.sha256_hex($_[0]); }
+
+# FHEM treats key names as regex patterns. New keys use only a fixed prefix
+# and hex digits; legacy names must be compared literally in the same file.
+sub GP_AuthPath {
+    my $file=GP_Attr('global','keyFileName','uniqueID');
+    $file =~ s/\.\.//g;
+    return GP_Attr('global','modpath','.').'/FHEM/FhemUtils/'.$file;
+}
+
+sub GP_ReadAuth {
+    my ($resident)=@_;
+    my ($error,@lines)=FileRead(GP_AuthPath());
+    return ($error,undef) if $error;
+    my $current=GP_AuthKey($resident).':';
+    my $old='GeoPresence_'.$resident.'_auth:';
+    my $legacy;
+    for my $line (@lines) {
+        return (undef,substr($line,length $current)) if index($line,$current)==0;
+        $legacy=substr($line,length $old) if !defined($legacy) && index($line,$old)==0;
+    }
+    return (undef,$legacy);
+}
+
+sub GP_StoreAuth {
+    my ($resident,$secret)=@_;
+    my $error=setKeyValue(GP_AuthKey($resident),$secret);
+    return $error if $error;
+    my $file=GP_AuthPath();
+    my @lines;
+    ($error,@lines)=FileRead($file);
+    return $error if $error;
+    my $prefix='GeoPresence_'.$resident.'_auth:';
+    my $count=@lines;
+    @lines=grep {index($_,$prefix)!=0} @lines;
+    return @lines==$count ? undef:FileWrite($file,@lines);
+}
+
 sub GP_Auth {
     my ($resident)=@_;
-    $GP_AUTH{$resident}//=[getKeyValue('GeoPresence_'.$resident.'_auth')];
+    unless ($GP_AUTH{$resident}) {
+        my $error=GP_Read($resident,'gp_auth_error','');
+        $GP_AUTH{$resident}=$error ? [$error,undef] : [GP_ReadAuth($resident)];
+    }
     return @{$GP_AUTH{$resident}};
 }
 
@@ -175,6 +216,7 @@ sub GeoPresence_Initialize {
     $hash->{DefFn} = 'GeoPresence_Define';
     $hash->{UndefFn} = 'GeoPresence_Undef';
     $hash->{DeleteFn} = 'GeoPresence_Delete';
+    $hash->{RenameFn} = 'GeoPresence_Rename';
     $hash->{SetFn} = 'GeoPresence_Set';
     $hash->{GetFn} = 'GeoPresence_Get';
     $hash->{AttrFn} = 'GeoPresence_Attr';
@@ -352,6 +394,10 @@ sub GP_Log {
             .($event eq 'configuration_invalid' ? 'Invalid configuration; processing suspended.' : 'Configuration valid again.'));
     } elsif ($event eq 'geometry_applied') {
         GP_NormalLog($c,$level,GP_LogResident($detail->{resident}).': Location geometry confirmed for production; trips reset.');
+    } elsif ($event eq 'roommate_status_failed') {
+        GP_NormalLog($c,2,GP_LogResident($detail->{resident}).': Could not update ROOMMATE status.');
+    } elsif ($event eq 'roommate_status_ready') {
+        GP_NormalLog($c,3,GP_LogResident($detail->{resident}).': ROOMMATE status update accepted again.');
     }
     return unless GP_DebugLogEnabled($c,$detail);
     my $path=GP_LogPath($c);
@@ -449,10 +495,10 @@ sub GP_DeviceNames {
 # Membership is independent of attributes. Administrative callers must not
 # compile adapters, rules or validation just to enumerate residents.
 sub GP_Inventory {
-    my ($c)=@_;
+    my ($c,$devices)=@_;
     return $c->{helper}{gp_devices} if $c->{helper}{gp_devices};
     my $inventory={devices=>[],residents=>[],members=>{},kinds=>{}};
-    for my $name (sort keys %defs) {
+    for my $name (sort($devices ? (map {$_->{NAME}} @$devices) : keys %defs)) {
         my $d=$defs{$name};
         next unless ($d->{TYPE}//'') eq 'GeoPresence' && ($d->{CONTROLLER}//'') eq $c->{NAME};
         push @{$inventory->{devices}},$name;
@@ -513,6 +559,8 @@ sub GP_Catalog {
     my $inventory=GP_Inventory($c);
     my $catalog={%{GP_Dependencies($c)},actions=>{},rules=>{},locations=>{},users=>{},common_errors=>[],
         rule_errors=>{},target_errors=>{},config=>{},views=>{},errors=>{}};
+    push @{$catalog->{common_errors}},"$_: invalid GeoPresence device name"
+        for grep {!GP_Name($_)} @{$inventory->{devices}};
     my (%devices,%users,%roommates,%signatures);
     for my $r (@{$inventory->{residents}}) {
         my $rr=$defs{$r}{ROOMMATE}//'';
@@ -699,7 +747,6 @@ sub GeoPresence_Define {
             unless $args[1] =~ /\A(?:home|outer|approach|place)\z/;
         $hash->{ROLE}=$args[1];
         GP_ConfigChanged($c,$hash);
-        GP_UpdateAttrLists();
         return;
     }
     return 'Only one GeoPresence controller is supported' if $kind eq 'controller'
@@ -807,9 +854,13 @@ sub GP_ResetResident {
     GP_StoreMode($defs{$r},'disabled') if $keep ne 'learning' && GP_Mode($r) eq 'learning';
     delete $rt->{errors}{$r};
     @{$rt->{queue}}=grep {$_->{resident} ne $r} @{$rt->{queue}};
-    $rt->{resident_start}{$r}=GP_Now();
-    $rt->{resident_mono}{$r}=GP_Mono();
-    $rt->{resident_generation}{$r}++;
+    if (exists $defs{$r}) {
+        $rt->{resident_start}{$r}=GP_Now();
+        $rt->{resident_mono}{$r}=GP_Mono();
+        $rt->{resident_generation}{$r}++;
+    } else {
+        delete $rt->{$_}{$r} for qw(resident_start resident_mono resident_generation);
+    }
 }
 
 sub GeoPresence_Undef {
@@ -840,7 +891,78 @@ sub GeoPresence_Delete {
     my ($hash) = @_;
     return unless ($hash->{SUBTYPE} // '') eq 'resident';
     delete $GP_AUTH{$hash->{NAME}};
-    return setKeyValue('GeoPresence_'.$hash->{NAME}.'_auth', undef);
+    return GP_StoreAuth($hash->{NAME},undef);
+}
+
+sub GeoPresence_Rename {
+    my ($new,$old)=@_;
+    my $d=$defs{$new} or return;
+    my $c=GP_Controller($d) or return;
+    my $kind=$d->{SUBTYPE};my $rt=$c->{helper}{gp};
+    my $owner=$kind eq 'controller' ? $old:$c->{NAME};
+    my $inventory=$c->{helper}{gp_devices};
+    my @devices=$inventory
+        ? grep {defined} map {$defs{$_ eq $old ? $new:$_}} @{$inventory->{devices}}
+        : grep {($_->{TYPE}//'') eq 'GeoPresence' && ($_->{CONTROLLER}//'') eq $owner} values %defs;
+    my %affected=$kind eq 'controller' ? () : map {$_=>1} keys %{($c->{helper}{gp_output_dependencies}//{})->{$old}//{}};
+    $affected{$old}=$affected{$new}=1 if $kind eq 'resident';
+    $affected{$d->{PARENT}}=1 if $kind eq 'location';
+    for my $child (@devices) {
+        $child->{CONTROLLER}=$new if $kind eq 'controller';
+        if (($child->{PARENT}//'') eq $old) {
+            $child->{PARENT}=$new;
+            $child->{DEF} =~ s/\A(\w+\s+)\Q$old\E(?=\s|\z)/$1$new/ if defined $child->{DEF};
+        }
+        # Public rule attributes are not silently rewritten. Revoke every
+        # resident of a shared rule when its resident selector becomes stale.
+        next unless ($child->{SUBTYPE}//'') eq 'rule' && $kind =~ /\A(?:resident|action|rule)\z/;
+        next if ($kind eq 'rule' && $child!=$d)
+            || ($kind eq 'action' && GP_Attr($child->{NAME},'action','') ne $old);
+        my @res=GP_List(GP_Attr($child->{NAME},'residents',''));
+        next if $kind eq 'resident' && !grep {$_ eq $old} @res;
+        $affected{$_}=1 for @res;
+    }
+    my $auth_error;
+    if ($kind eq 'resident') {
+        for my $r (keys %affected) {
+            GP_RevokeOutputs($rt->{$_}{$r}) for grep {$rt && $rt->{$_}{$r}} qw(prod debug);
+        }
+        # The callback runs after FHEM moved the device. Never revive old plans
+        # or trust a leftover key belonging to a previous use of the new name.
+        my ($error,$secret)=GP_ReadAuth($old);
+        $error=GP_StoreAuth($new,$secret) unless $error;
+        $error=GP_StoreAuth($old,undef) unless $error;
+        delete @GP_AUTH{$old,$new};
+        if ($error) {
+            setReadingsVal($d,'gp_auth_error','Could not migrate credentials; set webhookPassword again',
+                POSIX::strftime('%Y-%m-%d %H:%M:%S',localtime(GP_Now())));
+            GP_StoreMode($d,'disabled') if GP_UsesSource(GP_Attr($new,'sourceMode','geofency_phone'),'geo');
+            $auth_error=1;
+        }
+        if ($rt) {
+            GP_ResetResident($c,$old);
+            for my $key (qw(learned http_rate)) {
+                $rt->{$key}{$new}=delete $rt->{$key}{$old} if exists $rt->{$key}{$old};
+            }
+            for my $actor (values %{$rt->{actors}}) {
+                $actor->{waiters}{$new}=delete $actor->{waiters}{$old} if exists $actor->{waiters}{$old};
+            }
+        }
+    }
+    # The old socket and clients are closed by ResetController. A later timer
+    # binds the new owner; already dispatched actors remain observed.
+    GP_InvalidateDevices($c);
+    GP_Inventory($c,\@devices);
+    if ($kind eq 'controller') {
+        GP_ResetController($c);
+    } else {
+        GP_ResetResident($c,$_) for grep {GP_Field($_,'SUBTYPE','') eq 'resident'
+            && GP_Field($_,'CONTROLLER','') eq $c->{NAME}} keys %affected;
+        GP_UpdateModes($c);
+        GP_UpdateNotifyDevices($c) if $rt;
+    }
+    GP_NormalLog($c,2,$new.': Could not migrate webhook credentials after rename; set webhookPassword again.') if $auth_error;
+    return;
 }
 
 sub GeoPresence_Attr {
@@ -3352,22 +3474,38 @@ sub GP_Publish {
     my ($c,$r,$cfg,$s)=@_;
     GP_Checkpoint($c,$r,$cfg,$s);
     return unless GP_CanOutput($c,$r,$s,$cfg,0);
-    my $rr=$defs{$r}{ROOMMATE};
     if (my $status=delete $s->{desired_status}) {
+        my $rr=$defs{$r}{ROOMMATE};
+        my $retry;
         my $current=GP_Read($rr,'state','unknown');
         my $set=($status eq 'home' && $current !~ /\A(?:home|gotosleep|asleep|awoken)\z/)
             || ($status eq 'absent' && $current !~ /\A(?:absent|gone)\z/);
+        my $error;
         if ($set) {
             local $c->{helper}{gp}{own_status}=1;
-            GP_Profile($c,'roommate_command',$rr,sub {CommandSet(undef,"$rr state $status")});
+            $error=eval {GP_Profile($c,'roommate_command',$rr,sub {CommandSet(undef,"$rr state $status")})};
+            $error=$@ if $@;
         }
+        if ($error) {
+            $error=GP_LogText($error);
+            if (($s->{roommate_error}//'') ne $error) {
+                $s->{roommate_error}=$error;
+                GP_Log($c,2,'roommate_status_failed',{resident=>$r,mode=>'active',target=>$rr,reason=>$error});
+            }
+            $retry=$status;
+        } elsif (delete $s->{roommate_error}) {
+            GP_Log($c,3,'roommate_status_ready',{resident=>$r,mode=>'active',target=>$rr,reason=>'Status update accepted'});
+        }
+        return unless GP_CanOutput($c,$r,$s,$cfg,0);
+        # Recheck after command and log callbacks; keep any newer status request.
+        $s->{desired_status}//=$retry if defined $retry;
     }
-    return unless GP_CanOutput($c,$r,$s,$cfg,0);
     my $t=$s->{trip}//{};
     my $arrival=$s->{arrival}//{};
     my %readings=(gp_phase=>$s->{phase},gp_location=>$s->{location}//'unknown',gp_trip_id=>$t->{id}//'',
         gp_trip_scope=>$t->{scope}//'unknown',gp_arrival_armed=>$t->{armed}//0,gp_away_reason=>$t->{away_reason}//'',
         gp_source_mode=>$cfg->{sourceMode},
+        gp_roommate_error=>$s->{roommate_error}//'',
         gp_resume_status=>($s->{resume}//{})->{status}//'none',
         gp_resume_reason=>($s->{resume}//{})->{reason}//'No restart recovery in this session',
         gp_phone_state=>$s->{phone}{state},gp_phone_health=>$s->{phone}{health},gp_phone_signal_mode=>$cfg->{phoneSignalMode},
@@ -3642,6 +3780,14 @@ sub GeoPresence_Notify {
                 my $inventory=$c->{helper}{gp_devices};
                 if ($event =~ /\A(DEFINED|DELETED|RENAMED|MODIFIED) (\S+)(?: (\S+))?/) {
                     my $operation=$1; my @names=grep {defined} ($2,$3);
+                    # RenameFn already revoked contexts and refreshed our own
+                    # membership. The subsequent global event needs only widgets.
+                    if ($operation eq 'RENAMED' && $inventory && $inventory->{members}{$names[1]//''}
+                        && !$inventory->{members}{$names[0]} && GP_Field($names[1],'TYPE','') eq 'GeoPresence'
+                        && GP_Field($names[1],'CONTROLLER','') eq $c->{NAME}) {
+                        GP_UpdateAttrLists();
+                        next;
+                    }
                     GP_RevokeDependentOutputs($c,@names);
                     my $own=grep {
                         ($inventory && $inventory->{members}{$_}) || (GP_Field($_,'TYPE','') eq 'GeoPresence'
@@ -3652,10 +3798,13 @@ sub GeoPresence_Notify {
                     } elsif ($own || ($catalog && grep {$catalog->{dependents}{$_}} @names)) {
                         GP_InvalidateConfig($c);
                     }
-                    # modify keeps names/types; GeoPresence's own Modify path
-                    # already updates its widgets. Only membership changes can
-                    # affect global choices, including PRESENCE devices.
-                    GP_UpdateAttrLists() if $operation ne 'MODIFIED';
+                    # Only GeoPresence/PRESENCE membership affects choices.
+                    # Keep conservative refreshes for deleted or unknown types.
+                    if ($operation ne 'MODIFIED') {
+                        my $type=GP_Field($names[$operation eq 'RENAMED' ? 1:0]//'','TYPE','');
+                        GP_UpdateAttrLists() if $operation eq 'DELETED' || !length($type)
+                            || $type =~ /\A(?:GeoPresence|PRESENCE)\z/;
+                    }
                 } elsif ($event =~ /\A(ATTR|DELETEATTR) (\S+)(?: (.*))?\z/s) {
                     my ($operation,$name,$key)=($1,$2,$3//'');
                     $key =~ s/\s.*//s if $operation eq 'ATTR';
@@ -3783,9 +3932,12 @@ sub GeoPresence_Set {
         my $bytes=''; my $n=read($random,$bytes,16); close $random;
         return 'Random source unavailable' unless defined($n) && $n==16;
         my $salt=unpack('H*',$bytes);
-        my $error=setKeyValue('GeoPresence_'.$name.'_auth',$salt.':'.sha256_hex($salt.':'.$args[0]));
+        my $error=GP_StoreAuth($name,$salt.':'.sha256_hex($salt.':'.$args[0]));
+        delete $GP_AUTH{$name};
         return $error if $error;
-        delete $GP_AUTH{$name}; delete $c->{helper}{gp}{learned}{$name};
+        setReadingsVal($hash,'gp_auth_error','',POSIX::strftime('%Y-%m-%d %H:%M:%S',localtime(GP_Now())))
+            if GP_Read($name,'gp_auth_error','');
+        delete $c->{helper}{gp}{learned}{$name};
         GP_ResetResident($c,$name); GP_UpdateModes($c);
         GP_InvalidateConfig($c);
         return 'Webhook password stored in the FHEM key store';
@@ -4030,6 +4182,7 @@ sub GP_ReportResident {
         ['Phone',GP_UsesSource($cfg->{sourceMode},'phone')
             ? ucfirst($phone->{state}//'unknown').' ('.($debug && ($s->{phone_mode}//'live') eq 'simulated' ? 'simulated' : $phone->{health}//'unknown').')' : 'Disabled by source profile; no phone fallback'],
         ['Motion',$arrival ? ucfirst($arrival->{motion}) : ucfirst(GP_ArrivalMotion($s,$cfg,$now))]);
+    push @summary,['ROOMMATE update error',$s->{roommate_error}] if $s->{roommate_error};
     if ($arrival) {
         push @summary,['Home entry received',GP_ReportTime($arrival->{started})],
             ['Confirmation due',GP_ReportTime($arrival->{deadline}).' — wait '.GP_ReportDuration($arrival->{wait})],
@@ -4411,7 +4564,7 @@ sub GP_GetData {
     <li>Choose the value, then press <b>attr</b> to apply it. For multiple selection, click the value field, select devices and press <b>OK</b> first.</li>
     <li>Reload an open detail page after defining, deleting or renaming devices to see updated choices. With no available choices, references remain text fields.</li>
   </ul>
-  <p>Existing references are not rewritten automatically; validation still reports missing devices. Standard attributes such as <code>alias</code>, <code>room</code> and <code>verbose</code> retain FHEM's framework help.</p>
+  <p>Public attribute references are not rewritten automatically; validation still reports missing devices. Internal parent bindings follow GeoPresence renames. Standard attributes such as <code>alias</code>, <code>room</code> and <code>verbose</code> retain FHEM's framework help.</p>
   <p>Use <code>help GeoPresence EN</code> or <code>help System.GeoPresence EN</code> for this complete English reference.</p>
 
   <a id="GeoPresence-define"></a>
@@ -4506,6 +4659,7 @@ set Geo.PERSON mode debug</pre>
   <h5>Activation and configuration changes</h5>
   <p>Production activation validates configuration and checks for conflicting legacy arrival paths. Set the ROOMMATE's rr_locationUnderway to underway, remove old rr_geofenceUUIDs and disable the old arrival handlers before activation. Resident and private-location configuration requires that resident to be effectively debug or disabled; shared changes require pausing all affected residents. Controller configuration requires controller debug or disabled. Changes revoke the affected journeys. Diagnostic settings debugLog, logFile and standard verbose can be changed during production without resetting trips or learning.</p>
   <h5>Persistence</h5>
+  <p>FHEM rename updates GeoPresence's internal controller and parent bindings, including saved definitions. A controller rename closes its old HTTP clients and rebinds the listener under the new owner. A resident rename moves its stored password verifier and retains its request quota. Affected trips and pending commands are revoked; already dispatched actuator feedback remains observed. Public rule and external-device attribute references require explicit correction after validation. Use save after correcting the configuration. If credential migration fails, gp_auth_error keeps authentication blocked across reloads; repair the key store and set webhookPassword again. Affected Geo residents are disabled.</p>
   <p>Use FHEM's normal save mechanism for definitions, attributes and production readings. A deviceId confirmed with learnConfirm is an ordinary configuration attribute; learnConfirm does not call save. Production geometry is stored in gp_geometry. A qualified unfinished production trip is stored as one versioned gp_trip_checkpoint reading. Version 2 stores current consumption and cooldowns instead of old visit histories; valid version 1 data is imported once without replaying actions or renewing departure evidence. After restart, rereadcfg or module reload it can resume if identity, configuration, geometry and the trip_resume_max_age limit still match and no later Home or indoor presence contradicts it. A NEW return is required; startup alone never opens, and old arrival timers, queued commands, unconfirmed departures and debug trips never resume. The checkpoint is consumed before dispatching opening commands. gp_resume_status/gp_resume_reason and explain describe restoration or rejection.</p>
   <p>A restored trip keeps its saved ID. Each new runtime context adds a fresh random session component; new trip IDs use that context and a local counter, so restarting the counters alone cannot recreate an old ID. This also applies to new debug contexts. Existing version 1 and 2 checkpoints remain readable.</p>
   <p>Checkpoints use the ordinary FHEM state file; no additional database or automatic configuration save is used. A clean shutdown writes the state file; after an abrupt crash only the last successfully written state is available, so observations missed during downtime cannot be reconstructed. Test requests never promote debug geometry or permissions. Learning results for a configured phone remain available in the current process after learnConfirm or timeout; a restart, new learning session, phone identity change or resident deletion discards them. An unconfirmed phone candidate is also discarded by cancellation, relevant configuration/password changes or module reload.</p>
@@ -5130,6 +5284,7 @@ get Geo.PERSON explain debug</pre>
 
   <a id="GeoPresence-readings"></a>
   <h4>Readings and logs</h4>
+  <p><code>gp_roommate_error</code> reports a failed ROOMMATE status update. The current desired status is retried on the next timer pass, unless a newer status or context change supersedes it. The error clears when the update is accepted or ROOMMATE already has the requested status. Repeated identical failures produce one operational warning, followed by one recovery message. These retries never create opening permissions.</p>
   <p>Production resident readings prefixed with gp_ show snapshots such as phase, location, trip and door/garage results. Locations store production geometry in gp_geometry. These readings are diagnostic and do not restore executable permissions. Debug uses get explain with debug, get debugTrace and the separate diagnostic file instead of updating readings.</p>
   <p>The normal FHEM log contains English production area transitions, phone presence changes, opening requests and feedback, switch requests and messages handed to pushMsg. A message handoff is not a delivery receipt and door pulse confirmation is not proof that the door is physically open. Configured aliases, labels and message text are kept verbatim. The standard verbose attribute controls this normal output; detailed structured diagnostics go exclusively to logFile according to debugLog, even at verbose 5.</p>
   <p>Timer statistics and diagnostic files are never used to restore permissions. Logging failures do not change webhook acceptance or decision state. The timer reuses prepared configuration and static validation until relevant configuration changes; current source health and transport errors remain live. Unchanged idle ticks report zero device scans and configuration builds. The next tick is scheduled one second after completion; statistics distinguish callback work from delays caused elsewhere in FHEM.</p>

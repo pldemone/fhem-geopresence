@@ -13,7 +13,7 @@ my (@normal,@sets,@messages,$set_error,$push_error);
 sub Log3 { push @normal, [@_]; }
 sub CommandSet { push @sets, $_[1]; return $set_error; }
 sub pushMsg { die "mock delivery interface failed\n" if $push_error; push @messages, [@_]; }
-sub getKeyValue { (undef,('a'x32).':'.('b'x64)); }
+sub FileRead { (undef,'GeoPresence_Geo.Test_auth:'.('a'x32).':'.('b'x64)); }
 sub setNotifyDev { $_[0]{NOTIFYDEV}=$_[1]; }
 sub setReadingsVal { $_[0]{READINGS}{$_[1]}={VAL=>$_[2],TIME=>$_[3]}; }
 sub InternalTimer { die 'Unexpected timer change'; }

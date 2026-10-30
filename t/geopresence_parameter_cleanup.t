@@ -11,7 +11,7 @@ sub InternalTimer { }
 sub RemoveInternalTimer { }
 sub Log3 { }
 sub deviceEvents { $_[0]{CHANGED}; }
-sub getKeyValue { return (undef, ('a' x 32) . ':' . ('b' x 64)); }
+sub FileRead { return (undef, 'GeoPresence_Geo.Test_auth:' . ('a' x 32) . ':' . ('b' x 64)); }
 require "$FindBin::Bin/../FHEM/98_GeoPresence.pm";
 sub config_event { GeoPresence_Notify($defs{GP},{NAME=>'global',CHANGED=>[@_]}); }
 

@@ -47,8 +47,7 @@ sub diagnostic_lines {
     close $file or die $!;
     return @lines;
 }
-sub getKeyValue { return (undef,$keys{$_[0]}); }
-sub setKeyValue { defined($_[1]) ? ($keys{$_[0]}=$_[1]) : delete($keys{$_[0]}); return; }
+require "$FindBin::Bin/lib/FhemKeyStore.pm";
 sub deviceEvents { return $_[0]{CHANGED}; }
 sub getAllAttr {
     my ($name)=@_;
@@ -84,6 +83,7 @@ sub device {
 sub gp_define {
     my ($name,$definition)=@_;
     my $d=device($name,'GeoPresence');
+    $d->{DEF}=$definition;
     my $err=GeoPresence_Define($d,"$name GeoPresence $definition");
     die "define $name: $err" if defined $err;
     return $d;
@@ -108,6 +108,16 @@ sub delete_attributes {
 }
 sub config_event { GeoPresence_Notify($defs{GP},{NAME=>'global',CHANGED=>[@_]}); }
 sub mode { my ($name,$value)=@_; my $error=GeoPresence_Set($defs{$name},$name,'mode',$value); die $error if defined $error; return; }
+sub rename_device {
+    my ($old,$new)=@_;
+    my $d=delete $defs{$old} or die "Missing rename source $old";
+    $defs{$new}=$d;$d->{NAME}=$new;
+    $attr{$new}=delete $attr{$old} if exists $attr{$old};
+    GeoPresence_Rename($new,$old) if $d->{TYPE} eq 'GeoPresence';
+    GeoPresence_Notify($_,{NAME=>'global',CHANGED=>["RENAMED $old $new"]})
+        for grep {($_->{TYPE}//'') eq 'GeoPresence' && ($_->{SUBTYPE}//'') eq 'controller'} values %defs;
+    return $d;
+}
 sub fixture {
     my %options=@_;
     %defs=();%attr=();%data=();%keys=();@commands=();@messages=();@reading_events=();@timers=();$on_command=undef;
@@ -1023,6 +1033,239 @@ subtest 'debug simulation, reads and activation cannot affect production' => sub
     mode('GP','active');GeoPresence_Timer($c);advance(40);
     http($c,form($cfg,'Home',1,$now));advance(3);GeoPresence_Timer($c);
     is(scalar(grep {/^(?:door|garage) /} @commands),0,'activation does not import simulated trip');
+};
+
+subtest 'F-13 controller rename repairs definitions and replaces its listener session' => sub {
+    my %module;{local %defs;GeoPresence_Initialize(\%module);}
+    is($module{RenameFn},'GeoPresence_Rename','FHEM rename callback is registered');
+    for my $cold (0,1) {
+        my ($c,$cfg)=fixture();advance(40);actor_fresh();
+        my $s=GP_State($c,'Geo.Test',0);$s->{phase}='home';
+        my $intent=output_intent($s,$cfg,'door_open',
+            {target=>'door',command=>'lock unlocked',contact=>'contact',feedbackDevice=>'feedback'});
+        $s->{intents}=[$intent];GP_Dispatch($c,'Geo.Test',$cfg,$s,0,$now,$mono);
+        my $actor=$c->{helper}{gp}{actors}{door};ok($actor,'hardware reservation exists before rename');
+        my $old_rt=$c->{helper}{gp};$s->{intents}=[{%$intent}];
+        GP_InvalidateDevices($c) if $cold;
+        rename_device('GP','GP.Renamed');
+        ok($c->{helper}{gp_devices},'global notification retains the inventory already refreshed by RenameFn');
+        is($c->{CONTROLLER},'GP.Renamed','controller owns its new name');
+        is($defs{'Geo.Test'}{DEF},'resident GP.Renamed rr_Test','resident saved definition uses the new controller');
+        is($defs{'A.Door'}{DEF},'action GP.Renamed door_open','action saved definition uses the new controller');
+        is($defs{'R.Door'}{DEF},'rule GP.Renamed','rule saved definition uses the new controller');
+        is($defs{'Z.Home'}{PARENT},'Geo.Test','location retains its resident parent');
+        ok(!exists $c->{helper}{gp_http},'old listener is closed before the callback returns');
+        ok(!GP_TimerCurrent($c,$old_rt),'old timer session cannot issue later outputs');
+        is($c->{helper}{gp}{actors}{door},$actor,'already dispatched operation stays observed');
+        GP_Dispatch($c,'Geo.Test',$cfg,$s,0,$now,$mono);
+        is(scalar @commands,1,'a plan extracted from the old context is not repeated');
+        GeoPresence_Timer($c);
+        ok($c->{helper}{gp}{ready},'new controller session opens the listener');
+        is((http($c,form($cfg,'Home',1,$now)))[0],200,'webhooks remain available under the renamed controller');
+        advance(1);actor_event($c,'feedback','pulse_state','confirmed');GP_ActorFeedback($c,$now,$mono);
+        ok(!exists $c->{helper}{gp}{actors}{door},'the existing operation can still complete');
+    }
+};
+
+subtest 'F-13 resident rename preserves credentials and quota while revoking affected journeys' => sub {
+    for my $shared (0,1) {
+        my ($c)=shared_actor_fixture();advance(40);
+        unless ($shared) {
+            $attr{$_}{residents}='Geo.Test' for qw(R.Door R.Late R.Work);
+            GP_InvalidateDevices($c);
+        }
+        my $cfg=GP_Config($c,'Geo.Test');my $other_cfg=GP_Config($c,'Geo.Other');
+        my $s=GP_State($c,'Geo.Test',0);my $other=GP_State($c,'Geo.Other',0);
+        my $listener=$c->{helper}{gp_http};my $secret=$keys{'GeoPresence_Geo.Test_auth'};
+        GP_Auth('Geo.Test');$keys{'GeoPresence_Geo.New_auth'}='stale';GP_Auth('Geo.New');
+        for (1..120) {http($c,'isTest=invalid');}
+        $c->{helper}{gp}{learned}{'Geo.Test'}={confirmed=>1,device=>'device',zones=>{}};
+        $c->{helper}{gp}{actors}{door}={waiters=>{'Geo.Test'=>1}};
+        rename_device('Geo.Test','Geo.New');
+        is($keys{GP_AuthKey('Geo.New')},$secret,'existing password verifier moved to the new safe key');
+        ok(!exists $keys{'GeoPresence_Geo.Test_auth'},'old key was removed');
+        ok(!exists $keys{GP_AuthKey('Geo.Test')} && !exists $keys{'GeoPresence_Geo.New_auth'},'obsolete canonical and legacy entries were removed');
+        is((GP_Auth('Geo.New'))[1],$secret,'cached credentials cannot select the stale destination key');
+        is($defs{'Z.Home'}{PARENT},'Geo.New','private location parent follows the resident');
+        is($defs{'Z.Home'}{DEF},'location Geo.New home','private location definition remains restartable');
+        is($c->{helper}{gp_http},$listener,'resident rename does not restart the shared listener');
+        ok(!exists $c->{helper}{gp}{prod}{'Geo.Test'},'old resident state was discarded');
+        ok(!exists $c->{helper}{gp}{resident_generation}{'Geo.Test'},'old generation metadata was removed');
+        ok($c->{helper}{gp}{learned}{'Geo.New'}{confirmed},'confirmed setup metadata is retained');
+        ok($c->{helper}{gp}{actors}{door}{waiters}{'Geo.New'},'pending actor feedback follows the resident name');
+        ok(!exists $c->{helper}{gp}{actors}{door}{waiters}{'Geo.Test'},'actor has no stale waiter name');
+        is((http($c,'isTest=invalid'))[0],429,'rename cannot renew the person quota');
+        is($attr{'R.Door'}{residents},'Geo.Test'.($shared?',Geo.Other':''),'public rule selector is not silently rewritten');
+        like(join('; ',GP_Validate($c)),qr/unknown resident Geo\.Test/,'stale public reference is visible in validation');
+        if ($shared) {ok(!exists $c->{helper}{gp}{prod}{'Geo.Other'},'shared rule loses every affected pending context');}
+        else {is($c->{helper}{gp}{prod}{'Geo.Other'},$other,'unrelated resident context is retained');}
+    }
+};
+
+subtest 'GP-R11-001 regex-shaped resident names preserve migrated and unrelated logins' => sub {
+    my ($c)=shared_actor_fixture();mode('GP','debug');
+    rename_device('Geo.Test','Geo.A');rename_device('Geo.Other','Geo-A');
+    my $other_password='other_password_0123456789';
+    like(GeoPresence_Set($defs{'Geo-A'},'Geo-A','webhookPassword',$other_password),qr/password stored/i,'unrelated person has a distinct password');
+    my $other_auth='Basic '.encode_base64('other-user:'.$other_password,'');
+    $keys{'GeoPresence_GeoBA_auth'}='unrelated legacy value';
+    for my $pair (['Geo.A','GeoXA'],['GeoXA','Geo.A']) {
+        rename_device(@$pair);GP_ResetController($c);GeoPresence_Timer($c);
+        is((http($c,'isTest=invalid'))[0],400,"@$pair: migrated login still authenticates after cache reset");
+        is((http($c,'isTest=invalid',undef,$other_auth))[0],400,'similar name keeps its independent login');
+        is($keys{'GeoPresence_GeoBA_auth'},'unrelated legacy value','another matching legacy name was not deleted');
+    }
+};
+
+subtest 'GP-R11-001 legacy access is exact and new password operations preserve other people' => sub {
+    my ($c)=fixture();mode('GP','debug');
+    my $old=$keys{'GeoPresence_Geo.Test_auth'};
+    $keys{'GeoPresence_Geo-Test_auth'}='foreign legacy verifier';
+    GP_ResetController($c);GeoPresence_Timer($c);
+    is((GP_Auth('Geo.Test'))[1],$old,'legacy lookup uses the exact name even when a similar key sorts first');
+    ok(!exists $keys{GP_AuthKey('Geo.Test')},'reading an old verifier does not rewrite the key store');
+    my $password='replacement_password_0123456789';
+    like(GeoPresence_Set($defs{'Geo.Test'},'Geo.Test','webhookPassword',$password),qr/password stored/i,'new password uses safe storage');
+    my $new=$keys{GP_AuthKey('Geo.Test')};
+    isnt($new,$old,'new password replaced the verifier');
+    is((GP_Auth('Geo.Test'))[1],$new,'new password invalidates the cached old verifier');
+    ok(!exists $keys{'GeoPresence_Geo.Test_auth'},'writing removes only the exact obsolete entry');
+    is($keys{'GeoPresence_Geo-Test_auth'},'foreign legacy verifier','password change preserves the similar legacy name');
+    $keys{'GeoPresence_Geo.Test_auth'}=$old;
+    $keys{GP_AuthKey('Geo.Test')}='';
+    is((GP_ReadAuth('Geo.Test'))[1],'','an existing canonical entry cannot fall back to an obsolete password');
+    my $other_key=GP_AuthKey('Geo-Test');$keys{$other_key}='foreign canonical verifier';
+    is(GeoPresence_Delete($defs{'Geo.Test'}),undef,'deleting a person removes both of their key formats');
+    ok(!exists $keys{'GeoPresence_Geo.Test_auth'} && !exists $keys{GP_AuthKey('Geo.Test')},'both exact entries were deleted');
+    is($keys{'GeoPresence_Geo-Test_auth'},'foreign legacy verifier','delete preserves the similar legacy name');
+    is($keys{$other_key},'foreign canonical verifier','delete preserves the other canonical key');
+};
+
+subtest 'GP-SIM-015 one read preserves exact lookup, format precedence and first duplicate' => sub {
+    fixture();
+    my $old='GeoPresence_Geo.Test_auth:';my $new=GP_AuthKey('Geo.Test').':';
+    $attr{global}{modpath}='/configured/fhem';$attr{global}{keyFileName}='task..keys';
+    for my $case (
+        [[$old.'first'],'first'], [[$new.'new'],'new'],
+        [[$old.'old',$new.'new'],'new'], [[$new.'new',$old.'old'],'new'],
+        [[$old.'first',$old.'second'],'first'], [[$old.'',$old.'second'],''],
+        [[$old.'old',$new.'',$new.'new'],''], [[$new.'invalid',$new.'new',$old.'old'],'invalid'],
+        [['GeoPresence_Geo-Test_auth:foreign'],undef], [[],undef]) {
+        my @reads;
+        no warnings 'redefine';
+        local *FileRead=sub {push @reads,$_[0];return (undef,@{$case->[0]});};
+        local *FileWrite=sub {die 'Reading credentials must not write the key store';};
+        is_deeply([GP_ReadAuth('Geo.Test')],[undef,$case->[1]],'selection preserves the stored value and precedence');
+        is_deeply(\@reads,['/configured/fhem/FHEM/FhemUtils/taskkeys'],'exactly one read uses the configured FHEM key path');
+    }
+    {
+        no warnings 'redefine';
+        local *FileRead=sub {return ('store unavailable',undef);};
+        is_deeply([GP_ReadAuth('Geo.Test')],['store unavailable',undef],'file errors are returned without an alternate lookup');
+    }
+};
+
+subtest 'GP-R11-001 partial storage failure cannot retain a stale authentication cache' => sub {
+    my ($c)=fixture();mode('GP','debug');
+    my $old=(GP_Auth('Geo.Test'))[1];
+    {
+        no warnings 'redefine';
+        local *FileWrite=sub {return 'legacy cleanup failed';};
+        is(GeoPresence_Set($defs{'Geo.Test'},'Geo.Test','webhookPassword','replacement_password_0123456789'),
+            'legacy cleanup failed','cleanup failure is reported after the new verifier was written');
+    }
+    isnt((GP_Auth('Geo.Test'))[1],$old,'next authentication reloads the written canonical verifier');
+    is((GP_Auth('Geo.Test'))[1],$keys{GP_AuthKey('Geo.Test')},'cached state agrees with the store after partial failure');
+};
+
+subtest 'F-13 renamed locations, actions and rules revoke their affected contexts' => sub {
+    for my $name ('Z.Home','A.Door','R.Door') {
+        my ($c,$cfg)=fixture();advance(40);my $s=GP_State($c,'Geo.Test',0);
+        my $listener=$c->{helper}{gp_http};GP_InvalidateDevices($c);
+        rename_device($name,$name.'.New');
+        ok(!exists $c->{helper}{gp}{prod}{'Geo.Test'},"$name: affected context was revoked with a cold catalogue");
+        is($c->{helper}{gp_http},$listener,"$name: unrelated listener remains open");
+    }
+    my ($c)=fixture();rename_device('Geo.Test','9.Invalid');
+    like(join('; ',GP_Validate($c)),qr/invalid GeoPresence device name/,'FHEM-permitted names outside the module contract remain visibly invalid');
+};
+
+subtest 'F-13 credential migration failures stay disabled across session reset' => sub {
+    for my $fault ('read','write','delete','legacy delete') {
+        my ($c)=fixture();my $set=\&setKeyValue;
+        my $read=\&FileRead;my $write=\&FileWrite;
+        $keys{'GeoPresence_Geo.New_auth'}='stale';GP_Auth('Geo.New');
+        {
+            no warnings 'redefine';
+            local *setKeyValue=sub {return 'write failure' if ($fault eq 'write' && $_[0] eq GP_AuthKey('Geo.New'))
+                || ($fault eq 'delete' && $_[0] eq GP_AuthKey('Geo.Test'));return $set->(@_);};
+            local *FileRead=sub {return ('read failure',undef) if $fault eq 'read';return $read->(@_);};
+            local *FileWrite=sub {return 'write failure' if $fault eq 'legacy delete';return $write->(@_);};
+            rename_device('Geo.Test','Geo.New');
+        }
+        is(GP_Mode('Geo.New'),'disabled',"$fault: failed migration disables the Geo resident");
+        like((GP_Auth('Geo.New'))[0],qr/migrate credentials/,"$fault: stale credentials remain unusable");
+        GP_ResetController($c);
+        ok(!defined((GP_Auth('Geo.New'))[1]),"$fault: session reset does not trust a leftover key");
+        like(join(' ',map {$_->[2]} @logs),qr/Could not migrate webhook credentials/,"$fault: failure is visible in the operational log");
+        like(GeoPresence_Set($defs{'Geo.New'},'Geo.New','webhookPassword','replacement_password_0123456789'),qr/password stored/i,
+            "$fault: explicit password setup repairs the binding");
+        is(GP_Read('Geo.New','gp_auth_error',''),'','repair clears the persisted error');
+        ok(!defined((GP_Auth('Geo.New'))[0]),'repaired credentials pass the key-store check');
+    }
+};
+
+subtest 'F-17 ROOMMATE failures remain visible and retry until the state is synchronized' => sub {
+    for my $exception (0,1) {
+        my ($c,$cfg)=fixture();advance(40);my $s=GP_State($c,'Geo.Test',0);$s->{phase}='home';$s->{desired_status}='home';
+        reading('rr_Test','state','absent',$now);my $original=\&CommandSet;my $fail=1;
+        {
+            no warnings 'redefine';
+            local *CommandSet=sub {
+                if ($fail && $_[1] eq 'rr_Test state home') {push @commands,$_[1];die "roommate unavailable\n" if $exception;return 'roommate unavailable';}
+                return $original->(@_);
+            };
+            GP_Publish($c,'Geo.Test',$cfg,$s);GP_Publish($c,'Geo.Test',$cfg,$s);
+            is($s->{desired_status},'home','failed status stays pending');
+            like(GP_Read('Geo.Test','gp_roommate_error',''),qr/roommate unavailable/,'Reading exposes the status failure');
+            is(scalar(grep {$_->[2]=~/Could not update ROOMMATE/} @logs),1,'identical repeated failure is logged once');
+            $fail=0;GP_Publish($c,'Geo.Test',$cfg,$s);
+            is(GP_Read('rr_Test','state',''),'home','next successful attempt synchronized the actual ROOMMATE');
+            is(GP_Read('Geo.Test','gp_roommate_error',''),'','successful update clears the error');
+            ok(!exists $s->{desired_status},'successful request is consumed');
+            GP_Publish($c,'Geo.Test',$cfg,$s);
+        }
+        is(scalar @commands,3,'two failures and one successful idempotent update; no further retry');
+        is(scalar(grep {$_->[2]=~/status update accepted again/} @logs),1,'recovery is logged once');
+        is(scalar(grep {/^(?:door|garage) /} @commands),0,'status retry cannot issue a physical opening');
+    }
+};
+
+subtest 'F-17 command and log callbacks cannot restore obsolete or superseded requests' => sub {
+    for my $source (qw(command failure_log recovery_log)) {
+      for my $change (qw(status mode)) {
+        my ($c,$cfg)=fixture();advance(40);my $s=GP_State($c,'Geo.Test',0);$s->{desired_status}='home';
+        reading('rr_Test','state','absent',$now);
+        my $events=@reading_events;
+        my $update=sub {$change eq 'status' ? ($s->{desired_status}='absent') : mode('Geo.Test','debug');};
+        $s->{roommate_error}='prior failure' if $source eq 'recovery_log';
+        $on_log=sub {
+            $update->() if ($source eq 'failure_log' && $_[2]=~/Could not update ROOMMATE/)
+                || ($source eq 'recovery_log' && $_[2]=~/status update accepted again/);
+        };
+        no warnings 'redefine';
+        local *CommandSet=sub {
+            $update->() if $source eq 'command';
+            return $source eq 'recovery_log' ? undef:'callback failure';
+        };
+        GP_Publish($c,'Geo.Test',$cfg,$s);
+        if ($change eq 'status') {is($s->{desired_status},'absent',"$source: newer status wins over the older request");}
+        else {
+            ok(!exists $s->{desired_status},"$source: mode change prevents restoring the obsolete request");
+            is(scalar @reading_events,$events,"$source: invalidated context publishes no resident events");
+        }
+      }
+    }
 };
 
 subtest 'HTTP response, disabled input, request rate and method validation' => sub {
@@ -3918,17 +4161,23 @@ subtest 'R-07: small wall-clock corrections cannot extend a monotonic output dea
 
 subtest 'R-07: changed configuration cancels pending outputs without rebuilding it' => sub {
     for my $cold (0,1) {
-        for my $event ('MODIFIED contact','ATTR contact event-on-change-reading state','DELETEATTR contact') {
+        for my $event ('MODIFIED contact','ATTR contact event-on-change-reading state','DELETEATTR contact',
+                'DEFINED contact','RENAMED contact contact.New') {
             my ($c,$cfg,$s)=nonopening_fixture('notify');
-            $on_message=sub {GP_InvalidateDevices($c) if $cold;config_event($event)};
-            my $build=\&GP_Catalog;my $calls=0;
+            $on_message=sub {
+                GP_InvalidateDevices($c) if $cold;
+                $event =~ /^RENAMED/ ? rename_device('contact','contact.New') : config_event($event);
+            };
+            my $build=\&GP_Catalog;my $calls=0;my $update=\&GP_UpdateAttrLists;my $widgets=0;
             {
                 no warnings 'redefine';local *GP_Catalog=sub {$calls++;return $build->(@_)};
+                local *GP_UpdateAttrLists=sub {$widgets++;return $update->(@_);};
                 GP_Dispatch($c,'Geo.Test',$cfg,$s,0,$now,$mono);
             }
             is(scalar @messages,1,"first output precedes $event (cold=$cold)");
             is_deeply(\@commands,[],'obsolete configuration cannot authorize the switch');
             is($calls,0,'discarding obsolete plans never rebuilds or reads the catalogue');
+            is($widgets,0,'dependent dummy events revoke plans without rebuilding widget choices');
             ok(!$c->{helper}{gp_config},'rebuilding remains deferred until a new consumer');
         }
     }

@@ -12,8 +12,7 @@ $readingFnAttributes=''; $unicodeEncoding=1;
 sub setReadingsVal { $_[0]{READINGS}{$_[1]}={VAL=>$_[2],TIME=>$_[3]}; }
 sub InternalTimer { }
 sub RemoveInternalTimer { }
-sub getKeyValue { return (undef,$keys{$_[0]}); }
-sub setKeyValue { $keys{$_[0]}=$_[1]; return; }
+require "$FindBin::Bin/lib/FhemKeyStore.pm";
 sub Log3 { }
 sub CommandSet { push @outputs,[@_]; return; }
 sub pushMsg { push @outputs,[@_]; return; }

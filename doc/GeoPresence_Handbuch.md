@@ -1,6 +1,6 @@
 # GeoPresence – Handbuch
 
-**Version 2.36 · Stand 29.10.2026 · Architektur 0.74**
+**Version 2.37 · Stand 30.10.2026 · Architektur 0.75**
 
 GeoPresence ist eine Anwesenheits- und Ortssteuerung für FHEM. Es wertet aus, wer zu Hause ist, wer das Haus verlassen hat und wer zurückkehrt, und verbindet diese Informationen mit konfigurierbaren Automationen. So lässt sich beispielsweise beim Betreten eines Gartenbereichs ein Licht einschalten, beim Erreichen eines Arbeitsortes eine Nachricht senden oder bei einer berechtigten Heimkehr die vorhandene Tür- und Garagensteuerung ansprechen. Ziel ist, solche Aktionen passend zur Situation auszuführen und Fehlreaktionen auf einzelne unzuverlässige Meldungen zu vermeiden.
 
@@ -200,6 +200,8 @@ attr rr_PERSON rr_locationUnderway underway
 ```
 
 GeoPresence verwaltet die Anwesenheit dieses ROOMMATE-Geräts. Parallel arbeitende Automationen, die denselben Status oder dieselben Türaktionen auslösen, müssen vor der Produktivfreigabe bewusst abgegrenzt werden. Ein externer Wechsel auf `home` gilt als manuelle Heimkehr und widerruft die laufende Öffnungsberechtigung.
+
+Scheitert die Statusübergabe, zeigen das Reading `gp_roommate_error` und der Statusbericht den Fehler. GeoPresence versucht den weiterhin aktuellen gewünschten Status im nächsten Timerlauf erneut. Identische Fehler erzeugen keine wiederholte Warnung im Betriebslog; nach erfolgreicher Übergabe wird der Fehler gelöscht. Die Wiederholung aktualisiert ausschließlich den Anwesenheitsstatus und erzeugt keine neue Tür- oder Garagenaktion.
 
 Der Widerruf stoppt auch bereits vorgemerkte Folgebefehle. Setzt beispielsweise ein Rückruf des Türbefehls den ROOMMATE manuell auf `home`, wird der folgende Garagenbefehl nicht mehr ausgeführt. Die Rückmeldung für den bereits ausgegebenen Türbefehl wird trotzdem weiter erfasst.
 
@@ -770,6 +772,18 @@ list Geo.PERSON gp_resume_status gp_resume_reason gp_arrival_armed
 
 Ein geordnetes Beenden von FHEM schreibt dessen Zustandsdatei. GeoPresence ruft nicht automatisch `save` auf. Bei abruptem Absturz ist nur der zuletzt erfolgreich geschriebene Stand verfügbar, und während eines Ausfalls verpasste Orts- oder Sensoränderungen lassen sich nicht rekonstruieren. Die Positionsquellen aus [[#5.5 Tür und Garage anschließen|Abschnitt 5.5]] müssen ihren eigenen Zustandsvertrag erfüllen.
 
+### 8.5 GeoPresence-Geräte umbenennen
+
+Verwende FHEMs normalen Befehl `rename ALT NEU`. GeoPresence führt die internen Controller- und Elternbindungen einschließlich ihrer gespeicherten Definitionen nach. Beim Umbenennen einer Person bleibt ihr Webhook-Kennwort erhalten; der Geofency-Benutzername und die gemeinsame Webhook-URL ändern sich dadurch nicht. Ein umbenannter Controller bindet seinen Listener kurz neu; offene alte HTTP-Verbindungen werden geschlossen.
+
+Vorhandene Kennwörter aus älteren Versionen bleiben verwendbar und müssen für die Umbenennung nicht neu gesetzt werden. Auch bei einem Namenswechsel wie `Geo.A` → `GeoXA` bleibt der Zugang erhalten; Kennwörter ähnlich benannter Personen werden dabei nicht verändert.
+
+Betroffene Reisen und wartende Befehle werden verworfen. Bereits ausgegebene Aktoraufträge erhalten weiterhin Rückmeldungen. Bestätigte Lerndaten und das noch laufende Anfragenkontingent einer umbenannten Person bleiben erhalten; ein laufendes Lernfenster endet dagegen. Anschließend ist für neue Öffnungen ein neuer gültiger Ausflug erforderlich.
+
+Attributverweise in Regeln und auf externe Geräte werden nicht automatisch umgeschrieben. Prüfe nach der Umbenennung mit `get CONTROLLER validate`, berichtige die dort genannten Namen ausdrücklich und speichere mit `save`. Insbesondere `residents`, `action`, `locations` und ein `afterExit` mit Ortsbezug können noch den alten Namen enthalten. GeoPresence-Gerätenamen müssen weiterhin mit einem Buchstaben beginnen und dürfen nur Buchstaben, Ziffern, Unterstrich, Punkt und Bindestrich enthalten.
+
+Meldet `gp_auth_error` einen Fehler bei der Kennwortübertragung, bleibt eine betroffene Geo-Person deaktiviert. Behebe den Schlüsselspeicherfehler und setze das Kennwort unter dem neuen Personennamen mit `set NEUE_PERSON webhookPassword ...` erneut. Ein Reload allein hebt diese Sperre nicht auf. Zugangsdaten gehören weiterhin nicht in Logs oder Fehlermeldungen.
+
 ## 9. Parameter und Befehle nachschlagen
 
 ### 9.1 Controller
@@ -920,6 +934,8 @@ Während echter Handytests und der Testanwendung kein `debugAdvance` verwenden: 
 | Nach Reload oder Moduswechsel fehlt die Berechtigung | Neue Reise beginnen; alte Nachweise werden absichtlich nicht wiederhergestellt |
 | Ausführliche Diagnose fehlt | logStatus prüfen, Verzeichnisrechte korrigieren, debugLog auto oder 1 setzen |
 | Webhook meldet `429 Rate limit` | Anfragerate der betroffenen Person verringern und das laufende 60-Sekunden-Fenster abwarten. Debug-, Lern- und normale Anfragen derselben Person zählen zusammen; andere Personen haben eigene Kontingente. |
+| `gp_roommate_error` ist nicht leer | ROOMMATE und dessen Geräteaufruf prüfen. Der aktuelle Status wird erneut versucht; nach Annahme oder bereits erreichtem Zielzustand verschwindet der Fehler. |
+| Nach Umbenennung fehlt ein Zugang oder eine Regel | `validate` und `gp_auth_error` prüfen. Öffentliche Altverweise ausdrücklich berichtigen; bei Kennwortübertragungsfehler den Schlüsselspeicher reparieren und das Kennwort am neuen Namen erneut setzen. |
 
 Für eine nachvollziehbare Fehleranalyse den vollständigen Ausflug aus dem Diagnosefile, den passenden Zeitraum des FHEM-Logs und `explain` gemeinsam betrachten. Private Kennungen, Zugangsdaten und Ortskoordinaten vor einer Veröffentlichung entfernen.
 

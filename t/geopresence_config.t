@@ -19,8 +19,7 @@ sub readingsBulkUpdate { setReadingsVal($_[0],$_[1],$_[2],stamp()); }
 sub readingsEndUpdate { }
 sub CommandSet { push @commands,$_[1]; return; }
 sub pushMsg { push @messages,[@_]; }
-sub getKeyValue { (undef,$keys{$_[0]}); }
-sub setKeyValue { $keys{$_[0]}=$_[1]; return; }
+require "$FindBin::Bin/lib/FhemKeyStore.pm";
 require "$FindBin::Bin/../FHEM/98_GeoPresence.pm";
 {
     no warnings qw(redefine once);
@@ -294,7 +293,7 @@ subtest 'GP-R01-002: cold administrative edits never compile discarded catalogue
     is(GP_Config($c,'Geo.A')->{allowDoor},1,'next real consumer sees the committed configuration');
 };
 
-subtest 'GP-R01-003: unrelated MODIFIED events do no inventory or widget work' => sub {
+subtest 'GP-R01-003/GP-SIM-018: unrelated lifecycle events do no inventory or widget work' => sub {
     my $c=fixture();
     $defs{Unrelated}={NAME=>'Unrelated',TYPE=>'dummy'};
     my ($inventory,$catalog)=@{$c->{helper}}{qw(gp_devices gp_config)};
@@ -304,17 +303,20 @@ subtest 'GP-R01-003: unrelated MODIFIED events do no inventory or widget work' =
         no warnings 'redefine';
         local *GP_Inventory=sub {$scans++; $scan->(@_)};
         local *GP_UpdateAttrLists=sub {$widgets++; $update->(@_)};
-        global_event('MODIFIED Unrelated') for 1..5;
+        global_event('DEFINED Unrelated');
+        $defs{Renamed}=delete $defs{Unrelated};$defs{Renamed}{NAME}='Renamed';
+        global_event('RENAMED Unrelated Renamed');
+        global_event('MODIFIED Renamed') for 1..5;
         is(refaddr($c->{helper}{gp_config}),refaddr($catalog),'unrelated events retain the prepared catalogue');
         global_event('MODIFIED rr_A');
     }
-    is($scans,0,'Notify never enumerates devices for modify');
-    is($widgets,0,'modify never rebuilds unchanged widget choices');
+    is($scans,0,'unrelated lifecycle events never enumerate devices');
+    is($widgets,0,'unrelated definitions, renames and modifies retain unchanged widget choices');
     is(refaddr($c->{helper}{gp_devices}),refaddr($inventory),'membership inventory is retained');
     ok(!$c->{helper}{gp_config},'dependent modify still invalidates its static checks');
     GP_Config($c,'Geo.A');
     my $current=$c->{helper}{gp_config};
-    global_event('MODIFIED Unrelated');
+    global_event('MODIFIED Renamed');
     is(refaddr($c->{helper}{gp_config}),refaddr($current),'unrelated modify retains full configuration');
 };
 
@@ -331,6 +333,15 @@ subtest 'GP-R01-003: PRESENCE choices follow definition, rename and deletion' =>
     unlike($defs{'Geo.A'}{'.AttrList'},qr/Phone2/,'old proxy name is removed');
     delete $defs{Phone3}; global_event('DELETED Phone3');
     unlike($defs{'Geo.A'}{'.AttrList'},qr/Phone3/,'deleted PRESENCE is removed');
+    my $updates=0;my $update=\&GP_UpdateAttrLists;
+    {
+        no warnings 'redefine';
+        local *GP_UpdateAttrLists=sub {$updates++;return $update->(@_);};
+        global_event('DEFINED Unknown');
+        $defs{Unknown}={NAME=>'Unknown'};global_event('RENAMED Missing Unknown');
+        delete $defs{Unknown};global_event('DELETED Unknown');
+    }
+    is($updates,3,'missing or unknown types and deletions retain conservative widget refreshes');
 };
 
 subtest 'GP-R01-004: exact diagnostic edits retain configuration, bulk deletions invalidate it' => sub {

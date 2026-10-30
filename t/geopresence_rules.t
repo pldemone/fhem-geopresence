@@ -19,8 +19,7 @@ sub readingsBeginUpdate { }
 sub readingsBulkUpdate { $_[0]{READINGS}{$_[1]}={VAL=>$_[2],TIME=>strftime('%Y-%m-%d %H:%M:%S',localtime($now))}; }
 sub readingsEndUpdate { }
 sub setReadingsVal { $_[0]{READINGS}{$_[1]}={VAL=>$_[2],TIME=>$_[3]}; }
-sub getKeyValue { return (undef,$keys{$_[0]}); }
-sub setKeyValue { $keys{$_[0]}=$_[1]; return; }
+require "$FindBin::Bin/lib/FhemKeyStore.pm";
 sub CommandAttr {
     my (undef,$text)=@_;
     my ($name,$key,$value)=split / /,$text,3;
