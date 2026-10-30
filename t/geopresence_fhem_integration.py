@@ -515,6 +515,65 @@ def check_reports(command, http_request, admin_port, check):
           "reading reports does not dispatch actuator commands")
 
 
+def check_http_quotas(command, http_request, request, auth_headers, password, check):
+    """Exercise authentication and elapsed-time quotas over the real listener."""
+    for line in ("define rr_Rate ROOMMATE", "define Geo.Rate GeoPresence resident GP rr_Rate",
+                 "attr Geo.Rate sourceMode geofency_only", "attr Geo.Rate deviceId rate-device",
+                 "attr Geo.Rate webhookUser rate-user", f"set Geo.Rate webhookPassword {password}",
+                 "set Geo.Rate mode debug"):
+        result = command(line)
+        check("stored" in result if "webhookPassword" in line else result == "", "prepare quota test resident")
+    command("{ $main::GP_rate_wall=GP_Now();; $main::GP_rate_mono=GP_Mono()+60;; "
+            "no warnings 'redefine';; *GP_Now=sub { $main::GP_rate_wall };; "
+            "*GP_Mono=sub { $main::GP_rate_mono };; GeoPresence_Timer($defs{GP});; return 'quota clocks set' }")
+    headers = auth_headers()
+    other_headers = dict(headers, Authorization="Basic " + base64.b64encode(f"rate-user:{password}".encode()).decode())
+
+    def post(selected=headers):
+        return http_request("POST", "/fhem/geopresence", "isTest=invalid", selected)[0]
+
+    try:
+        unknown = dict(headers, Authorization="Basic " + base64.b64encode(b"unknown:invalid").decode())
+        for label, failed in (("missing", auth_headers(False)), ("wrong", auth_headers("wrong")), ("unknown", unknown)):
+            statuses = [post(failed) for _ in range(121)]
+            check(statuses == [401] * 121, f"F-12 {label} credentials never consume the processing quota")
+        check(request("Home", 1, debug=True)[0] == 200, "F-12 valid webhook remains available after failed logins")
+        check([post() for _ in range(119)] == [400] * 119, "F-12 all remaining authenticated processing slots are available")
+        check(post() == 429, "F-12 authenticated request 121 is limited")
+        check(post(auth_headers(False)) == 401, "F-12 exhausted quota retains the authentication challenge")
+        command("{ $main::GP_rate_mono+=30;; return 'elapsed' }")
+        check([post(other_headers) for _ in range(120)] == [400] * 120, "F-12 another resident retains its full quota")
+        check(post(other_headers) == 429, "F-12 second resident has its own limit")
+        command("{ $main::GP_rate_mono+=30;; return 'elapsed' }")
+        check(post() == 400 and post(other_headers) == 429, "F-12 residents renew at independent deadlines")
+        command("{ $main::GP_rate_mono+=30;; return 'elapsed' }")
+        check(post(other_headers) == 400, "F-12 second resident renews at its own deadline")
+        check(command("set Geo.Rate mode learning").startswith("Learning for 15 minutes"),
+              "quota test enters the real learning mode")
+        check([post(other_headers) for _ in range(119)] == [400] * 119, "F-12 learning shares the resident quota")
+        check(post(other_headers) == 429, "F-12 mode change did not reset the processing limit")
+
+        for shift in (-3600, 3600):
+            command("{ $main::GP_rate_mono+=60;; return 'new window' }")
+            check([post() for _ in range(120)] == [400] * 120, f"F-16 shift {shift}: full initial window")
+            command(f"{{ $main::GP_rate_wall+={shift};; $main::GP_rate_mono+=59;; return 'clock corrected' }}")
+            check(post() == 429, f"F-16 shift {shift}: still limited before 60 elapsed seconds")
+            command("{ $main::GP_rate_mono+=1;; return 'elapsed' }")
+            check(post() == 400, f"F-16 shift {shift}: renews exactly at 60 monotonic seconds")
+            check([post() for _ in range(119)] == [400] * 119 and post() == 429,
+                  f"F-16 shift {shift}: renewed window retains the full limit")
+        check(command("delete Geo.Rate") == "", "temporary quota resident can be deleted")
+        check(command("{ exists $defs{GP}{helper}{gp}{http_rate}{'Geo.Rate'} ? 1:0 }") == "0",
+              "deleted resident leaves no quota entry")
+    finally:
+        command("delete Geo.Rate")
+        command("delete rr_Rate")
+        command("{ no warnings 'redefine';; "
+                "*GP_Now=sub { ($main::GP_fixture_fixed_wall // Time::HiRes::time())+$main::GP_fixture_offset };; "
+                "*GP_Mono=sub { Time::HiRes::clock_gettime(Time::HiRes::CLOCK_MONOTONIC())+$main::GP_fixture_offset };; "
+                "GP_ResetController($defs{GP});; GeoPresence_Timer($defs{GP});; return 'quota fixture cleared' }")
+
+
 def run(source, encoding="bytestream", help_only=False):
     repo = Path(__file__).resolve().parents[1]
     with tempfile.TemporaryDirectory(prefix="geopresence-test-") as directory:
@@ -718,6 +777,7 @@ def run(source, encoding="bytestream", help_only=False):
                   "structured timer diagnostics are available")
             # Controlled clock affects only this copied module in this process.
             command("{ no warnings 'redefine';; $main::GP_fixture_offset=0;; *GP_Now=sub { ($main::GP_fixture_fixed_wall // Time::HiRes::time())+$main::GP_fixture_offset };; *GP_Mono=sub { Time::HiRes::clock_gettime(Time::HiRes::CLOCK_MONOTONIC())+$main::GP_fixture_offset };; return 'clock set' }")
+            check_http_quotas(command, http_request, request, auth_headers, password, check)
             check(command("attr GP verbose 4") == "", "normal controller verbosity accepted")
             check(command("attr GP logFile ./log/geopresence-%Y-%m.log") == "", "separate monthly diagnostic log configured")
             check(command("define GP.LogFile FileLog ./log/geopresence-%Y-%m.log .* readonly") == "", "optional FHEMWEB log viewer syntax accepted")

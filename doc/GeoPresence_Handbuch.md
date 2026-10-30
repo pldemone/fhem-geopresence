@@ -1,6 +1,6 @@
 # GeoPresence – Handbuch
 
-**Version 2.35 · Stand 29.10.2026 · Architektur 0.73**
+**Version 2.36 · Stand 29.10.2026 · Architektur 0.74**
 
 GeoPresence ist eine Anwesenheits- und Ortssteuerung für FHEM. Es wertet aus, wer zu Hause ist, wer das Haus verlassen hat und wer zurückkehrt, und verbindet diese Informationen mit konfigurierbaren Automationen. So lässt sich beispielsweise beim Betreten eines Gartenbereichs ein Licht einschalten, beim Erreichen eines Arbeitsortes eine Nachricht senden oder bei einer berechtigten Heimkehr die vorhandene Tür- und Garagensteuerung ansprechen. Ziel ist, solche Aktionen passend zur Situation auszuführen und Fehlreaktionen auf einzelne unzuverlässige Meldungen zu vermeiden.
 
@@ -180,6 +180,10 @@ curl -i --data '' https://PUBLIC_HOST/fhem/geopresence
 ```
 
 **Erwartet:** Der erste Aufruf liefert `405 POST required`, der zweite `401 Authentication required`. Beide Antworten sind bei diesen Aufrufen richtig: Sie belegen Erreichbarkeit, aber noch keine gültige Personenanmeldung. Ein Aufruf des nackten Ports ohne `/fhem/geopresence` liefert `Unknown webhook`. Wenn nur `localhost` funktioniert, zuerst Bind-Adresse, freigegebene Quelladresse und Firewall prüfen.
+
+Nach erfolgreicher Anmeldung sind je Person 120 Anfragen innerhalb eines festen 60-Sekunden-Fensters möglich. Weitere angemeldete Anfragen erhalten bis zum Ablauf `429 Rate limit`; andere Personen behalten ihr eigenes Kontingent. Fehlgeschlagene Anmeldungen verbrauchen dieses Kontingent nicht. Auch angemeldete Anfragen mit anschließend abgewiesenen Inhalten zählen; normale Webhooks, Debug und Lernen teilen das Kontingent derselben Person. Ein Moduswechsel oder eine Korrektur der Systemzeit erneuert es nicht vorzeitig und verlängert die Wartezeit nicht. Eine äußere Drosselung am HTTPS-Proxy kann zusätzlich die Verbindungen und Anmeldeversuche begrenzen.
+
+Die Dateidiagnose ordnet `429 Rate limit` der bereits angemeldeten Person zu. Bei `debugLog auto` wird diese Ablehnung auch unter aktivem Controller für Personen in Debug oder Lernen protokolliert; die üblichen Dateipfad- und Diagnoseloggrenzen gelten weiter.
 
 ## 3. Eine Person einrichten und das Telefon einlernen
 
@@ -915,6 +919,7 @@ Während echter Handytests und der Testanwendung kein `debugAdvance` verwenden: 
 | Rückkehr nach Neustart öffnet nicht | Restart recovery in explain beziehungsweise gp_resume_status/gp_resume_reason prüfen. Ein gültiger qualifizierter Checkpoint, aktive Modi und eine neue gültige Rückkehr sind erforderlich. Nach Konfigurationsänderung, späterer Heimkehr oder Ablauf der 48-Stunden-Grenze ist der alte Stand nicht mehr gültig. |
 | Nach Reload oder Moduswechsel fehlt die Berechtigung | Neue Reise beginnen; alte Nachweise werden absichtlich nicht wiederhergestellt |
 | Ausführliche Diagnose fehlt | logStatus prüfen, Verzeichnisrechte korrigieren, debugLog auto oder 1 setzen |
+| Webhook meldet `429 Rate limit` | Anfragerate der betroffenen Person verringern und das laufende 60-Sekunden-Fenster abwarten. Debug-, Lern- und normale Anfragen derselben Person zählen zusammen; andere Personen haben eigene Kontingente. |
 
 Für eine nachvollziehbare Fehleranalyse den vollständigen Ausflug aus dem Diagnosefile, den passenden Zeitraum des FHEM-Logs und `explain` gemeinsam betrachten. Private Kennungen, Zugangsdaten und Ortskoordinaten vor einer Veröffentlichung entfernen.
 

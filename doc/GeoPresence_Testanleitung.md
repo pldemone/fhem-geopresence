@@ -1,6 +1,6 @@
 # GeoPresence – Testanleitung
 
-**Version 4.31 · Stand 29.10.2026 · Handbuch 2.35 · Architektur 0.73**
+**Version 4.32 · Stand 29.10.2026 · Handbuch 2.36 · Architektur 0.74**
 
 Diese Anleitung beschreibt die Prüfung einer eingerichteten GeoPresence-Anlage. Die Testanwendung simuliert Alltagswege und prüft deren neue Diagnosezeilen; gezielte App-Tests prüfen eigene Orts- und Gruppenregeln. Einrichtung, Begriffe und Parameter stehen im [Handbuch](GeoPresence_Handbuch.md).
 
@@ -142,6 +142,12 @@ Damit wird Test 17 ergänzt. Ein solcher Helferort ist eine normale location mit
 | 16 – Nur Geofency mit Home-Sprung | Fernausflug, kurzer Home-Eintritt mit walking und erneuter Austritt | Keine vorzeitige Öffnung |
 | 17 – Nur Geofency mit Helferort | Home verlassen, ausreichend entfernten Helferort erreichen, zu Fuß zurückkehren | Tür nach bestätigter Rückkehr, keine Garage |
 | 18 – Nur Geofency ohne Home-Rückkehr | Fernausflug, Home-Eintritt fehlt | Keine erfundene Telefonbestätigung, keine Öffnung |
+
+Die Repository-Prüfungen zu F-12 und F-16 senden mehr als 120 Anfragen mit fehlenden, falschen oder unbekannten Zugangsdaten. Sie müssen weiterhin HTTP 401 liefern, während eine gültig angemeldete Ortsmeldung danach angenommen wird. Erst nach 120 authentifizierten Anfragen derselben Person folgt HTTP 429; eine zweite Person behält ihr eigenes Kontingent mit eigener Ablaufzeit. Betriebsmodi teilen das Kontingent. Vor- und Rückwärtskorrekturen der Systemzeit dürfen das Fenster weder vorzeitig erneuern noch über 60 tatsächlich verstrichene Sekunden hinaus sperren. Die HTTP-Integration verwendet dafür nur private Moduluhren in einer temporären FHEM-Instanz; die Systemuhr des Hosts und die produktive Anlage werden nicht verändert.
+
+GP-F12-001 prüft die HTTP-429-Dateidiagnose mit aktivem Controller und einer Person in Debug beziehungsweise Lernen bei `debugLog auto`. Der Eintrag muss die authentifizierte Person nennen. Gegenproben prüfen die ausdrücklich eingeschaltete Produktionsdiagnose, die abgeschaltete Diagnose und den Verzicht auf eine ungeprüfte Personenzuordnung nach falschem Kennwort. Zugangsdaten dürfen weiterhin nicht im Log erscheinen.
+
+Die Gegenproben zu GP-SIM-012 bis GP-SIM-014 prüfen vor und nach der Bereinigung dieselben HTTP-Antworten und Diagnosedaten: falsche Pfade, Unterpfade und angehängte Abfrageparameter bleiben unbekannt; Methoden-, Inhaltsformat-, Größen- und Anmeldeablehnungen am richtigen Pfad bleiben als Webhook zugeordnet. Mehrdeutige Benutzernamen müssen weiterhin HTTP 401 liefern, ohne die gemeinsame Katalogliste zu verändern oder ein Personenkontingent anzulegen.
 
 Die zusätzlichen Repository-Prüfungen in `t/geopresence.t` und `t/geopresence_fhem_integration.py` decken GP-F11-001 ab: Eine Annäherung ohne Bewegung wird vor Home verarbeitet; erst danach trifft die Wiederholung derselben Annäherung mit `walking` ein. Annäherung und Home haben dabei gleiche oder aufeinanderfolgende Beobachtungszeiten. Sowohl nach Ablauf der Home-Frist als auch bei früherer Telefonbestätigung darf ausschließlich die Tür angefordert werden. Die ursprünglichen Home-Zeitanker bleiben erhalten; unterbrochene oder abgelaufene Annäherungen dürfen keine Bewegung in eine spätere Ankunft übertragen.
 

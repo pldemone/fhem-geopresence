@@ -826,8 +826,10 @@ sub GeoPresence_Undef {
         delete $hash->{helper}{gp_timer_due};
     } else {
         my $error=GP_ConfigChangeError($c,$hash); return $error if $error;
-        delete $c->{helper}{gp}{learned}{$hash->{NAME}}
-            if $c && ($hash->{SUBTYPE}//'') eq 'resident';
+        if ($c && ($hash->{SUBTYPE}//'') eq 'resident') {
+            delete $c->{helper}{gp}{learned}{$hash->{NAME}};
+            delete $c->{helper}{gp}{http_rate}{$hash->{NAME}};
+        }
         GP_ConfigChanged($c,$hash);
         GP_InvalidateDevices($c);
     }
@@ -3015,13 +3017,10 @@ sub GP_SetMode {
 sub GP_HTTP {
     my ($c,$method,$path,$headers,$body)=@_;
     my $diag={route=>'unknown'};
-    if ($c) {
-        my $base='/fhem/'.GP_Attr($c->{NAME},'webhookPath','geopresence');
-        $diag->{route}=$path eq $base ? 'webhook' : 'unknown';
-    }
     my ($status,$text)=GP_HandleHTTP($c,$method,$path,$headers,$body,$diag);
     my $level=$status>=400 && $status!=404 && $status!=405 ? 2:4;
-    GP_Log($c,$level,'http',{%$diag,status=>$status,reason=>$text});
+    @{$diag}{qw(status reason)}=($status,$text);
+    GP_Log($c,$level,'http',$diag);
     return ($status,$text);
 }
 
@@ -3030,30 +3029,36 @@ sub GP_HandleHTTP {
     return (404,'Unknown webhook') unless $c;
     my $base='/fhem/'.GP_Attr($c->{NAME},'webhookPath','geopresence');
     return (404,'Unknown webhook') unless $path eq $base;
+    $diag->{route}='webhook';
     return (405,'POST required') unless $method eq 'POST';
     return (415,'application/x-www-form-urlencoded required') unless ($headers->{'content-type'}//'') =~ m{\Aapplication/x-www-form-urlencoded(?:\s*;|\z)}i;
     return (413,'Request too large') if length($body)>16384;
     my $rt=$c->{helper}{gp};
     return (503,'Initializing') unless $rt && $rt->{ready};
-    my ($now,$mono)=(GP_Now(),GP_Mono());
-    if (!defined($rt->{rate_start}) || $now-$rt->{rate_start}>=60) { $rt->{rate_start}=$now; $rt->{rate_count}=0; }
-    return (429,'Rate limit') if ++$rt->{rate_count}>120;
     my $auth=$headers->{authorization}//'';
     return (401,'Authentication required') unless $auth =~ /\ABasic ([A-Za-z0-9+\/=]+)\z/;
     my ($user,$password)=split /:/,decode_base64($1),2;
     return (401,'Authentication required') unless defined($password) && length($password)<=256;
-    my @res=@{GP_Catalog($c)->{users}{$user}//[]};
-    return (401,'Authentication required') unless @res==1;
-    my $r=$res[0];
+    my $res=GP_Catalog($c)->{users}{$user};
+    return (401,'Authentication required') unless $res && @$res==1;
+    my $r=$res->[0];
     my ($err,$stored)=GP_Auth($r);
     return (401,'Authentication required') if $err || !defined($stored) || $stored !~ /\A([a-f0-9]{32}):([a-f0-9]{64})\z/;
     my ($salt,$expected)=($1,$2);
     my $actual=sha256_hex($salt.':'.$password);
     my $diff=0; $diff|=ord(substr($actual,$_,1))^ord(substr($expected,$_,1)) for 0..63;
     return (401,'Authentication required') if $diff;
+    $diag->{resident}=$r;
+    # Failed logins cannot consume another resident's processing capacity.
+    # One bounded window covers production, debug and learning for this person.
+    my ($now,$mono)=(GP_Now(),GP_Mono());
+    my $rate=$rt->{http_rate}{$r};
+    $rate=$rt->{http_rate}{$r}={start=>$mono,count=>0} if !$rate || $mono-$rate->{start}>=60;
+    return (429,'Rate limit') if $rate->{count}>=120;
+    $rate->{count}++;
     GP_ExpireLearning($c,$r);
     my $mode=GP_EffectiveMode($c,$r,0);
-    @{$diag}{qw(resident mode)}=($r,$mode);
+    $diag->{mode}=$mode;
     return (503,'Resident disabled') if $mode eq 'disabled';
     my ($p,$parse_error,$form_info)=GP_DecodeForm($body);
     return (400,$parse_error) if $parse_error;
@@ -4479,6 +4484,7 @@ set Geo.PERSON mode debug</pre>
   <h5>Webhook access</h5>
   <p>Use an HTTPS reverse proxy for the dedicated HTTP listener. Forward only the exact path <code>/fhem/&lt;webhookPath&gt;</code> to webhookPort. Block all child paths with HTTP 404 so that child paths cannot fall through to a general FHEMWEB proxy. This listener is not FHEMWEB and provides no FHEM command endpoint. A proxy on another machine requires an explicit webhookBindAddress and webhookAllowedPeers.</p>
   <p>Webhooks require HTTP Basic authentication and <code>application/x-www-form-urlencoded</code> POST data containing Geofency's <code>device</code>, <code>id</code>, <code>entry</code> (0/1), <code>date</code>, <code>latitude</code>, <code>longitude</code> and <code>radius</code>. Optional motion selects the Home confirmation wait and can refine the garage decision. Unused metadata may contain line breaks and tabs; decision fields remain strict. Credentials and raw payloads are not logged.</p>
+  <p>After successful authentication, each resident has a separate limit of 120 requests per fixed 60-second window, starting with that resident's first authenticated request. Further authenticated requests return HTTP 429 until the window expires; failed authentication returns HTTP 401 without consuming this quota. Authenticated requests still count if later rejected for their content or operating mode. Production, debug and learning share the resident's quota, and mode changes do not renew it. The window uses monotonic elapsed time, so wall-clock corrections cannot extend it or renew it early. Connection, size and queue bounds remain separate; an HTTPS proxy can additionally limit outside traffic.</p>
   <h5>Indoor phone presence</h5>
   <p>Indoor sensors are used only by geofency_phone and phone_only. In geofency_only, phone state and health are explicitly disabled; no sensors are polled, no phone simulation is accepted, and a lost Home webhook has no phone fallback.</p>
   <p>One detecting indoor sensor is enough for presence. Changing rooms or being seen by multiple sensors does not create another arrival. Absence requires all configured sensors to be negative for phone_absence_window. A short reception gap preserves presence and cannot authorize a new opening. Phone arrival can replace a missing Home webhook after a qualified trip. A local walk can authorize the door; the garage additionally needs driving evidence or a remote trip without fresh contradictory walking/running/cycling evidence.</p>

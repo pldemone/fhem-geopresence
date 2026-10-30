@@ -1038,6 +1038,129 @@ subtest 'HTTP response, disabled input, request rate and method validation' => s
     is((http($c,form($cfg,'Home',1,$now)))[0],503,'disabled resident cannot queue');
 };
 
+subtest 'HTTP route diagnostics preserve exact paths and early rejection details' => sub {
+    my ($c)=fixture();advance(40);
+    my $dir=tempdir(CLEANUP=>1);$attr{GP}{logFile}="$dir/http.log";$attr{GP}{debugLog}=1;
+    my $form={'content-type'=>'application/x-www-form-urlencoded'};
+    for my $case (
+        ['GET','/fhem/other',$form,'',404,'unknown'],
+        ['POST','/fhem/geopresence/debug',$form,'',404,'unknown'],
+        ['POST','/fhem/geopresence?cmd=set',$form,'',404,'unknown'],
+        ['GET','/fhem/geopresence',$form,'',405,'webhook'],
+        ['POST','/fhem/geopresence',{},'',415,'webhook'],
+        ['POST','/fhem/geopresence',$form,'x'x16385,413,'webhook'],
+        ['POST','/fhem/geopresence',$form,'',401,'webhook']) {
+        my ($method,$path,$headers,$body,$expected,$route)=@$case;
+        my ($status,$text)=GP_HTTP($c,$method,$path,$headers,$body);
+        is($status,$expected,"$method $path: same rejection status");
+        my @lines=diagnostic_lines($c);my ($json)=$lines[-1]=~/GeoPresence http (\{.*\})/;
+        my $row=JSON::PP::decode_json($json);
+        is_deeply([@{$row}{qw(route status reason)}],[$route,$status,$text],
+            'diagnosis retains the route, response status and reason');
+        ok(!exists $row->{resident},'early rejection has no unverified person');
+    }
+    is(scalar @{$c->{helper}{gp}{queue}},0,'rejected requests queued no observations');
+};
+
+subtest 'HTTP authentication rejects ambiguous catalog users without changing the catalog' => sub {
+    my ($c)=shared_actor_fixture();advance(40);
+    $attr{'Geo.Other'}{webhookUser}='user';config_event('ATTR Geo.Other webhookUser user');
+    my $matches=GP_Catalog($c)->{users}{user};my @before=@$matches;
+    is(scalar @before,2,'configuration has two residents sharing one username');
+    for (1..2) {
+        is((http($c,'isTest=invalid'))[0],401,'ambiguous identity is rejected before content or quota processing');
+    }
+    is_deeply($matches,\@before,'authentication leaves the shared user index unchanged');
+    ok(!exists $c->{helper}{gp}{http_rate},'ambiguous identity allocated no person quota');
+};
+
+subtest 'F-12 failed authentication cannot consume a resident webhook quota' => sub {
+    my ($c,$cfg)=fixture();advance(40);
+    my $body=form($cfg,'Home',1,$now);
+    for my $auth ('','Bearer invalid','Basic '.encode_base64('user:wrong',''),
+            'Basic '.encode_base64('unknown:password123456789012345678','')) {
+        my @status=map {(http($c,$body,undef,$auth))[0]} 1..121;
+        is_deeply(\@status,[(401)x121],'failed authentication stays HTTP 401 beyond the processing quota');
+    }
+    is(scalar @{$c->{helper}{gp}{queue}},0,'unauthenticated requests queued nothing');
+    my @status=map {(http($c,$body))[0]} 1..120;
+    is_deeply(\@status,[(200)x120],'all 120 authenticated requests remain available after the failed logins');
+    is((http($c,$body))[0],429,'the next authenticated request reaches the resident limit');
+    is((http($c,$body,undef,''))[0],401,'an exhausted quota does not replace the authentication challenge');
+    is(scalar @{$c->{helper}{gp}{queue}},120,'only authenticated requests below the limit reached the queue');
+    is_deeply([\@commands,\@messages],[[],[]],'authentication and quota checks produced no outputs');
+};
+
+subtest 'F-12 residents have independent quotas shared by all modes' => sub {
+    my ($c,$cfg)=shared_actor_fixture();advance(40);
+    # Authenticated invalid payloads exercise the processing limit without
+    # filling the independent, controller-wide observation queue.
+    my @status=map {(http($c,'isTest=invalid'))[0]} 1..120;
+    is_deeply(\@status,[(400)x120],'authenticated invalid payloads also consume processing capacity');
+    is((http($c,'isTest=invalid'))[0],429,'first resident exhausted its own quota');
+    mode('Geo.Test','debug');
+    is((http($c,'isTest=true'))[0],429,'changing mode cannot renew the same resident quota');
+    advance(30);
+    my $other='Basic '.encode_base64('other-user:password123456789012345678','');
+    is((http($c,form($cfg,'Home',1,$now,device=>'other-device'),undef,$other))[0],200,
+        'another resident can still submit a valid observation');
+    @status=map {(http($c,'isTest=invalid',undef,$other))[0]} 1..119;
+    is_deeply(\@status,[(400)x119],'second resident retained its remaining quota');
+    is((http($c,'isTest=invalid',undef,$other))[0],429,'second resident has the same independent limit');
+    advance(30);
+    is((http($c,'isTest=invalid'))[0],400,'first resident renews after its own 60 seconds');
+    is((http($c,'isTest=invalid',undef,$other))[0],429,'renewing one window cannot renew another resident');
+    advance(30);
+    is((http($c,'isTest=invalid',undef,$other))[0],400,'second resident renews at its own deadline');
+    mode('GP','debug');
+    is(GeoPresence_Undef($defs{'Geo.Other'}),undef,'resident can be removed normally');
+    ok(!exists $c->{helper}{gp}{http_rate}{'Geo.Other'},'removing a resident releases its quota entry');
+};
+
+subtest 'GP-F12-001 quota diagnostics retain the authenticated resident' => sub {
+    my $dir=tempdir(CLEANUP=>1);
+    for my $case ([debug=>'auto',1],[learning=>'auto',1],[active=>'1',1],[active=>'auto',0],[debug=>'0',0]) {
+        my ($resident_mode,$setting,$enabled)=@$case;
+        my ($c)=fixture();advance(40);
+        if ($resident_mode eq 'learning') {
+            like(GeoPresence_Set($defs{'Geo.Test'},'Geo.Test','mode','learning'),qr/^Learning for/,'learning started');
+        } else { mode('Geo.Test',$resident_mode); }
+        $attr{GP}{logFile}="$dir/$resident_mode-$setting.log";
+        $attr{GP}{debugLog}=$setting;
+        is(GP_Mode('GP'),'active','controller remains active for the mixed-mode diagnosis');
+        my @status=map {(http($c,'isTest=invalid'))[0]} 1..120;
+        is_deeply(\@status,[(400)x120],"$resident_mode / $setting: authenticated requests fill the quota");
+        is((http($c,'isTest=invalid'))[0],429,"$resident_mode / $setting: excess request is limited");
+        my @rows=map {JSON::PP::decode_json(/GeoPresence http (\{.*\})/ ? $1:'{}')} diagnostic_lines($c);
+        my @limited=grep {($_->{status}//0)==429} @rows;
+        is(scalar @limited,$enabled,"$resident_mode / $setting: quota diagnosis follows the configured switch");
+        if ($enabled) {
+            is($limited[0]{resident},'Geo.Test','HTTP 429 belongs to the authenticated resident');
+            is($limited[0]{reason},'Rate limit','quota reason remains available');
+        }
+        is((http($c,'isTest=invalid',undef,'Basic '.encode_base64('user:wrong','')))[0],401,'wrong password remains unauthenticated');
+        @rows=map {JSON::PP::decode_json(/GeoPresence http (\{.*\})/ ? $1:'{}')} diagnostic_lines($c);
+        ok(!scalar(grep {($_->{status}//0)==401 && exists $_->{resident}} @rows),
+            'failed authentication cannot attach an unverified resident to the diagnosis');
+        unlike(join('',diagnostic_lines($c)),qr/password123456789012345678|Basic |user:wrong/,'credentials stay out of the diagnosis');
+    }
+};
+
+subtest 'F-16 webhook quota duration is independent of wall clock corrections' => sub {
+    for my $shift (-3600,0,3600) {
+        my ($c)=fixture();advance(40);
+        my @status=map {(http($c,'isTest=invalid'))[0]} 1..120;
+        is_deeply(\@status,[(400)x120],"wall shift $shift: full quota initially available");
+        $now+=$shift;$mono+=59;
+        is((http($c,'isTest=invalid'))[0],429,"wall shift $shift: no renewal after 59 elapsed seconds");
+        $mono+=1;
+        is((http($c,'isTest=invalid'))[0],400,"wall shift $shift: renewal exactly at 60 monotonic seconds");
+        @status=map {(http($c,'isTest=invalid'))[0]} 1..119;
+        is_deeply(\@status,[(400)x119],"wall shift $shift: renewed window has its full capacity");
+        is((http($c,'isTest=invalid'))[0],429,"wall shift $shift: renewed window is limited again");
+    }
+};
+
 subtest 'dedicated HTTP framing bounds and ambiguity rejection' => sub {
     my $prefix="POST /fhem/geopresence HTTP/1.1\r\nHost: localhost\r\n";
     my $wire=$prefix."cOnTeNt-LeNgTh: 7\r\naUtHoRiZaTiOn: Basic test\r\n\r\nentry=1";

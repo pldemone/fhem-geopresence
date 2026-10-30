@@ -1,6 +1,6 @@
 # GeoPresence – Architektur
 
-**Version 0.73 · Stand 29.10.2026 · Handbuch 2.35**
+**Version 0.74 · Stand 29.10.2026 · Handbuch 2.36**
 
 Diese Beschreibung spezifiziert den aktuellen Aufbau von `FHEM/98_GeoPresence.pm`. Einrichtung und Bedienung stehen im [Handbuch](GeoPresence_Handbuch.md); Prüfabläufe und Testprogramm sind in der [Testanleitung](GeoPresence_Testanleitung.md) beschrieben. Gerätenamen wie `Geo.PERSON` und `Geo.PERSON.ORT` sind austauschbare Beispiele.
 
@@ -102,7 +102,15 @@ Für einen entfernten Reverse-Proxy werden eine konkrete lokale `webhookBindAddr
 
 Jede Person erhält einen eigenen `webhookUser` und ein über `set ... webhookPassword` gesetztes Kennwort. Der FHEM-Schlüsselspeicher hält einen gesalzenen SHA-256-Prüfwert. Erfolgreiche Basic-Authentifizierung ordnet eine Anfrage genau einer Person zu; deren Geofency-Gerätekennung und Ortskennung müssen anschließend passen. Zugangsdaten erscheinen nicht in Readings oder Diagnoseausgaben.
 
-Der Listener begrenzt Header, Body, Verbindungsdauer, gleichzeitige Verbindungen und Warteschlange. Der Body darf höchstens 16 KiB umfassen; mehr als 120 Anfragen pro Minute werden zurückgewiesen. Mehrdeutige HTTP-Header, Transfer-Encoding und FHEM-Steuerfelder werden nicht als Webhooks akzeptiert. Ein HTTP 200 bestätigt die Annahme in der aktuellen Sitzung, nicht eine physische Aktion oder dauerhafte Zustellung.
+Der HTTP-Handler ermittelt und prüft den exakten Pfad einmal und trägt die passende Route vor weiteren Ablehnungen in den vorhandenen Diagnosehash ein. Der Wrapper ergänzt darin Status und Antwortgrund für die Protokollierung, ohne einen weiteren Hash zu kopieren. Die Benutzerzuordnung wird direkt aus der gemeinsamen Katalogliste gelesen; fehlende oder mehrdeutige Zuordnungen werden weiterhin abgewiesen, und die Liste bleibt unverändert.
+
+Der Listener begrenzt Header, Body, Verbindungsdauer, gleichzeitige Verbindungen und Warteschlange. Der Body darf höchstens 16 KiB umfassen. Mehrdeutige HTTP-Header, Transfer-Encoding und FHEM-Steuerfelder werden nicht als Webhooks akzeptiert. Ein HTTP 200 bestätigt die Annahme in der aktuellen Sitzung, nicht eine physische Aktion oder dauerhafte Zustellung.
+
+Nach erfolgreicher Anmeldung gilt ein eigenes Kontingent von 120 Anfragen je Person und festem 60-Sekunden-Fenster. Das Fenster beginnt mit der ersten authentifizierten Anfrage und wird ausschließlich anhand der monotonen Uhr erneuert; Systemzeitkorrekturen verlängern oder verkürzen es nicht. Weitere authentifizierte Anfragen erhalten bis zum Ablauf HTTP 429. Auch anschließend wegen Inhalt oder Betriebsmodus abgewiesene Anfragen zählen. Fehlende, unbekannte oder falsche Zugangsdaten erhalten HTTP 401 und verbrauchen kein Personenkontingent. Produktion, Debug und Lernen teilen das Kontingent derselben Person; Moduswechsel erneuern es nicht.
+
+Der Controller hält dafür nur Fensterbeginn und einen auf 120 begrenzten Zähler je authentifizierter Person. Beim Löschen der Person wird ihr Eintrag entfernt; eine neue Controller-Sitzung beginnt ohne alte Kontingente. Die Begrenzung ersetzt keine äußere Drosselung am HTTPS-Proxy. Die gemeinsamen Verbindungs-, Größen- und Warteschlangengrenzen gelten weiterhin unabhängig davon.
+
+Die authentifizierte Person wird vor der Kontingentprüfung der Diagnose zugeordnet. Dadurch behält auch HTTP 429 den Personenbezug; `debugLog auto` berücksichtigt deren Debug-/Lernmodus unter einem aktiven Controller über die vorhandene Modusableitung. Fehlgeschlagene Anmeldungen erhalten keine ungeprüfte Personenzuordnung.
 
 ### 3.2 Nutzdaten und Testkennzeichen
 
@@ -458,6 +466,8 @@ Der Controller hält den letzten und langsamsten profilierten Lauf, den Lauf mit
 
 Nach jeder relevanten Änderung prüft `validate` Referenzen und Verträge; Geometriehinweise beschreiben zusätzlich noch ausstehende Laufzeitdaten. Der [automatische Praxistest](GeoPresence_Testanleitung.md) nutzt authentifizierte Testwebhooks, lokale FHEM-Abfragen und die echte Diagnoseausgabe. Softwaretests prüfen ergänzend Zeitordnung, Gruppenüberlappung, Wiedereintritt, verworfene Nachweise, Quellenprofile, Feedbackauflösung, Transportisolation, Oberfläche und die ausführbaren Handbuchbeispiele in einer temporären FHEM-Instanz mit Dummy-Aktoren.
 
+Die Regressionen zu F-12 und F-16 prüfen fehlende, falsche und unbekannte Anmeldungen über das bisherige Kontingent hinaus, eine weiterhin angenommene gültige Ortsmeldung, unabhängige Personenfenster sowie die gemeinsame Begrenzung über Betriebsmodi hinweg. Nach 120 authentifizierten Anfragen muss HTTP 429 folgen; nach genau 60 monotonen Sekunden steht das Kontingent wieder bereit, auch bei um eine Stunde zurück- oder vorgestellter Systemzeit. Die reale FHEM-Integration verwendet dafür ausschließlich private Moduluhren im temporären Prozess und prüft außerdem die Freigabe des Kontingenteintrags beim Löschen einer Person.
+
 Die Lebenszyklustests verwenden einen echten FHEM-Prozess mit Speichern, Beenden, erneutem Start, Modulreload und rereadcfg. Die gespeicherten Moduszeitstempel und die Nachweise des Neustarttests liegen ausdrücklich vor dem realen Neustart, unabhängig von zuvor vorgestellten Testuhren. Geprüft werden aktive, simulierte, deaktivierte und fehlende Modi, das Ende von learning, die Controller-Vorrangregeln, erhaltene Zeitstempel, wiederhergestellte gültige Ausflüge, frische anschließende Rückkehr sowie der Verzicht auf alte Timer und Aufträge. Ein zweiter Prozessneustart darf eine bereits verbrauchte Berechtigung nicht erneut nutzen. Dummy-Kontakte behalten dafür ihre alten Zeitstempel; ihre Positionen werden nicht künstlich aufgefrischt.
 
 Regressionstests prüfen eine Radiusänderung beim Home-Austritt mit zuvor qualifizierter Telefonabwesenheit, die vollständige erneute Qualifikation und eine anschließende Türöffnung nach Fußwegfrist. Gegenproben umfassen GPS-Sprünge, neuere lokale Anwesenheit, ungültige oder widersprüchliche Geometrie, alte Meldungen und das reine Geo-Profil. Bewegungsdaten werden in Wiederholungen innerhalb desselben Bündels und in späteren Timerläufen ergänzt; dabei werden Fristen, Originalzeitstempel, Garagenausschluss bei Fußweg und ausbleibende doppelte Aktionen geprüft. Die FHEM-Integration bestätigt den HTTP-/Timer-Ablauf und die Diagnose mit Dummy-Aktoren.
@@ -503,6 +513,14 @@ GP-R05-010 ergänzt abgeschlossene Geo- und telefonbestätigte Reisen mit einem 
 Die Bereinigung GP-SIM-008 bis GP-SIM-011 wird mit denselben fachlichen Regressionen vor und nach dem Umbau geprüft. Direkte interne Testereignisse enthalten die Pflichtfelder des regulären Erzeugers. Eine zusätzliche Gegenprobe qualifiziert Abwesenheit im Zustands- und Messmodus, prüft unveränderte Negativwerte und meldet anschließend einen Quellenfehler. Der Fehler muss auch nach bereits bestätigter Abwesenheit erkannt werden; eine bloße Wiederverbindung mit alten Werten genügt nicht, neue Beobachtungen und eine vollständige erneuerte Frist bleiben erforderlich.
 
 ## 13. Änderungen seit der letzten Version
+
+Änderungen von Version 0.73 auf 0.74:
+
+- F-12: Webhook-Kontingente erst nach erfolgreicher Anmeldung und getrennt je Person zählen; Produktion, Debug und Lernen teilen dasselbe Personenfenster.
+- F-16: Das feste 60-Sekunden-Fenster mit der monotonen Uhr begrenzen; Vor- und Rückwärtskorrekturen der Systemzeit ändern seine Dauer nicht.
+- GP-F12-001: Authentifizierte Person vor der Kontingentprüfung an die Diagnose übergeben; HTTP 429 bleibt zuordenbar und wird bei `debugLog auto` für Debug-/Lernpersonen auch unter aktivem Controller protokolliert.
+- GP-SIM-012 bis GP-SIM-014: Doppelte Webhook-Pfadermittlung, zusätzliche Diagnosehashkopie und Kopie der Benutzerzuordnung entfernt; Pfad-, Anmelde- und Diagnoseverträge bleiben erhalten.
+- Kontingente auf zwei Werte je angemeldeter Person begrenzt und beim Löschen der Person bereinigt; Regressionen prüfen Anmeldung, Personentrennung, Moduswechsel und Zeitkorrekturen auch über den echten HTTP-Listener.
 
 Änderungen von Version 0.72 auf 0.73:
 
