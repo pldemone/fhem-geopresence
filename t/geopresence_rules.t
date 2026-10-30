@@ -197,7 +197,7 @@ subtest 'overlapping group membership and first/last transitions' => sub {
     advance(1);event($s,$cfg,'Helper',0);is_deeply(plans($s),[],'same route does not repeat in trip');
 };
 
-subtest 'F-03: ordinary visits and afterExit consumption never overwrite each other' => sub {
+subtest 'ordinary visits and afterExit consumption never overwrite each other' => sub {
     for my $trigger (qw(enter exit)) {
         my ($c)=rules_fixture();
         for my $name (qw(Ordinary Mixed)) {
@@ -229,7 +229,7 @@ subtest 'F-03: ordinary visits and afterExit consumption never overwrite each ot
     }
 };
 
-subtest 'F-03: groups and individual locations retain independent consumption slots' => sub {
+subtest 'groups and individual locations retain independent consumption slots' => sub {
     my ($c)=rules_fixture(); def('R.Individual','rule GP');
     $attr{'R.Individual'}={residents=>'Geo.Test',trigger=>'enter',locations=>'Z.Work,Z.Work2',action=>'A.Message',cooldown=>0};
     my $cfg=GP_Config($c,'Geo.Test',1); my $s=GP_State($c,'Geo.Test',1); advance(40);
@@ -244,7 +244,7 @@ subtest 'F-03: groups and individual locations retain independent consumption sl
     is_deeply([sort @{plans($s)}],[qw(R.GroupEnter R.Individual)],'new group and location visit can react again');
 };
 
-subtest 'F-03: cooldown stays shared across visit and trip slots without consuming suppressed actions' => sub {
+subtest 'cooldown stays shared across visit and trip slots without consuming suppressed actions' => sub {
     my ($c)=rules_fixture();
     for my $name (qw(Shared RouteLight)) {def('R.'.$name,'rule GP');}
     $attr{'R.Shared'}={residents=>'Geo.Test',trigger=>'enter',locations=>'Z.Work,Z.Work2',action=>'A.Light',cooldown=>10};

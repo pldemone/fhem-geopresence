@@ -480,11 +480,11 @@ Der Controller hält den letzten und langsamsten profilierten Lauf, den Lauf mit
 
 Nach jeder relevanten Änderung prüft `validate` Referenzen und Verträge; Geometriehinweise beschreiben zusätzlich noch ausstehende Laufzeitdaten. Der [automatische Praxistest](GeoPresence_Testanleitung.md) nutzt authentifizierte Testwebhooks, lokale FHEM-Abfragen und die echte Diagnoseausgabe. Softwaretests prüfen ergänzend Zeitordnung, Gruppenüberlappung, Wiedereintritt, verworfene Nachweise, Quellenprofile, Feedbackauflösung, Transportisolation, Oberfläche und die ausführbaren Handbuchbeispiele in einer temporären FHEM-Instanz mit Dummy-Aktoren.
 
-Die Regressionen zu F-12 und F-16 prüfen fehlende, falsche und unbekannte Anmeldungen über das bisherige Kontingent hinaus, eine weiterhin angenommene gültige Ortsmeldung, unabhängige Personenfenster sowie die gemeinsame Begrenzung über Betriebsmodi hinweg. Nach 120 authentifizierten Anfragen muss HTTP 429 folgen; nach genau 60 monotonen Sekunden steht das Kontingent wieder bereit, auch bei um eine Stunde zurück- oder vorgestellter Systemzeit. Die reale FHEM-Integration verwendet dafür ausschließlich private Moduluhren im temporären Prozess und prüft außerdem die Freigabe des Kontingenteintrags beim Löschen einer Person.
+Die Prüfungen der Webhook-Anmeldung und Kontingente untersuchen fehlende, falsche und unbekannte Anmeldungen über das bisherige Kontingent hinaus, eine weiterhin angenommene gültige Ortsmeldung, unabhängige Personenfenster sowie die gemeinsame Begrenzung über Betriebsmodi hinweg. Nach 120 authentifizierten Anfragen muss HTTP 429 folgen; nach genau 60 monotonen Sekunden steht das Kontingent wieder bereit, auch bei um eine Stunde zurück- oder vorgestellter Systemzeit. Die reale FHEM-Integration verwendet dafür ausschließlich private Moduluhren im temporären Prozess und prüft außerdem die Freigabe des Kontingenteintrags beim Löschen einer Person.
 
 Die Lebenszyklustests verwenden einen echten FHEM-Prozess mit Speichern, Beenden, erneutem Start, Modulreload und rereadcfg. Die gespeicherten Moduszeitstempel und die Nachweise des Neustarttests liegen ausdrücklich vor dem realen Neustart, unabhängig von zuvor vorgestellten Testuhren. Geprüft werden aktive, simulierte, deaktivierte und fehlende Modi, das Ende von learning, die Controller-Vorrangregeln, erhaltene Zeitstempel, wiederhergestellte gültige Ausflüge, frische anschließende Rückkehr sowie der Verzicht auf alte Timer und Aufträge. Ein zweiter Prozessneustart darf eine bereits verbrauchte Berechtigung nicht erneut nutzen. Dummy-Kontakte behalten dafür ihre alten Zeitstempel; ihre Positionen werden nicht künstlich aufgefrischt.
 
-R-11 ergänzt Controller-, Personen-, Orts-, Aktions- und Regelumbenennungen mit vorbereiteten und kalten Beständen. Geprüft werden nachgeführte Definitionen, widerrufene alte Pläne, unveränderte unbeteiligte Kontexte, weiterhin beobachtete Aktoraufträge, Zugangsdatenübertragung, erhaltene Personenkontingente und sichtbare öffentliche Altverweise. Fehler beim Lesen, Schreiben und Entfernen von Kennwortschlüsseln dürfen nach Sitzungsreset keinen veralteten Zugang freigeben. Die reale FHEM-Integration prüft zusätzlich geschlossene alte HTTP-Clients, den neu gebundenen Listener, gespeicherte Elterndefinitionen und Rename-Rückrufe während eines Türbefehls. ROOMMATE-Gegenproben prüfen Fehlerwerte, Ausnahmen, eine spätere erfolgreiche Wiederholung und den Vorrang neuerer Status- oder Modusänderungen.
+Die Lebenszyklusprüfungen umfassen Controller-, Personen-, Orts-, Aktions- und Regelumbenennungen mit vorbereiteten und kalten Beständen. Geprüft werden nachgeführte Definitionen, widerrufene alte Pläne, unveränderte unbeteiligte Kontexte, weiterhin beobachtete Aktoraufträge, Zugangsdatenübertragung, erhaltene Personenkontingente und sichtbare öffentliche Altverweise. Fehler beim Lesen, Schreiben und Entfernen von Kennwortschlüsseln dürfen nach Sitzungsreset keinen veralteten Zugang freigeben. Die reale FHEM-Integration prüft zusätzlich geschlossene alte HTTP-Clients, den neu gebundenen Listener, gespeicherte Elterndefinitionen und Rename-Rückrufe während eines Türbefehls. ROOMMATE-Gegenproben prüfen Fehlerwerte, Ausnahmen, eine spätere erfolgreiche Wiederholung und den Vorrang neuerer Status- oder Modusänderungen.
 
 Regressionstests prüfen eine Radiusänderung beim Home-Austritt mit zuvor qualifizierter Telefonabwesenheit, die vollständige erneute Qualifikation und eine anschließende Türöffnung nach Fußwegfrist. Gegenproben umfassen GPS-Sprünge, neuere lokale Anwesenheit, ungültige oder widersprüchliche Geometrie, alte Meldungen und das reine Geo-Profil. Bewegungsdaten werden in Wiederholungen innerhalb desselben Bündels und in späteren Timerläufen ergänzt; dabei werden Fristen, Originalzeitstempel, Garagenausschluss bei Fußweg und ausbleibende doppelte Aktionen geprüft. Die FHEM-Integration bestätigt den HTTP-/Timer-Ablauf und die Diagnose mit Dummy-Aktoren.
 
@@ -494,154 +494,154 @@ Die Ausgaberegressionen prüfen manuelle Heimsetzung während des Türbefehls, a
 
 Weitere Regressionen prüfen Aliasänderungen und Aliaslöschungen innerhalb des Türbefehls, Controller-Sammellöschungen vor und nach der Übernahme, gemeinsam wiederhergestellte Zeitstandardwerte sowie kleine Uhrkorrekturen während Warteschlange und Ankunftsfrist. Die reale FHEM-Gegenprobe stellt die Systemzeit während der Ankunftsfrist um zehn Sekunden zurück und verzögert anschließend den Tür-Rückruf tatsächlich um 2,5 Sekunden; die Garage erhält keine verlängerte Frist.
 
-Die Nachprüfung ergänzt verschiedene Aliaslöschmuster am ROOMMATE bei warmen und kalten Caches sowie die Erneuerung gespeicherter Fehler nach der Musterlöschung von Altattributen. Reale FHEM-Befehle prüfen dabei sowohl den weiter ausgegebenen Garagenbefehl als auch eine erfolgreiche Validierung und Aktivierung nach der Bereinigung.
+Weitere Prüfungen untersuchen verschiedene Aliaslöschmuster am ROOMMATE bei warmen und kalten Caches sowie die Erneuerung gespeicherter Fehler nach der Musterlöschung von Altattributen. Reale FHEM-Befehle prüfen dabei sowohl den weiter ausgegebenen Garagenbefehl als auch eine erfolgreiche Validierung und Aktivierung nach der Bereinigung.
 
-Die erste Etappe von R-03 prüft einen kontinuierlichen Webhook-Strom, unabhängige Produktiv- und Debug-Fristen sowie jüngere Gegenbeobachtungen vor der Ankunftsbestätigung. Für 64 frische Geo-Meldungen mit unterschiedlichen Beobachtungszeiten begrenzt die Regression die insgesamt verbleibenden Konfliktaufrufe auf höchstens 64; der vorherige Ablauf erzeugte 2.079. Die reale FHEM-Integration prüft dieselbe Bündelverarbeitung über HTTP. Diese Aufrufzähler sind keine Messung eines zeitlichen oder prozentualen Leistungsgewinns.
+Die Prüfungen der Ereignisbündelung untersuchen einen kontinuierlichen Webhook-Strom, unabhängige Produktiv- und Debug-Fristen sowie jüngere Gegenbeobachtungen vor der Ankunftsbestätigung. Für 64 frische Geo-Meldungen mit unterschiedlichen Beobachtungszeiten begrenzt die Regression die insgesamt verbleibenden Konfliktaufrufe auf höchstens 64; der vorherige Ablauf erzeugte 2.079. Die reale FHEM-Integration prüft dieselbe Bündelverarbeitung über HTTP. Diese Aufrufzähler sind keine Messung eines zeitlichen oder prozentualen Leistungsgewinns.
 
-Die F-11-Regressionen ergänzen ältere akzeptierte Eintritte nach mehreren neueren Home-Meldungen. Sie prüfen ursprüngliche Zeitanker, unveränderte Mitgliedschaften und Besuchszähler, den Vorrang neuerer Bewegung sowie den Ausschluss unbekannter Ursprünge, geänderter alter Geometrie und abgebrochener Ankünfte. Eine verspätete Austrittsmeldung muss weiterhin beim tatsächlich neuesten Home-Eintritt eine neue vollständige Frist beginnen. Die reale FHEM-Integration prüft den späten Fußwegnachtrag über HTTP mit regulärer Timerbestätigung und mit vorzeitiger Telefonbestätigung; Diagnose und Dummy-Aktoren belegen jeweils genau eine Türanforderung und keine Garagenanforderung.
+Die Prüfungen nachgelieferter Bewegungsdaten ergänzen ältere akzeptierte Eintritte nach mehreren neueren Home-Meldungen. Sie prüfen ursprüngliche Zeitanker, unveränderte Mitgliedschaften und Besuchszähler, den Vorrang neuerer Bewegung sowie den Ausschluss unbekannter Ursprünge, geänderter alter Geometrie und abgebrochener Ankünfte. Eine verspätete Austrittsmeldung muss weiterhin beim tatsächlich neuesten Home-Eintritt eine neue vollständige Frist beginnen. Die reale FHEM-Integration prüft den späten Fußwegnachtrag über HTTP mit regulärer Timerbestätigung und mit vorzeitiger Telefonbestätigung; Diagnose und Dummy-Aktoren belegen jeweils genau eine Türanforderung und keine Garagenanforderung.
 
-GP-F11-001 ergänzt den Übergang einer zuvor akzeptierten Annäherung zu Home mit gleicher und mit späterer Home-Beobachtungszeit, jeweils mit Timer- und Telefonbestätigung. Der verspätete Fußwegnachtrag muss die Garage sperren, ohne den Home-Zeitanker zu ändern. Weitere Gegenproben schließen vor Home unterbrochene, abgelaufene oder durch eine neuere Annäherung ersetzte Ursprünge aus. Eine vor erfüllter Mindestabwesenheit beobachtete Annäherung darf eine danach berechtigt begonnene Home-Frist durch ihren Nachtrag nicht vorzeitig bestätigen oder verwerfen.
+Weitere Fälle prüfen den Übergang einer zuvor akzeptierten Annäherung zu Home mit gleicher und mit späterer Home-Beobachtungszeit, jeweils mit Timer- und Telefonbestätigung. Der verspätete Fußwegnachtrag muss die Garage sperren, ohne den Home-Zeitanker zu ändern. Weitere Gegenproben schließen vor Home unterbrochene, abgelaufene oder durch eine neuere Annäherung ersetzte Ursprünge aus. Eine vor erfüllter Mindestabwesenheit beobachtete Annäherung darf eine danach berechtigt begonnene Home-Frist durch ihren Nachtrag nicht vorzeitig bestätigen oder verwerfen.
 
-GP-F11-002 prüft verspätete Home-, Annäherungs- und Outer-Austritte nach einer neueren nahen Ortsmeldung, jeweils bei Empfang vor und nach Home. Ein nachgereichter Automotive-Ursprung vor der Unterbrechung darf die Garage nicht freigeben. Gegenproben erhalten neuere Home-Bewegung, einen späteren gültigen Annäherungseintritt und den aktuellen Ursprung bei einem noch älteren Austritt. Eine abweichende alte Geometrie wird weiterhin verworfen. Weitere Austritte während der Home-Frist müssen den tatsächlich neuesten Home-Nachweis verwenden. Die reale FHEM-Integration prüft den nahen Ort und beide Empfangsvarianten über HTTP mit Dummy-Aktoren.
+Weitere Prüfungen umfassen verspätete Home-, Annäherungs- und Outer-Austritte nach einer neueren nahen Ortsmeldung, jeweils bei Empfang vor und nach Home. Ein nachgereichter Automotive-Ursprung vor der Unterbrechung darf die Garage nicht freigeben. Gegenproben erhalten neuere Home-Bewegung, einen späteren gültigen Annäherungseintritt und den aktuellen Ursprung bei einem noch älteren Austritt. Eine abweichende alte Geometrie wird weiterhin verworfen. Weitere Austritte während der Home-Frist müssen den tatsächlich neuesten Home-Nachweis verwenden. Die reale FHEM-Integration prüft den nahen Ort und beide Empfangsvarianten über HTTP mit Dummy-Aktoren.
 
-GP-F11-003 setzt `motion_max_age` auf zulässige 20 Sekunden. Ein verspäteter Austritt vor Home trifft erst nach Ablauf dieses Werts ein; die gespeicherte Home-Walking-Sperre muss bei Timer- und Telefonbestätigung erhalten bleiben. Gegenproben entfernen einen früheren Automotive-Nachweis und berücksichtigen spätere Walking-, Running- oder Cycling-Daten weiterhin anhand ihrer angenommenen Gültigkeit. Eine tatsächlich unterbrochene alte Fußwegsperre darf entfallen, und ein neuer gültiger Automotive-Nachweis darf die Entscheidung ändern. Die reale FHEM-Integration prüft die Walking-Sperre mit Timer und Telefon sowie die Teilentwertung eines Automotive-Nachweises.
+Eine Gegenprobe setzt `motion_max_age` auf zulässige 20 Sekunden. Ein verspäteter Austritt vor Home trifft erst nach Ablauf dieses Werts ein; die gespeicherte Home-Walking-Sperre muss bei Timer- und Telefonbestätigung erhalten bleiben. Gegenproben entfernen einen früheren Automotive-Nachweis und berücksichtigen spätere Walking-, Running- oder Cycling-Daten weiterhin anhand ihrer angenommenen Gültigkeit. Eine tatsächlich unterbrochene alte Fußwegsperre darf entfallen, und ein neuer gültiger Automotive-Nachweis darf die Entscheidung ändern. Die reale FHEM-Integration prüft die Walking-Sperre mit Timer und Telefon sowie die Teilentwertung eines Automotive-Nachweises.
 
-F-04 zählt JSON-Aufbereitungen und Checkpoint-Schreibzugriffe getrennt. Diagnosen, unveränderte Wiederholungen, abgewiesene Beobachtungen, Aktorrückmeldungen sowie ruhige Timer- und Wiederherstellungsläufe müssen ohne beides auskommen. Neue Ortsnachweise, Verbrauchsstände, Bewegungsnachträge, verspätete Bewegungswiderrufe und Zeitabläufe müssen dagegen gespeichert werden. Gegenproben entziehen eine zuvor saubere Reisequalifikation ohne Trace bei blockierter Ausgabe und berichtigen ein extern verändertes Reading. Die bestehenden Neustart- und synchronen Gerätecalls prüfen weiterhin die Speicherung des Verbrauchs vor der Ausgabe.
+Die Prüfungen der Checkpoint-Speicherung zählen JSON-Aufbereitungen und Checkpoint-Schreibzugriffe getrennt. Diagnosen, unveränderte Wiederholungen, abgewiesene Beobachtungen, Aktorrückmeldungen sowie ruhige Timer- und Wiederherstellungsläufe müssen ohne beides auskommen. Neue Ortsnachweise, Verbrauchsstände, Bewegungsnachträge, verspätete Bewegungswiderrufe und Zeitabläufe müssen dagegen gespeichert werden. Gegenproben entziehen eine zuvor saubere Reisequalifikation ohne Trace bei blockierter Ausgabe und berichtigen ein extern verändertes Reading. Die bestehenden Neustart- und synchronen Gerätecalls prüfen weiterhin die Speicherung des Verbrauchs vor der Ausgabe.
 
-F-03 prüft 2.101 aufeinanderfolgende verbrauchte Besuche mit anschließendem Neustart: Ein aktueller Verbrauchseintrag ersetzt die Historie, und der Checkpoint bleibt in dieser festen Konfiguration unter 4 KiB. Weitere Prüfungen wechseln gewöhnliche und reisegebundene Regeln derselben Aktion und Auswahl, erhalten die Trennung zwischen Einzelort und Gruppe und prüfen gemeinsame Cooldowns ohne vorzeitigen Verbrauch. Version-1-Wiederherstellung und Reload eines alten Laufzeitzustands erhalten aktuelle Nachrichten-, Schalt- und Öffnungsverbräuche, obwohl die alte vollständige Historie im Reload-Fall größer als 64 KiB wäre. Fehlende, unbekannte oder unmögliche Verbrauchsstände im neuen Format werden abgelehnt. Die reale FHEM-Integration übernimmt einen alten Checkpoint und prüft eine bereits verbrauchte Ortsaktion mit `cooldown 0` erneut; es darf kein zweiter Schaltbefehl entstehen.
+Die Prüfungen des Aktionsverbrauchs umfassen 2.101 aufeinanderfolgende verbrauchte Besuche mit anschließendem Neustart: Ein aktueller Verbrauchseintrag ersetzt die Historie, und der Checkpoint bleibt in dieser festen Konfiguration unter 4 KiB. Weitere Prüfungen wechseln gewöhnliche und reisegebundene Regeln derselben Aktion und Auswahl, erhalten die Trennung zwischen Einzelort und Gruppe und prüfen gemeinsame Cooldowns ohne vorzeitigen Verbrauch. Version-1-Wiederherstellung und Reload eines alten Laufzeitzustands erhalten aktuelle Nachrichten-, Schalt- und Öffnungsverbräuche, obwohl die alte vollständige Historie im Reload-Fall größer als 64 KiB wäre. Fehlende, unbekannte oder unmögliche Verbrauchsstände im neuen Format werden abgelehnt. Die reale FHEM-Integration übernimmt einen alten Checkpoint und prüft eine bereits verbrauchte Ortsaktion mit `cooldown 0` erneut; es darf kein zweiter Schaltbefehl entstehen.
 
-GP-F03-001 prüft gewöhnliche Nachrichten und Schaltaktionen während eines unbestätigten Home-Abgangs, mit `enter`/`exit`, Orts-/Gruppenauswahl und `cooldown 0`. Zweimalige Zurückweisung eines Outer-Abgangs bei gehaltener Telefonanwesenheit muss den Verbrauch derselben Reise erhalten. Neue Austrittsnachweise und neue Besuche dürfen die Aktion nicht wiederholen; ein tatsächlich neuer Ausflug darf sie mit neuen Nachweisen wieder erlauben. Die reale FHEM-Integration prüft diesen Ablauf über HTTP mit einem Dummy-Licht und unveränderten Tür-/Garagen-Dummys.
+Weitere Gegenproben prüfen gewöhnliche Nachrichten und Schaltaktionen während eines unbestätigten Home-Abgangs, mit `enter`/`exit`, Orts-/Gruppenauswahl und `cooldown 0`. Zweimalige Zurückweisung eines Outer-Abgangs bei gehaltener Telefonanwesenheit muss den Verbrauch derselben Reise erhalten. Neue Austrittsnachweise und neue Besuche dürfen die Aktion nicht wiederholen; ein tatsächlich neuer Ausflug darf sie mit neuen Nachweisen wieder erlauben. Die reale FHEM-Integration prüft diesen Ablauf über HTTP mit einem Dummy-Licht und unveränderten Tür-/Garagen-Dummys.
 
-F-15 prüft neue Kontexte und wiederholte Debug-Resets bei identischer absoluter und monotoner Zeit. Offene Reisen behalten ihre ID und ihren Zähler; neue Reisen und Kontexte erhalten verschiedene IDs. Gespeicherte alte IDs werden aus Checkpoints der Versionen 1 und 2 unverändert übernommen, dürfen nach Abschluss aber nicht an die nächste Reise vergeben werden. Die reale FHEM-Integration prüft neue Sitzungskennungen über zwei Prozessneustarts, die unveränderte ID der fortgesetzten Reise und einen späteren neuen Ausflug mit eigener ID und eigenem Checkpoint.
+Die Prüfungen der Sitzungskennungen umfassen neue Kontexte und wiederholte Debug-Resets bei identischer absoluter und monotoner Zeit. Offene Reisen behalten ihre ID und ihren Zähler; neue Reisen und Kontexte erhalten verschiedene IDs. Gespeicherte alte IDs werden aus Checkpoints der Versionen 1 und 2 unverändert übernommen, dürfen nach Abschluss aber nicht an die nächste Reise vergeben werden. Die reale FHEM-Integration prüft neue Sitzungskennungen über zwei Prozessneustarts, die unveränderte ID der fortgesetzten Reise und einen späteren neuen Ausflug mit eigener ID und eigenem Checkpoint.
 
-R-05 prüft verspätete gültige Telefonanwesenheit mit und ohne wartende Home-Ankunft, unveränderte Quellzeitstempel, entwertete Checkpoints und ausbleibende spätere Öffnungen aus der alten Reise. Gegenproben erhalten spätere Reisen gegenüber älteren Messungen und verwerfen zukünftige oder fehlerhafte Werte. F-14 prüft vor Home negative Zustände, eine bereits abgeschlossene alte Qualifikation, eine neue vollständige Frist ohne Wiederholungsmeldungen sowie unveränderte Mess-, Fehler- und Startgrenzen. Frühere oder zukünftig datierte Home-Eintritte und eine verspätet gemeldete frühere Telefon-Rückkehr dürfen auch nach späterer Fristbestätigung keine Berechtigung erhalten. Ein gültiger Home-Eintritt zwischen Fristende und nächstem Poll bleibt dagegen berechtigt. Die Quellenprüfung wird bei gleichzeitig fälliger Produktion und Live-Debug nur einmal aufgerufen; beide Kontinuitäten bleiben getrennt. Die reale FHEM-Integration prüft verspätete Anwesenheit, den Spaziergang mit zuvor negativen Quellen und die vorzeitige Home-Rückkehr mit Dummy-Aktoren.
+Die Prüfungen der Telefonkontinuität umfassen verspätete gültige Telefonanwesenheit mit und ohne wartende Home-Ankunft, unveränderte Quellzeitstempel, entwertete Checkpoints und ausbleibende spätere Öffnungen aus der alten Reise. Gegenproben erhalten spätere Reisen gegenüber älteren Messungen und verwerfen zukünftige oder fehlerhafte Werte. Weitere Fälle prüfen vor Home negative Zustände, eine bereits abgeschlossene alte Qualifikation, eine neue vollständige Frist ohne Wiederholungsmeldungen sowie unveränderte Mess-, Fehler- und Startgrenzen. Frühere oder zukünftig datierte Home-Eintritte und eine verspätet gemeldete frühere Telefon-Rückkehr dürfen auch nach späterer Fristbestätigung keine Berechtigung erhalten. Ein gültiger Home-Eintritt zwischen Fristende und nächstem Poll bleibt dagegen berechtigt. Die Quellenprüfung wird bei gleichzeitig fälliger Produktion und Live-Debug nur einmal aufgerufen; beide Kontinuitäten bleiben getrennt. Die reale FHEM-Integration prüft verspätete Anwesenheit, den Spaziergang mit zuvor negativen Quellen und die vorzeitige Home-Rückkehr mit Dummy-Aktoren.
 
-Die Nachprüfung GP-R05-001 bis GP-R05-004 ergänzt gesammelte Abschlüsse mit nachgelieferter widersprechender Anwesenheit, mehrere positive Sensoren mit verschiedenen Zeiten und den Erhalt eines gültigen früheren Abschlusses bei echter späterer Rückkehr. Weitere Fälle liefern Vorstart-Anwesenheit erst nach der Wiederherstellung und erhalten dabei neuere Positionen sowie spätere Reisen. Eine nahe Zwischenposition darf gehaltene Negativwerte nicht dauerhaft blockieren. Im Messmodus werden eine Rückkehr vor der letzten erforderlichen Erneuerung im selben und in getrennten Bündeln sowie eine echte Rückkehr danach vor dem nächsten Poll verglichen. Gegenproben erhalten unabhängig bestätigte Geo-Ausflüge und reine Telefonstatuswechsel. Die echte FHEM-Integration prüft die vier gemeldeten Abläufe mit kontrollierten Quellzeiten, einschließlich Wiederherstellung eines alten Ausflugs und zulässiger späterer Rückkehr, ausschließlich an Dummy-Aktoren.
+Weitere Prüfungen ergänzen gesammelte Abschlüsse mit nachgelieferter widersprechender Anwesenheit, mehrere positive Sensoren mit verschiedenen Zeiten und den Erhalt eines gültigen früheren Abschlusses bei echter späterer Rückkehr. Weitere Fälle liefern Vorstart-Anwesenheit erst nach der Wiederherstellung und erhalten dabei neuere Positionen sowie spätere Reisen. Eine nahe Zwischenposition darf gehaltene Negativwerte nicht dauerhaft blockieren. Im Messmodus werden eine Rückkehr vor der letzten erforderlichen Erneuerung im selben und in getrennten Bündeln sowie eine echte Rückkehr danach vor dem nächsten Poll verglichen. Gegenproben erhalten unabhängig bestätigte Geo-Ausflüge und reine Telefonstatuswechsel. Die echte FHEM-Integration prüft diese Abläufe mit kontrollierten Quellzeiten, einschließlich Wiederherstellung eines alten Ausflugs und zulässiger späterer Rückkehr, ausschließlich an Dummy-Aktoren.
 
-GP-R05-005 ergänzt gemischte Vorstart- und aktuelle positive Quellen nach Wiederherstellung einer Geo-Reise, einschließlich eines dritten Sensors sowie zulässiger älterer Beobachtungen und späterer neuer Reisen. GP-R05-006 prüft das bereits bei 285 erfüllte Fristende mit Rückkehr 286 und zusätzlicher Negativmessung 287, sowohl bei regelmäßigen als auch versetzten Quellenerneuerungen. Wiederholte negative Zustandsmeldungen dürfen die Frist ebenfalls nicht verschieben. Die echte FHEM-Integration prüft den gemischten historischen Widerruf und die gültige Rückkehr nach bereits vollständiger Erneuerung über PRESENCE und HTTP. Die vorhandenen Prüfungen für Queue-Widerrufe und tatsächlich verspätete erste Erneuerungen bleiben nach Entfernung des zusätzlichen Aufbewahrungsfelds wirksam.
+Die Prüfungen historischer Anwesenheit umfassen gemischte Vorstart- und aktuelle positive Quellen nach Wiederherstellung einer Geo-Reise, einschließlich eines dritten Sensors sowie zulässiger älterer Beobachtungen und späterer neuer Reisen. Die Prüfungen der Abwesenheitsfrist umfassen das bereits bei 285 erfüllte Fristende mit Rückkehr 286 und zusätzlicher Negativmessung 287, sowohl bei regelmäßigen als auch versetzten Quellenerneuerungen. Wiederholte negative Zustandsmeldungen dürfen die Frist ebenfalls nicht verschieben. Die echte FHEM-Integration prüft den gemischten historischen Widerruf und die gültige Rückkehr nach bereits vollständiger Erneuerung über PRESENCE und HTTP. Die vorhandenen Prüfungen für Queue-Widerrufe und tatsächlich verspätete erste Erneuerungen bleiben nach Entfernung des zusätzlichen Aufbewahrungsfelds wirksam.
 
-GP-R05-008 prüft die verspätete Anwesenheit 120 zusammen mit aktueller Anwesenheit 230 nach unabhängig bestätigtem Geo-Abgang 100. Gemeinsame und getrennte Abfragen müssen die alte Berechtigung gleichermaßen verbrauchen oder widerrufen. Zusätzliche Fälle prüfen eine noch frische Rückkehr vor Mindestabwesenheit, drei positive Sensoren, eine jüngere Position und einen tatsächlich späteren neuen Ausflug. Auch bei neuerer Position oder bereits wartender Home-Ankunft muss eine solche zu frühe Rückkehr widerrufen. Eine berechtigte frühere Rückkehr bleibt ausführbar; ein langsamer Tür-Aufruf darf das anhand dieser ursprünglichen Rückkehr begrenzte Garagenbudget nicht verlängern. Die echte FHEM-Integration ergänzt gemeinsame und getrennte verspätete Beobachtungen, die beiden neueren Positionskontexte und eine berechtigte frische Rückkehr.
+Die Prüfungen verspäteter Telefonanwesenheit umfassen die verspätete Anwesenheit 120 zusammen mit aktueller Anwesenheit 230 nach unabhängig bestätigtem Geo-Abgang 100. Gemeinsame und getrennte Abfragen müssen die alte Berechtigung gleichermaßen verbrauchen oder widerrufen. Zusätzliche Fälle prüfen eine noch frische Rückkehr vor Mindestabwesenheit, drei positive Sensoren, eine jüngere Position und einen tatsächlich späteren neuen Ausflug. Auch bei neuerer Position oder bereits wartender Home-Ankunft muss eine solche zu frühe Rückkehr widerrufen. Eine berechtigte frühere Rückkehr bleibt ausführbar; ein langsamer Tür-Aufruf darf das anhand dieser ursprünglichen Rückkehr begrenzte Garagenbudget nicht verlängern. Die echte FHEM-Integration ergänzt gemeinsame und getrennte verspätete Beobachtungen, die beiden neueren Positionskontexte und eine berechtigte frische Rückkehr.
 
-GP-R05-009 prüft ohne Reisenachweis die gemischten positiven Beobachtungen 120 und 235 nach qualifizierter Abwesenheit 230. Die jüngste gültige Beobachtung muss den Status bei Telefon, GeoPresence und ROOMMATE auf Anwesenheit bringen; spätere Polls ohne weitere Sensormeldungen müssen ihn erhalten. Varianten prüfen vertauschte Sensoren, drei Quellen, den Messmodus und das kombinierte Profil ohne Reise. Die echte FHEM-Integration prüft Zustands- und Messmodus bei `phone_only`; dabei entstehen weder Reise- noch Öffnungsberechtigungen und die Quellzeitstempel bleiben unverändert.
+Die Prüfungen der Statusübernahme umfassen ohne Reisenachweis die gemischten positiven Beobachtungen 120 und 235 nach qualifizierter Abwesenheit 230. Die jüngste gültige Beobachtung muss den Status bei Telefon, GeoPresence und ROOMMATE auf Anwesenheit bringen; spätere Polls ohne weitere Sensormeldungen müssen ihn erhalten. Varianten prüfen vertauschte Sensoren, drei Quellen, den Messmodus und das kombinierte Profil ohne Reise. Die echte FHEM-Integration prüft Zustands- und Messmodus bei `phone_only`; dabei entstehen weder Reise- noch Öffnungsberechtigungen und die Quellzeitstempel bleiben unverändert.
 
-GP-R05-010 ergänzt abgeschlossene Geo- und telefonbestätigte Reisen mit einem späteren Abwesenheitszyklus, neuerer naher Ortsposition und gemischten positiven Quellzeiten. Beide Statuswerte müssen anhand der aktuellen Anwesenheit wieder `home` werden und ohne weitere Quellenmeldungen dort bleiben. Eine ältere bereits für Aktionen abgelaufene Meldung darf den reinen Status ebenfalls nicht blockieren. Gegenproben erhalten ursprüngliche Reisegrenzen, unveränderte Quellenzeiten und den Widerruf eines tatsächlich neuen laufenden Ausflugs. Ein aufbewahrter alter Ausgabeplan muss nach dem neuen Statuswechsel weiterhin an seinem eigenen abgelaufenen Budget scheitern. Die echte FHEM-Integration prüft die beiden Arten abgeschlossener Reise; der spätere Statuswechsel darf keine Öffnung wiederholen.
+Weitere Prüfungen umfassen abgeschlossene Geo- und telefonbestätigte Reisen mit einem späteren Abwesenheitszyklus, neuerer naher Ortsposition und gemischten positiven Quellzeiten. Beide Statuswerte müssen anhand der aktuellen Anwesenheit wieder `home` werden und ohne weitere Quellenmeldungen dort bleiben. Eine ältere bereits für Aktionen abgelaufene Meldung darf den reinen Status ebenfalls nicht blockieren. Gegenproben erhalten ursprüngliche Reisegrenzen, unveränderte Quellenzeiten und den Widerruf eines tatsächlich neuen laufenden Ausflugs. Ein aufbewahrter alter Ausgabeplan muss nach dem neuen Statuswechsel weiterhin an seinem eigenen abgelaufenen Budget scheitern. Die echte FHEM-Integration prüft die beiden Arten abgeschlossener Reise; der spätere Statuswechsel darf keine Öffnung wiederholen.
 
-Die Bereinigung GP-SIM-008 bis GP-SIM-011 wird mit denselben fachlichen Regressionen vor und nach dem Umbau geprüft. Direkte interne Testereignisse enthalten die Pflichtfelder des regulären Erzeugers. Eine zusätzliche Gegenprobe qualifiziert Abwesenheit im Zustands- und Messmodus, prüft unveränderte Negativwerte und meldet anschließend einen Quellenfehler. Der Fehler muss auch nach bereits bestätigter Abwesenheit erkannt werden; eine bloße Wiederverbindung mit alten Werten genügt nicht, neue Beobachtungen und eine vollständige erneuerte Frist bleiben erforderlich.
+Die Prüfungen der Telefonverarbeitung sichern die fachlichen Abläufe im Zustands- und Messmodus ab. Direkte interne Testereignisse enthalten die Pflichtfelder des regulären Erzeugers. Eine zusätzliche Gegenprobe qualifiziert Abwesenheit im Zustands- und Messmodus, prüft unveränderte Negativwerte und meldet anschließend einen Quellenfehler. Der Fehler muss auch nach bereits bestätigter Abwesenheit erkannt werden; eine bloße Wiederverbindung mit alten Werten genügt nicht, neue Beobachtungen und eine vollständige erneuerte Frist bleiben erforderlich.
 
 ## 13. Änderungen seit der letzten Version
 
 Änderungen von Version 0.74 auf 0.75:
 
-- R-11/F-13: FHEM-Rename-Callback für interne Ressourcen, Elterndefinitionen, Zugangsdaten, begrenzte betroffene Kontexte und laufende Aktorrückmeldungen ergänzt.
+- FHEM-Rename-Callback für interne Ressourcen, Elterndefinitionen, Zugangsdaten, begrenzte betroffene Kontexte und laufende Aktorrückmeldungen ergänzt.
 - Kennwortfehler nach Umbenennung bleiben gesperrt und sichtbar, bis die Zugangsdaten erfolgreich neu gesetzt wurden; öffentliche Attributverweise bleiben ausdrücklich zu berichtigen.
-- GP-R11-001: Regex-sichere Kennwortschlüssel und exakte Altübernahme schützen den migrierten Zugang und ähnlich benannte fremde Einträge beim Lesen, Schreiben und Löschen.
-- Rest von F-17: Rückgabefehler und Ausnahmen der ROOMMATE-Statusübergabe werden angezeigt; der noch aktuelle gewünschte Status wird ohne zusätzliche Öffnungsrechte wiederholt.
-- GP-SIM-015 bis GP-SIM-017: Kennwortformate aus einem gelesenen Bestand auswählen, die lokale Zeilenliste bei der Altbereinigung weiterverwenden und die Freigabe für ROOMMATE-Wiederholung und Veröffentlichung gemeinsam prüfen.
-- GP-SIM-018 und GP-SIM-019: Auswahllisten bei eindeutig auswahlfremden Definitionen und Umbenennungen sowie nach reiner Änderung einer Ortsfunktion nicht mehr wirkungslos neu aufbauen.
-- GP-SIM-020 und GP-SIM-021: Erneute Freigabe auf die tatsächliche ROOMMATE-Statusbearbeitung begrenzen und Bewohnerlisten bei Aktions- und Regelumbenennungen erst nach der Betroffenheitsauswahl aufbereiten.
+- Regex-sichere Kennwortschlüssel und exakte Altübernahme schützen den migrierten Zugang und ähnlich benannte fremde Einträge beim Lesen, Schreiben und Löschen.
+- Rückgabefehler und Ausnahmen der ROOMMATE-Statusübergabe werden angezeigt; der noch aktuelle gewünschte Status wird ohne zusätzliche Öffnungsrechte wiederholt.
+- Kennwortformate aus einem gelesenen Bestand auswählen, die lokale Zeilenliste bei der Altbereinigung weiterverwenden und die Freigabe für ROOMMATE-Wiederholung und Veröffentlichung gemeinsam prüfen.
+- Auswahllisten bei eindeutig auswahlfremden Definitionen und Umbenennungen sowie nach reiner Änderung einer Ortsfunktion nicht mehr wirkungslos neu aufbauen.
+- Erneute Freigabe auf die tatsächliche ROOMMATE-Statusbearbeitung begrenzen und Bewohnerlisten bei Aktions- und Regelumbenennungen erst nach der Betroffenheitsauswahl aufbereiten.
 
 Änderungen von Version 0.73 auf 0.74:
 
-- F-12: Webhook-Kontingente erst nach erfolgreicher Anmeldung und getrennt je Person zählen; Produktion, Debug und Lernen teilen dasselbe Personenfenster.
-- F-16: Das feste 60-Sekunden-Fenster mit der monotonen Uhr begrenzen; Vor- und Rückwärtskorrekturen der Systemzeit ändern seine Dauer nicht.
-- GP-F12-001: Authentifizierte Person vor der Kontingentprüfung an die Diagnose übergeben; HTTP 429 bleibt zuordenbar und wird bei `debugLog auto` für Debug-/Lernpersonen auch unter aktivem Controller protokolliert.
-- GP-SIM-012 bis GP-SIM-014: Doppelte Webhook-Pfadermittlung, zusätzliche Diagnosehashkopie und Kopie der Benutzerzuordnung entfernt; Pfad-, Anmelde- und Diagnoseverträge bleiben erhalten.
+- Webhook-Kontingente erst nach erfolgreicher Anmeldung und getrennt je Person zählen; Produktion, Debug und Lernen teilen dasselbe Personenfenster.
+- Das feste 60-Sekunden-Fenster mit der monotonen Uhr begrenzen; Vor- und Rückwärtskorrekturen der Systemzeit ändern seine Dauer nicht.
+- Authentifizierte Person vor der Kontingentprüfung an die Diagnose übergeben; HTTP 429 bleibt zuordenbar und wird bei `debugLog auto` für Debug-/Lernpersonen auch unter aktivem Controller protokolliert.
+- Doppelte Webhook-Pfadermittlung, zusätzliche Diagnosehashkopie und Kopie der Benutzerzuordnung entfernt; Pfad-, Anmelde- und Diagnoseverträge bleiben erhalten.
 - Kontingente auf zwei Werte je angemeldeter Person begrenzt und beim Löschen der Person bereinigt; Regressionen prüfen Anmeldung, Personentrennung, Moduswechsel und Zeitkorrekturen auch über den echten HTTP-Listener.
 
 Änderungen von Version 0.72 auf 0.73:
 
-- GP-SIM-008: Vollständige interne Telefonereignisse direkt verwenden; nicht benötigte Ersatzpfade und Abschlusszuweisungen entfernt.
-- GP-SIM-009: Aktuellen Telefonwiderruf nach der Zeitlage vor beziehungsweise ab dem Abgang aufgeteilt.
-- GP-SIM-010: Bereits qualifizierte gesunde Negativlagen vor erneuter Fristrechnung beenden, nach unveränderter Quellen- und Grenzprüfung.
-- GP-SIM-011: Zwei im vorhandenen Lebenszyklus nicht wirksame Markerprüfungen an übernommenen Reisenachweisen entfernt.
+- Vollständige interne Telefonereignisse direkt verwenden; nicht benötigte Ersatzpfade und Abschlusszuweisungen entfernt.
+- Aktuellen Telefonwiderruf nach der Zeitlage vor beziehungsweise ab dem Abgang aufgeteilt.
+- Bereits qualifizierte gesunde Negativlagen vor erneuter Fristrechnung beenden, nach unveränderter Quellen- und Grenzprüfung.
+- Zwei im vorhandenen Lebenszyklus nicht wirksame Markerprüfungen an übernommenen Reisenachweisen entfernt.
 
 Änderungen von Version 0.71 auf 0.72:
 
-- GP-R05-010: Nur eine laufende Reise bestimmt die ursprüngliche Telefon-Rückkehrzeit; abgeschlossene Reisen blockieren spätere reine Statuswechsel nicht.
+- Nur eine laufende Reise bestimmt die ursprüngliche Telefon-Rückkehrzeit; abgeschlossene Reisen blockieren spätere reine Statuswechsel nicht.
 - Abgeschlossene Nachweise und die Zeitgrenzen ihrer Ausgaben bleiben für Widerruf und Freigabe erhalten.
 
 Änderungen von Version 0.70 auf 0.71:
 
-- GP-R05-009: Ohne Reisenachweis verwendet die Statusübernahme die jüngste gültige positive Quellzeit; ältere gleichzeitig angenommene Meldungen blockieren frische Anwesenheit nicht.
+- Ohne Reisenachweis verwendet die Statusübernahme die jüngste gültige positive Quellzeit; ältere gleichzeitig angenommene Meldungen blockieren frische Anwesenheit nicht.
 - Bei vorhandenem Reisenachweis bleiben die ursprüngliche Rückkehrzeit und ihre Grenzen für Widerruf, Mindestabwesenheit und Ausgabe wirksam.
 
 Änderungen von Version 0.69 auf 0.70:
 
-- GP-R05-008: Die früheste neue positive Beobachtung ab dem maßgeblichen Abgang bestimmt Rückkehralter, Mindestabwesenheit und Ausgabebudget.
+- Die früheste neue positive Beobachtung ab dem maßgeblichen Abgang bestimmt Rückkehralter, Mindestabwesenheit und Ausgabebudget.
 - Vorstart- und laufende Sitzungen verwenden dieselbe Zeitwahl; der zusätzliche Ereigniswert `snapshot_time` entfällt.
 - Die gemeinsame Bestimmung des Abgangs verhindert doppelte Grenzlogik in Quellenprüfung und Reisekern.
 
 Änderungen von Version 0.68 auf 0.69:
 
-- GP-R05-005: Vorstart-Gegenbeweise bleiben bei gleichzeitig aktuellen positiven Sensoren für den Widerruf wiederhergestellter Geo-Reisen wirksam.
-- GP-R05-006: Nur die erste erforderliche Erneuerung je Quelle begrenzt den Abschluss; weitere Negativmessungen verschieben eine gültige Rückkehr nicht.
-- GP-R05-007: Der vorhandene Telefonpuffer übernimmt die Aufbewahrung unverarbeiteter Abschlüsse allein; das zusätzliche Referenzfeld und seine Pflegepfade entfallen.
+- Vorstart-Gegenbeweise bleiben bei gleichzeitig aktuellen positiven Sensoren für den Widerruf wiederhergestellter Geo-Reisen wirksam.
+- Nur die erste erforderliche Erneuerung je Quelle begrenzt den Abschluss; weitere Negativmessungen verschieben eine gültige Rückkehr nicht.
+- Der vorhandene Telefonpuffer übernimmt die Aufbewahrung unverarbeiteter Abschlüsse allein; das zusätzliche Referenzfeld und seine Pflegepfade entfallen.
 
 Änderungen von Version 0.67 auf 0.68:
 
-- GP-R05-001: Widersprochene gesammelte Telefonabschlüsse werden gezielt entwertet; gültige frühere Abschlüsse bleiben für spätere Rückkehr erhalten.
-- GP-R05-002: Nachgelieferte Vorstart-Anwesenheit kann ältere wiederhergestellte Berechtigungen widerrufen, ohne historische Aktionen auszuführen.
-- GP-R05-003: Nahe Zwischenpositionen sperren eine weiterhin gültige Abwesenheitskontinuität nicht.
-- GP-R05-004: Ein gemeinsamer Abschlussnachweis begrenzt Rückkehr über Bündelgrenzen hinweg; der tatsächliche Abschluss bleibt auch im Messmodus maßgeblich.
+- Widersprochene gesammelte Telefonabschlüsse werden gezielt entwertet; gültige frühere Abschlüsse bleiben für spätere Rückkehr erhalten.
+- Nachgelieferte Vorstart-Anwesenheit kann ältere wiederhergestellte Berechtigungen widerrufen, ohne historische Aktionen auszuführen.
+- Nahe Zwischenpositionen sperren eine weiterhin gültige Abwesenheitskontinuität nicht.
+- Ein gemeinsamer Abschlussnachweis begrenzt Rückkehr über Bündelgrenzen hinweg; der tatsächliche Abschluss bleibt auch im Messmodus maßgeblich.
 
 Änderungen von Version 0.66 auf 0.67:
 
-- R-05: Quellenprüfung, Telefonkontinuität und Reiseentscheidung getrennt; gemeinsame Live-Abfragen und direkte Zeitgrenzen statt zusätzlicher Listen und Sortierungen.
-- F-10: Gültige verspätete Anwesenheit widerruft alte Reise- und Ausgabeberechtigungen unabhängig von der Freigabe neuer Aktionen.
-- F-14: Gehaltene negative Zustände können nach einem Home-Austritt eine neue vollständige Abwesenheitsfrist erfüllen, ohne erneut gemeldet werden zu müssen.
+- Quellenprüfung, Telefonkontinuität und Reiseentscheidung getrennt; gemeinsame Live-Abfragen und direkte Zeitgrenzen statt zusätzlicher Listen und Sortierungen.
+- Gültige verspätete Anwesenheit widerruft alte Reise- und Ausgabeberechtigungen unabhängig von der Freigabe neuer Aktionen.
+- Gehaltene negative Zustände können nach einem Home-Austritt eine neue vollständige Abwesenheitsfrist erfüllen, ohne erneut gemeldet werden zu müssen.
 - Gemeinsamer Home-Abgang und gemeinsames Anwesenheitsveto; Abwesenheitsabschlüsse werden anhand ihres tatsächlichen Abschlusszeitpunkts eingeordnet.
 
 Änderungen von Version 0.65 auf 0.66:
 
-- Dritte Etappe von R-08, F-15: Neue Kontextkennungen erhalten einmalig einen zufälligen Sitzungsanteil gegen die erneute Vergabe alter Reise-IDs nach Prozessneustarts.
+- Neue Kontextkennungen erhalten einmalig einen zufälligen Sitzungsanteil gegen die erneute Vergabe alter Reise-IDs nach Prozessneustarts.
 - Wiederhergestellte Reisen behalten ihre ID; neue Reisen verwenden die neue Kennung und den lokalen Zähler.
 - Checkpoint-Format und Übernahme gültiger Daten der Versionen 1 und 2 bleiben erhalten.
 
 Änderungen von Version 0.64 auf 0.65:
 
-- GP-F03-001: Ein beibehaltener unbestätigter Home-Abgang erhält den Verbrauch seiner Reiseaktionen.
+- Ein beibehaltener unbestätigter Home-Abgang erhält den Verbrauch seiner Reiseaktionen.
 - Zurückgewiesene Entfernungs- und Austrittsnachweise bleiben verworfen; neue Nachweise erlauben keine erneute Ausgabe innerhalb derselben Reise.
 
 Änderungen von Version 0.63 auf 0.64:
 
-- Zweite Etappe von R-08, F-03: Aktuelle Verbrauchsstände ersetzen die Historie alter Besuche und deren Reihenfolgeliste.
+- Aktuelle Verbrauchsstände ersetzen die Historie alter Besuche und deren Reihenfolgeliste.
 - Reisegebundener Verbrauch bleibt im Ausflug; gewöhnliche Orts-/Gruppenbesuche und gemeinsame Aktions-Cooldowns bleiben getrennt.
 - Checkpoint-Version 2 mit einmaliger Übernahme gültiger Version-1-Daten und Verdichtung alter Laufzeitzustände beim Reload.
 
 Änderungen von Version 0.62 auf 0.63:
 
-- Erste Etappe von R-08, F-04: Checkpoints folgen Änderungen der gespeicherten Fachdaten statt Diagnoseeinträgen.
+- Checkpoints folgen Änderungen der gespeicherten Fachdaten statt Diagnoseeinträgen.
 - Unveränderte Wiederherstellungen behalten den gespeicherten Stand; Bewegungs- und Anzeigeabläufe werden ausdrücklich erfasst.
 - Reisequalifikation wird vor dem schnellen Rücksprung geprüft; Widerruf und Verbrauch bleiben vor produktiven Ausgaben gespeichert.
 
 Änderungen von Version 0.61 auf 0.62:
 
-- GP-F11-003: Ein verspäteter Austritt vor Home erhält die bestehende Home-Vormerkung samt unbetroffener Fahrzeugentscheidung.
+- Ein verspäteter Austritt vor Home erhält die bestehende Home-Vormerkung samt unbetroffener Fahrzeugentscheidung.
 - Gemeinsame Bewegungsbewertung für neue Hinweise und Teilentwertung; verbliebene Daten behalten bei Teilentwertung ihren ursprünglichen Bewertungszeitpunkt.
 - Kein vollständiger Neuaufbau der Home-Vormerkung und keine Neubewertung, wenn keine Bewegungsdaten entfallen.
 
 Änderungen von Version 0.60 auf 0.61:
 
-- GP-F11-002: Verspätete Austritte unterbrechen bereits den Annäherungsabschnitt, auch nach einer neueren Ortsmeldung und vor der Home-Vormerkung.
+- Verspätete Austritte unterbrechen bereits den Annäherungsabschnitt, auch nach einer neueren Ortsmeldung und vor der Home-Vormerkung.
 - Eine gemeinsame Ursprungszeit begrenzt Austrittsprüfung und Bewegungsergänzung ohne zusätzliche Ereignishistorie.
 - Vor Home liegende Unterbrechungen erhalten eine bereits begonnene gültige Home-Frist, entwerten aber frühere Bewegungsursprünge und deren Fahrzeugentscheidung.
 
 Änderungen von Version 0.59 auf 0.60:
 
-- GP-F11-001: Die aktuelle Annäherungsbeobachtung wird beim Home-Eintritt derselben wartenden Ankunft zugeordnet; ihr gültiger Bewegungsnachtrag bleibt wirksam.
+- Die aktuelle Annäherungsbeobachtung wird beim Home-Eintritt derselben wartenden Ankunft zugeordnet; ihr gültiger Bewegungsnachtrag bleibt wirksam.
 - Der vorhandene Annäherungskontext speichert dafür einen Ereignisschlüssel zusätzlich zur Ablaufzeit. Abbrüche löschen ihn auch vor Beginn einer Home-Frist.
 - Ältere Annäherungsnachträge prüfen die Mindestabwesenheit anhand des bereits qualifizierten Home-Eintritts und lösen keine vorzeitige Bestätigung aus.
 
 Änderungen von Version 0.58 auf 0.59:
 
-- F-11: Akzeptierte Eintritte bleiben ihrer offenen Ankunft zugeordnet; neuere bewegungslose Meldungen verwerfen ihre Bewegungsnachträge nicht mehr.
+- Akzeptierte Eintritte bleiben ihrer offenen Ankunft zugeordnet; neuere bewegungslose Meldungen verwerfen ihre Bewegungsnachträge nicht mehr.
 - Gemeinsame Ergänzungsprüfung für Geometrie-Vorfilter und Duplikatverarbeitung; vorhandener begrenzter Duplikatspeicher wird weiterverwendet.
 - Der neueste Home-Nachweis bleibt bei älteren Ergänzungen erhalten, damit verspätete Austritte die Ankunft weiterhin korrekt unterbrechen.
 
 Änderungen von Version 0.57 auf 0.58:
 
-- Erste Etappe von R-03: Feste Bündelfrist ab erstem Empfang korrigiert F-06; neue Meldungen verschieben ältere nicht mehr beliebig.
-- F-05: Chronologisch gruppierte Konfliktprüfung ersetzt den Vergleich sämtlicher Paare; nur gleiche Zeitstempel werden miteinander verglichen.
+- Die Bündelfrist beginnt mit dem ersten Empfang; neue Meldungen verschieben ältere nicht mehr beliebig.
+- Chronologisch gruppierte Konfliktprüfung ersetzt den Vergleich sämtlicher Paare; nur gleiche Zeitstempel werden miteinander verglichen.
 - Alle bereits vorliegenden Gegenbeobachtungen eines fälligen Bündels bleiben vor der Ankunftsbestätigung berücksichtigt.
 
 Änderungen von Version 0.56 auf 0.57:

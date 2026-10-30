@@ -129,10 +129,10 @@ subtest 'cosmetic edits preserve checkpoint binding across reload' => sub {
     is(scalar @messages,0,'reload produces no notifications');
 };
 
-subtest 'ordinary version 1 checkpoints retain their pre-R01 binding' => sub {
+subtest 'ordinary version 1 checkpoints retain their previous configuration binding' => sub {
     my $c=fixture();
     delete @{$attr{Message}}{qw(room target)};
-    # Generated with the module before R-01 for this fixture, using only the
+    # Generated with the earlier configuration fingerprint for this fixture, using only the
     # adapter's supported attributes. No dependency on the new hash builder.
     my $legacy_revision='54091508a3b8828224c7659f66f0050c24fd0df9ec73caa5f97e7b41c529cfc3';
     my $cfg=GP_Config($c,'Geo.A');
@@ -238,7 +238,7 @@ subtest 'reports reuse their prepared configuration without allocating journey s
     is(scalar @commands,0,'report emits no commands');
 };
 
-subtest 'GP-R01-001: saved timing pairs load independently of attribute order' => sub {
+subtest 'saved timing pairs load independently of attribute order' => sub {
     my $c=fixture();
     for my $order ([action_max_age=>2,reorder_window=>1],[reorder_window=>1,action_max_age=>2]) {
         {
@@ -265,7 +265,7 @@ subtest 'GP-R01-001: saved timing pairs load independently of attribute order' =
     is($attr{GP}{action_max_age},1,'invalid configuration is reported without replacing its value by a default');
 };
 
-subtest 'GP-R01-002: cold administrative edits never compile discarded catalogues' => sub {
+subtest 'cold administrative edits never compile discarded catalogues' => sub {
     my $c=fixture();
     GP_InvalidateConfig($c);
     my $calls=0; my $catalog=\&GP_Catalog;
@@ -293,7 +293,7 @@ subtest 'GP-R01-002: cold administrative edits never compile discarded catalogue
     is(GP_Config($c,'Geo.A')->{allowDoor},1,'next real consumer sees the committed configuration');
 };
 
-subtest 'GP-R01-003/GP-SIM-018: unrelated lifecycle events do no inventory or widget work' => sub {
+subtest 'unrelated lifecycle events do no inventory or widget work' => sub {
     my $c=fixture();
     $defs{Unrelated}={NAME=>'Unrelated',TYPE=>'dummy'};
     my ($inventory,$catalog)=@{$c->{helper}}{qw(gp_devices gp_config)};
@@ -320,7 +320,7 @@ subtest 'GP-R01-003/GP-SIM-018: unrelated lifecycle events do no inventory or wi
     is(refaddr($c->{helper}{gp_config}),refaddr($current),'unrelated modify retains full configuration');
 };
 
-subtest 'GP-R01-003: PRESENCE choices follow definition, rename and deletion' => sub {
+subtest 'PRESENCE choices follow definition, rename and deletion' => sub {
     my $c=fixture(); GP_StoreMode($c,'debug');
     $defs{Phone1}={NAME=>'Phone1',TYPE=>'PRESENCE'};
     attribute('Geo.A','sourceMode','phone_only'); attribute('Geo.A','phoneProxies','Phone1');
@@ -344,7 +344,7 @@ subtest 'GP-R01-003: PRESENCE choices follow definition, rename and deletion' =>
     is($updates,3,'missing or unknown types and deletions retain conservative widget refreshes');
 };
 
-subtest 'GP-R01-004: exact diagnostic edits retain configuration, bulk deletions invalidate it' => sub {
+subtest 'exact diagnostic edits retain configuration, bulk deletions invalidate it' => sub {
     my $c=fixture(); GP_StoreMode($c,'debug');
     my $catalog=$c->{helper}{gp_config};
     for my $spec ([debugLog=>1],[logFile=>'/tmp/geopresence-review-diagnostic-%Y.log']) {

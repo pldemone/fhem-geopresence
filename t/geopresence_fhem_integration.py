@@ -536,32 +536,32 @@ def check_http_quotas(command, http_request, request, auth_headers, password, ch
         unknown = dict(headers, Authorization="Basic " + base64.b64encode(b"unknown:invalid").decode())
         for label, failed in (("missing", auth_headers(False)), ("wrong", auth_headers("wrong")), ("unknown", unknown)):
             statuses = [post(failed) for _ in range(121)]
-            check(statuses == [401] * 121, f"F-12 {label} credentials never consume the processing quota")
-        check(request("Home", 1, debug=True)[0] == 200, "F-12 valid webhook remains available after failed logins")
-        check([post() for _ in range(119)] == [400] * 119, "F-12 all remaining authenticated processing slots are available")
-        check(post() == 429, "F-12 authenticated request 121 is limited")
-        check(post(auth_headers(False)) == 401, "F-12 exhausted quota retains the authentication challenge")
+            check(statuses == [401] * 121, f"{label} credentials never consume the processing quota")
+        check(request("Home", 1, debug=True)[0] == 200, "valid webhook remains available after failed logins")
+        check([post() for _ in range(119)] == [400] * 119, "all remaining authenticated processing slots are available")
+        check(post() == 429, "authenticated request 121 is limited")
+        check(post(auth_headers(False)) == 401, "exhausted quota retains the authentication challenge")
         command("{ $main::GP_rate_mono+=30;; return 'elapsed' }")
-        check([post(other_headers) for _ in range(120)] == [400] * 120, "F-12 another resident retains its full quota")
-        check(post(other_headers) == 429, "F-12 second resident has its own limit")
+        check([post(other_headers) for _ in range(120)] == [400] * 120, "another resident retains its full quota")
+        check(post(other_headers) == 429, "second resident has its own limit")
         command("{ $main::GP_rate_mono+=30;; return 'elapsed' }")
-        check(post() == 400 and post(other_headers) == 429, "F-12 residents renew at independent deadlines")
+        check(post() == 400 and post(other_headers) == 429, "residents renew at independent deadlines")
         command("{ $main::GP_rate_mono+=30;; return 'elapsed' }")
-        check(post(other_headers) == 400, "F-12 second resident renews at its own deadline")
+        check(post(other_headers) == 400, "second resident renews at its own deadline")
         check(command("set Geo.Rate mode learning").startswith("Learning for 15 minutes"),
               "quota test enters the real learning mode")
-        check([post(other_headers) for _ in range(119)] == [400] * 119, "F-12 learning shares the resident quota")
-        check(post(other_headers) == 429, "F-12 mode change did not reset the processing limit")
+        check([post(other_headers) for _ in range(119)] == [400] * 119, "learning shares the resident quota")
+        check(post(other_headers) == 429, "mode change did not reset the processing limit")
 
         for shift in (-3600, 3600):
             command("{ $main::GP_rate_mono+=60;; return 'new window' }")
-            check([post() for _ in range(120)] == [400] * 120, f"F-16 shift {shift}: full initial window")
+            check([post() for _ in range(120)] == [400] * 120, f"shift {shift}: full initial window")
             command(f"{{ $main::GP_rate_wall+={shift};; $main::GP_rate_mono+=59;; return 'clock corrected' }}")
-            check(post() == 429, f"F-16 shift {shift}: still limited before 60 elapsed seconds")
+            check(post() == 429, f"shift {shift}: still limited before 60 elapsed seconds")
             command("{ $main::GP_rate_mono+=1;; return 'elapsed' }")
-            check(post() == 400, f"F-16 shift {shift}: renews exactly at 60 monotonic seconds")
+            check(post() == 400, f"shift {shift}: renews exactly at 60 monotonic seconds")
             check([post() for _ in range(119)] == [400] * 119 and post() == 429,
-                  f"F-16 shift {shift}: renewed window retains the full limit")
+                  f"shift {shift}: renewed window retains the full limit")
         check(command("delete Geo.Rate") == "", "temporary quota resident can be deleted")
         check(command("{ exists $defs{GP}{helper}{gp}{http_rate}{'Geo.Rate'} ? 1:0 }") == "0",
               "deleted resident leaves no quota entry")
@@ -592,35 +592,35 @@ def check_auth_key_names(command, http_request, auth_headers, password, check):
     def check_foreign_lines():
         check(command("{ my ($err,@lines)=FileRead('./FHEM/FhemUtils/uniqueID');; "
                       "return !$err && (grep {$_ eq 'GeoPresence_GeoCA_auth:foreign value'} @lines) "
-                      "&& (grep {$_ eq '# GP-R11-001 retained comment'} @lines) ? 1:0 }") == "1",
-              "GP-R11-001 exact cleanup preserves foreign entries and comments")
+                      "&& (grep {$_ eq '# retained comment'} @lines) ? 1:0 }") == "1",
+              "exact cleanup preserves foreign entries and comments")
 
     try:
-        check(command("rename Geo.Test Geo.A") == "", "GP-R11-001 prepare dotted person name")
+        check(command("rename Geo.Test Geo.A") == "", "prepare dotted person name")
         check(command("{ my $file='./FHEM/FhemUtils/uniqueID';; my ($err,@lines)=FileRead($file);; die $err if $err;; "
                       "my $a=GP_AuthKey('Geo.A');; my $b=GP_AuthKey('GeoBA');; "
                       "my $first=(GP_ReadAuth('Geo.A'))[1];; my $second=(GP_ReadAuth('GeoBA'))[1];; "
                       "return FileWrite($file,(grep {index($_,$a.':')!=0 && index($_,$b.':')!=0} @lines),"
                       "'GeoPresence_GeoBA_auth:'.$second,'GeoPresence_Geo.A_auth:'.$first,"
-                      "'GeoPresence_GeoCA_auth:foreign value','# GP-R11-001 retained comment') // 'seeded' }") == "seeded",
-              "GP-R11-001 seed exact old-format entries with distinct passwords")
+                      "'GeoPresence_GeoCA_auth:foreign value','# retained comment') // 'seeded' }") == "seeded",
+              "seed exact old-format entries with distinct passwords")
         command("{ GP_ResetController($defs{GP});; GeoPresence_Timer($defs{GP});; return 'reset' }")
         check(post(auth_headers()) == 400 and post(other_headers) == 400,
-              "GP-R11-001 legacy lookup does not confuse names matched by a dot")
+              "legacy lookup does not confuse names matched by a dot")
         check(command("{ defined((getKeyValue(GP_AuthKey('Geo.A')))[1]) ? 1:0 }") == "0",
-              "GP-R11-001 reading a legacy password does not write a new key")
+              "reading a legacy password does not write a new key")
         for old, new in (("Geo.A", "GeoXA"), ("GeoXA", "Geo.A")):
-            check(command(f"rename {old} {new}") == "", "GP-R11-001 rename succeeds: " + old + " to " + new)
+            check(command(f"rename {old} {new}") == "", "rename succeeds: " + old + " to " + new)
             command("{ GP_ResetController($defs{GP});; GeoPresence_Timer($defs{GP});; return 'reset' }")
-            check(post(auth_headers()) == 400, "GP-R11-001 migrated password authenticates with a cold cache")
-            check(post(other_headers) == 400, "GP-R11-001 unrelated password authenticates with a cold cache")
+            check(post(auth_headers()) == 400, "migrated password authenticates with a cold cache")
+            check(post(other_headers) == 400, "unrelated password authenticates with a cold cache")
             check(command("{ defined((GP_ReadAuth('" + old + "'))[1]) ? 1:0 }") == "0",
-                  "GP-R11-001 old exact key is absent")
+                  "old exact key is absent")
             check_foreign_lines()
         command("{ my $file='./FHEM/FhemUtils/uniqueID';; my ($err,@lines)=FileRead($file);; die $err if $err;; "
                 "return FileWrite($file,@lines,'GeoPresence_Geo.A_auth:'.(GP_ReadAuth('Geo.A'))[1]) }")
-        check("stored" in command(f"set Geo.A webhookPassword {password}"), "GP-R11-001 password change cleans a dotted legacy key")
-        check(post(auth_headers()) == 400 and post(other_headers) == 400, "GP-R11-001 password change preserves both logins")
+        check("stored" in command(f"set Geo.A webhookPassword {password}"), "password change cleans a dotted legacy key")
+        check(post(auth_headers()) == 400 and post(other_headers) == 400, "password change preserves both logins")
         check_foreign_lines()
     finally:
         command("{ CommandRename(undef,'GeoXA Geo.Test') if $defs{GeoXA};; "
@@ -628,7 +628,7 @@ def check_auth_key_names(command, http_request, auth_headers, password, check):
         command("delete GeoBA")
         command("delete rr_Key")
         command("{ GP_ResetController($defs{GP});; GeoPresence_Timer($defs{GP});; return 'reset' }")
-    check(command("get GP validate").startswith("OK:"), "GP-R11-001 original configuration validates after key-store checks")
+    check(command("get GP validate").startswith("OK:"), "original configuration validates after key-store checks")
 
 
 def check_lifecycle(command, request, advance, web_port, check):
@@ -642,56 +642,56 @@ def check_lifecycle(command, request, advance, web_port, check):
                     break
             else:
                 raise AssertionError("rename test client was not accepted")
-            check(command("rename GP GP.Renamed") == "", "F-13 real controller rename succeeds")
-            check(command("{ exists $selectlist{'GeoPresenceHTTP:GP'} ? 1:0 }") == "0", "F-13 old listener is deregistered")
-            check(partial.recv(1) == b"", "F-13 partial old client is closed")
+            check(command("rename GP GP.Renamed") == "", "real controller rename succeeds")
+            check(command("{ exists $selectlist{'GeoPresenceHTTP:GP'} ? 1:0 }") == "0", "old listener is deregistered")
+            check(partial.recv(1) == b"", "partial old client is closed")
         command("{ GeoPresence_Timer($defs{'GP.Renamed'});; return 'ticked' }")
         check(command("{ $defs{'GP.Renamed'}{helper}{gp_http}{server}{OWNER} }") == "GP.Renamed",
-              "F-13 reopened listener belongs to the renamed controller")
-        check(command("{ $defs{'Geo.Test'}{DEF} }") == "resident GP.Renamed rr_Test", "F-13 resident definition follows controller")
-        check(command("{ $defs{'A.Door'}{DEF} }") == "action GP.Renamed door_open", "F-13 action definition follows controller")
-        check(request("Home", 1, debug=True)[0] == 200, "F-13 renamed controller accepts a real authenticated webhook")
+              "reopened listener belongs to the renamed controller")
+        check(command("{ $defs{'Geo.Test'}{DEF} }") == "resident GP.Renamed rr_Test", "resident definition follows controller")
+        check(command("{ $defs{'A.Door'}{DEF} }") == "action GP.Renamed door_open", "action definition follows controller")
+        check(request("Home", 1, debug=True)[0] == 200, "renamed controller accepts a real authenticated webhook")
         command("save")
         check(command("{ my ($err,@lines)=FileRead('test.cfg');; return scalar grep {/^define Geo.Test GeoPresence resident GP.Renamed rr_Test/} @lines }") == "1",
-              "F-13 save persists the repaired parent definition")
-        check(command("rename GP.Renamed GP") == "", "F-13 controller can be renamed back")
+              "save persists the repaired parent definition")
+        check(command("rename GP.Renamed GP") == "", "controller can be renamed back")
         command("{ GeoPresence_Timer($defs{GP});; return 'ticked' }")
         secret = command("{ (GP_ReadAuth('Geo.Test'))[1] }")
-        check(command("rename Geo.Test Geo.Renamed") == "", "F-13 real resident rename succeeds")
-        check(command("{ (GP_ReadAuth('Geo.Renamed'))[1] }") == secret, "F-13 verifier moved in the real key store")
-        check(command("{ defined((GP_ReadAuth('Geo.Test'))[1]) ? 1:0 }") == "0", "F-13 old credential key was removed")
-        check(command("{ $defs{'Z.Home'}{DEF} }") == "location Geo.Renamed home", "F-13 private location definition follows resident")
-        check(request("Home", 1, debug=True)[0] == 200, "F-13 renamed resident keeps its existing webhook login")
-        check("unknown resident Geo.Test" in command("get GP validate"), "F-13 unresolved public rule references remain visible")
+        check(command("rename Geo.Test Geo.Renamed") == "", "real resident rename succeeds")
+        check(command("{ (GP_ReadAuth('Geo.Renamed'))[1] }") == secret, "verifier moved in the real key store")
+        check(command("{ defined((GP_ReadAuth('Geo.Test'))[1]) ? 1:0 }") == "0", "old credential key was removed")
+        check(command("{ $defs{'Z.Home'}{DEF} }") == "location Geo.Renamed home", "private location definition follows resident")
+        check(request("Home", 1, debug=True)[0] == 200, "renamed resident keeps its existing webhook login")
+        check("unknown resident Geo.Test" in command("get GP validate"), "unresolved public rule references remain visible")
         command("save")
         check(command("{ my ($err,@lines)=FileRead('test.cfg');; return scalar grep {/^define Z.Home GeoPresence location Geo.Renamed home/} @lines }") == "1",
-              "F-13 save persists the repaired resident binding")
-        check(command("rename Geo.Renamed Geo.Test") == "", "F-13 resident can be renamed back")
+              "save persists the repaired resident binding")
+        check(command("rename Geo.Renamed Geo.Test") == "", "resident can be renamed back")
         command("save")
-        check(command("get GP validate").startswith("OK:"), "F-13 original public configuration validates again")
+        check(command("get GP validate").startswith("OK:"), "original public configuration validates again")
 
-        check(command("set Geo.Test mode active") == "", "F-17 resident activation succeeds")
-        check(command("set GP mode active") == "", "F-17 controller activation succeeds")
+        check(command("set Geo.Test mode active") == "", "resident activation succeeds")
+        check(command("set GP mode active") == "", "controller activation succeeds")
         command("set rr_Test state absent")
         advance(40)
-        command("{ $main::GP_r11_set_fn=$modules{ROOMMATE}{SetFn};; "
-                "no warnings 'redefine';; *GP_R11RoommateSet=sub { return 'temporary ROOMMATE failure' };; "
-                "$modules{ROOMMATE}{SetFn}='GP_R11RoommateSet';; return 'failure installed' }")
-        check(request("Home", 1)[0] == 200, "F-17 status-only Home observation enters through HTTP")
+        command("{ $main::GP_original_roommate_set_fn=$modules{ROOMMATE}{SetFn};; "
+                "no warnings 'redefine';; *GP_FailingRoommateSet=sub { return 'temporary ROOMMATE failure' };; "
+                "$modules{ROOMMATE}{SetFn}='GP_FailingRoommateSet';; return 'failure installed' }")
+        check(request("Home", 1)[0] == 200, "status-only Home observation enters through HTTP")
         advance(3)
         check("temporary ROOMMATE failure" in command("{ ReadingsVal('Geo.Test','gp_roommate_error','') }"),
-              "F-17 real CommandSet failure is exposed in the resident Reading")
+              "real CommandSet failure is exposed in the resident Reading")
         check(command("{ $defs{GP}{helper}{gp}{prod}{'Geo.Test'}{desired_status} }") == "home",
-              "F-17 unsuccessful status request remains pending")
-        command("{ $modules{ROOMMATE}{SetFn}=$main::GP_r11_set_fn;; return 'restored' }")
+              "unsuccessful status request remains pending")
+        command("{ $modules{ROOMMATE}{SetFn}=$main::GP_original_roommate_set_fn;; return 'restored' }")
         advance(1)
-        check(command("{ ReadingsVal('rr_Test','state','') }") == "home", "F-17 next timer retry uses the real ROOMMATE adapter")
-        check(command("{ ReadingsVal('Geo.Test','gp_roommate_error','missing') }") == "", "F-17 recovery clears the error Reading")
+        check(command("{ ReadingsVal('rr_Test','state','') }") == "home", "next timer retry uses the real ROOMMATE adapter")
+        check(command("{ ReadingsVal('Geo.Test','gp_roommate_error','missing') }") == "", "recovery clears the error Reading")
         check(command("{ ReadingsVal('door','state','untouched') }") == "untouched"
               and command("{ ReadingsVal('garage','state','untouched') }") == "untouched",
-              "F-17 retry does not create an opening permission")
+              "retry does not create an opening permission")
     finally:
-        command("{ $modules{ROOMMATE}{SetFn}=$main::GP_r11_set_fn if defined $main::GP_r11_set_fn;; "
+        command("{ $modules{ROOMMATE}{SetFn}=$main::GP_original_roommate_set_fn if defined $main::GP_original_roommate_set_fn;; "
                 "CommandRename(undef,'Geo.Renamed Geo.Test') if $defs{'Geo.Renamed'};; "
                 "CommandRename(undef,'GP.Renamed GP') if $defs{'GP.Renamed'};; return 'restored' }")
         command("set GP mode debug")
@@ -1097,7 +1097,7 @@ def run(source, encoding="bytestream", help_only=False):
             check("would execute" in command("get GP debugTrace Geo.Test format=json"), "debug trace traverses actual socket, parser and timer")
             check(command("{ $main::GP_fixture_user_readings }") == "0", "debug did not invoke real userReadings")
             check(command("{ ReadingsVal('door','state','untouched') }") == "untouched", "debug did not set actuator")
-            # R-03, first stage: the first receipt closes each collection
+            # The first receipt closes each collection
             # window even while newer webhooks continue to arrive.
             command("set GP debugReset Geo.Test keepGeometry")
             advance(40)
@@ -1105,15 +1105,15 @@ def run(source, encoding="bytestream", help_only=False):
                 payload = event_body("Work", 0, test=True)
                 observed = datetime.datetime.fromisoformat(urllib.parse.parse_qs(payload)["date"][0]).timestamp()
                 check(http_request("POST", "/fhem/geopresence", payload, auth_headers())[0] == 200,
-                      "R-03 continuous stream accepts a fresh webhook")
+                      "continuous stream accepts a fresh webhook")
                 command("{ GeoPresence_Timer($defs{GP});; return 'ticked' }")
                 pending = int(command("{ scalar @{$defs{GP}{helper}{gp}{queue}} }"))
                 check(pending == (step + 1) % 3,
-                      f"R-03 stream cannot postpone the first receipt deadline: step={step}, pending={pending}")
+                      f"stream cannot postpone the first receipt deadline: step={step}, pending={pending}")
                 if step % 3 == 2:
                     state = json.loads(command("get GP explain Geo.Test debug format=json"))["state"]
                     check(abs(state["last_observed"] - observed) < 0.001,
-                          "R-03 due batch includes its newest received observation")
+                          "due batch includes its newest received observation")
                 if step < 5:
                     command("{ $main::GP_fixture_offset += 1 }")
             command("set GP debugReset Geo.Test keepGeometry")
@@ -1123,7 +1123,7 @@ def run(source, encoding="bytestream", help_only=False):
                 payload = urllib.parse.parse_qs(event_body("Home", 1, test=True))
                 payload["date"] = [datetime.datetime.fromtimestamp(latest - age, datetime.timezone.utc).isoformat()]
                 check(http_request("POST", "/fhem/geopresence", urllib.parse.urlencode(payload, doseq=True), auth_headers())[0] == 200,
-                      "R-03 accepts a batch with distinct observation times")
+                      "accepts a batch with distinct observation times")
             comparisons = json.loads(command(
                 "{ no warnings 'redefine';; my $compare=\\&GP_Contradiction;; my $calls=0;; "
                 "$main::GP_fixture_offset+=2;; "
@@ -1131,8 +1131,8 @@ def run(source, encoding="bytestream", help_only=False):
                 "return JSON::PP->new->encode({calls=>$calls,pending=>scalar(@{$defs{GP}{helper}{gp}{queue}}),"
                 "observed=>$defs{GP}{helper}{gp}{debug}{'Geo.Test'}{last_observed}}) }"))
             check(comparisons["calls"] <= 64 and comparisons["pending"] == 0,
-                  "R-03 removes quadratic batch comparisons for distinct times")
-            check(abs(comparisons["observed"] - latest) < 0.001, "R-03 processes the latest observation in the sorted batch")
+                  "removes quadratic batch comparisons for distinct times")
+            check(abs(comparisons["observed"] - latest) < 0.001, "processes the latest observation in the sorted batch")
             check(command("set Geo.Test mode active") == "", "resident activation")
             check(command("set GP mode active") == "", "controller activation")
             advance(40)
@@ -1817,15 +1817,15 @@ def run(source, encoding="bytestream", help_only=False):
             actor_reading("upper", "state", "closed")
             actor_reading("lower", "state", "open")
             advance(1)
-            # R-07: use actual FHEM notify callbacks during the first dummy
+            # use actual FHEM notify callbacks during the first dummy
             # opening. A short age budget makes a real 1.5 s stall sufficient.
-            check(command("define rr_R07 ROOMMATE") == "", "prepare unrelated R-07 resident")
+            check(command("define rr_Callback ROOMMATE") == "", "prepare unrelated resident")
             for reason, callback in (("manual Home", "set rr_Test home"),
                                      ("expired", "{ Time::HiRes::sleep(1.5) }"),
-                                     ("controller rename", "{ CommandRename(undef,'GP GP.R11'), CommandRename(undef,'GP.R11 GP') }"),
-                                     ("resident rename", "{ CommandRename(undef,'Geo.Test Geo.R11Temp'), CommandRename(undef,'Geo.R11Temp Geo.Test') }"),
-                                     ("unrelated configuration", "define Geo.R07 GeoPresence resident GP rr_R07"),
-                                     ("alias", "attr Geo.Test alias R07 name"),
+                                     ("controller rename", "{ CommandRename(undef,'GP GP.Callback'), CommandRename(undef,'GP.Callback GP') }"),
+                                     ("resident rename", "{ CommandRename(undef,'Geo.Test Geo.CallbackTemp'), CommandRename(undef,'Geo.CallbackTemp Geo.Test') }"),
+                                     ("unrelated configuration", "define Geo.Callback GeoPresence resident GP rr_Callback"),
+                                     ("alias", "attr Geo.Test alias Callback name"),
                                      ("alias deletion", "deleteattr Geo.Test alias"),
                                      ("ROOMMATE alias pattern", "deleteattr rr_Test ^alias$"),
                                      ("ROOMMATE alias class pattern", "deleteattr rr_Test [a]lias"),
@@ -1834,41 +1834,41 @@ def run(source, encoding="bytestream", help_only=False):
                                      ("controller pattern", "{ $main::GP_fixture_delete_result=CommandDeleteAttr(undef,'GP action_max_ag.') }"),
                                      ("controller all", "{ $main::GP_fixture_delete_result=CommandDeleteAttr(undef,'GP') }"),
                                      ("clock correction during wait", "{ Time::HiRes::sleep(2.5) }")):
-                check(command("set GP mode debug") == "", "pause R-07 fixture")
-                check(command("attr GP reorder_window 0.1") == "", "short R-07 reorder window")
-                check(command("attr GP action_max_age 2") == "", "short R-07 output budget")
-                check(command("set GP mode active") == "", "activate R-07 fixture")
+                check(command("set GP mode debug") == "", "pause fixture")
+                check(command("attr GP reorder_window 0.1") == "", "short reorder window")
+                check(command("attr GP action_max_age 2") == "", "short output budget")
+                check(command("set GP mode active") == "", "activate fixture")
                 if reason.startswith("ROOMMATE"):
-                    check(command("attr rr_Test alias R07 label") == "", "prepare a real ROOMMATE alias")
+                    check(command("attr rr_Test alias Callback label") == "", "prepare a real ROOMMATE alias")
                 advance(40)
                 phone_state("p1", "absent")
                 phone_state("p2", "absent")
                 advance(5)
-                check(request("Outer", 0)[0] == 200, "R-07 remote departure accepted")
+                check(request("Outer", 0)[0] == 200, "remote departure accepted")
                 advance(1)
                 advance(90)
                 refresh_actor_contacts()
                 command("set door untouched")
                 command("set garage untouched")
-                check(command("define R07.Door notify door:lock.unlocked " + callback) == "",
-                      "R-07 synchronous callback installed: " + reason)
+                check(command("define Callback.Door notify door:lock.unlocked " + callback) == "",
+                      "synchronous callback installed: " + reason)
                 correction = reason == "clock correction during wait"
                 check(request("Home", 1, motion="unknown" if correction else "automotive")[0] == 200,
-                      "R-07 Home observation accepted")
+                      "Home observation accepted")
                 advance(1)
                 planned = json.loads(command("get GP explain Geo.Test prod format=json"))["state"]
-                check(planned["arrival"]["wait"] == (60 if correction else 10), "R-07 arrival retains its normal wait")
+                check(planned["arrival"]["wait"] == (60 if correction else 10), "arrival retains its normal wait")
                 if correction:
                     advance(49)
                     command("{ no warnings 'redefine';; *GP_Now=sub { Time::HiRes::time()+$main::GP_fixture_offset-10 };; return 'wall corrected' }")
                 advance(10)
                 check(command("{ ReadingsVal('door','state','') }") == "lock unlocked",
-                      "R-07 first door command executes: " + reason)
+                      "first door command executes: " + reason)
                 unrelated = reason == "unrelated configuration"
                 renamed = reason in ("controller rename", "resident rename")
                 allowed = not renamed and reason not in ("manual Home", "expired", "clock correction during wait", "ROOMMATE functional pattern")
                 check(command("{ ReadingsVal('garage','state','') }") == ("on" if allowed else "untouched"),
-                      "R-07 remaining garage command respects current permission: " + reason)
+                      "remaining garage command respects current permission: " + reason)
                 changed = json.loads(command("get GP explain Geo.Test prod format=json"))["state"]
                 if allowed:
                     permission_valid = changed["output_revision"] == planned["output_revision"]
@@ -1878,10 +1878,10 @@ def run(source, encoding="bytestream", help_only=False):
                     permission_valid = changed["output_revision"] > planned["output_revision"]
                 else:
                     permission_valid = any(row["reason"] == "intent expired" for row in changed["trace"])
-                check(permission_valid, "R-07 permission change is scoped to the affected resident")
+                check(permission_valid, "permission change is scoped to the affected resident")
                 check(("garage" in json.loads(command("get GP explain Geo.Test prod format=json"))["pending_actors"]) == allowed,
-                      "R-07 reserves only commands that were actually issued")
-                check(command("delete R07.Door") == "", "remove R-07 callback")
+                      "reserves only commands that were actually issued")
+                check(command("delete Callback.Door") == "", "remove callback")
                 if reason.startswith("ROOMMATE"):
                     check(command("{ AttrVal('rr_Test','alias','missing') }") == "missing", "ROOMMATE pattern actually removed the alias")
                     check(command("{ GP_Config($defs{GP},'Geo.Test',0)->{label} }") == "rr_Test",
@@ -1889,13 +1889,13 @@ def run(source, encoding="bytestream", help_only=False):
                     check(command("attr rr_Test rr_locationUnderway underway") == "", "restore ROOMMATE guard")
                 if reason in ("controller pattern", "controller all"):
                     check("Controller configuration requires" in command("{ $main::GP_fixture_delete_result }"),
-                          "R-07 rejects the real controller bulk deletion before committing it")
+                          "rejects the real controller bulk deletion before committing it")
                     check(command("{ AttrVal('GP','action_max_age','missing') }") == "2",
-                          "R-07 rejected bulk deletion retains the original age")
+                          "rejected bulk deletion retains the original age")
                 if correction:
                     command("{ no warnings 'redefine';; *GP_Now=sub { Time::HiRes::time()+$main::GP_fixture_offset };; return 'wall restored' }")
                 if unrelated:
-                    check(command("delete Geo.R07") == "", "remove unrelated R-07 resident")
+                    check(command("delete Geo.Callback") == "", "remove unrelated resident")
                 if allowed:
                     actor_reading("gate", "state", "open")
                     actor_reading("upper", "state", "open")
@@ -1904,8 +1904,8 @@ def run(source, encoding="bytestream", help_only=False):
                 advance(1)
                 completed = json.loads(command("get GP explain Geo.Test prod format=json"))
                 check("door" not in completed["pending_actors"] if renamed else completed["state"]["door_result"] == "confirmed",
-                      "R-07 retains feedback for the issued door command")
-            check(command("delete rr_R07") == "", "remove unrelated R-07 ROOMMATE")
+                      "retains feedback for the issued door command")
+            check(command("delete rr_Callback") == "", "remove unrelated ROOMMATE")
             command("set GP mode debug")
             command("deleteattr GP action_max_age")
             command("deleteattr GP reorder_window")
@@ -1926,7 +1926,7 @@ def run(source, encoding="bytestream", help_only=False):
                 check(command("deleteattr " + name + " " + pattern) == "", "real obsolete-attribute pattern accepted")
                 check(command("get GP validate Geo.Test").startswith("OK:"), "cleaned attributes refresh real validation")
                 check(command("set GP mode active") == "", "cleaned configuration activates without a reload")
-            # GP-F03-001: keeping the same unarmed Home departure must keep its
+            # keeping the same unarmed Home departure must keep its
             # route consumption, even after a new valid exit and another visit.
             zones["RouteA"] = ("place", 0.0009, 20)
             zones["RouteB"] = ("place", 0.00135, 20)
@@ -1939,10 +1939,10 @@ def run(source, encoding="bytestream", help_only=False):
                          "attr R.RetainedRoute trigger enter", "attr R.RetainedRoute locations Z.RouteB",
                          "attr R.RetainedRoute afterExit location:Z.RouteA", "attr R.RetainedRoute action A.RetainedRoute",
                          "attr R.RetainedRoute cooldown 0", "set GP mode active"):
-                check(command(text) == "", "GP-F03-001 configures the real route: " + text)
+                check(command(text) == "", "configures the real route: " + text)
             advance(40)
             for zone in ("RouteA", "RouteB"):
-                check(request(zone, 1)[0] == 200, "GP-F03-001 initializes nearby geometry")
+                check(request(zone, 1)[0] == 200, "initializes nearby geometry")
                 advance(3)
             command("{ GP_ResetController($defs{GP});; return 'reset' }")
             advance(40)
@@ -1951,60 +1951,60 @@ def run(source, encoding="bytestream", help_only=False):
             advance(5)
             for target in ("retainedRouteLamp", "door", "garage"):
                 command(f"set {target} untouched")
-            check(request("Home", 0)[0] == 200, "GP-F03-001 accepts the unconfirmed Home departure")
+            check(request("Home", 0)[0] == 200, "accepts the unconfirmed Home departure")
             advance(3)
             retained = json.loads(command("get GP explain Geo.Test prod format=json"))["state"]["trip"]
             for zone, entry in (("RouteA", 0), ("RouteB", 1)):
                 advance(10)
-                check(request(zone, entry)[0] == 200, "GP-F03-001 accepts the initial route observation")
+                check(request(zone, entry)[0] == 200, "accepts the initial route observation")
                 advance(3)
             check(command("{ ReadingsVal('retainedRouteLamp','state','') }") == "on",
-                  "GP-F03-001 first route command really reached the dummy")
+                  "first route command really reached the dummy")
             consumed = json.loads(command("get GP explain Geo.Test prod format=json"))["state"]["trip"]["actions"]
             command("set retainedRouteLamp untouched")
             advance(10)
-            check(request("Outer", 0)[0] == 200, "GP-F03-001 accepts the contradictory outer observation")
+            check(request("Outer", 0)[0] == 200, "accepts the contradictory outer observation")
             advance(3)
             state = json.loads(command("get GP explain Geo.Test prod format=json"))["state"]
             check(state["trip"]["id"] == retained["id"] and state["trip"]["home_exit"] == retained["home_exit"]
                   and state["trip"]["scope"] == "local" and not state["trip"]["armed"],
-                  "GP-F03-001 retains the same unarmed local trip")
+                  "retains the same unarmed local trip")
             check(state["trip"]["actions"] == consumed and not state["trip"].get("exits"),
-                  "GP-F03-001 retains consumption while discarding rejected exit evidence")
+                  "retains consumption while discarding rejected exit evidence")
             for zone, entry in (("RouteA", 1), ("RouteA", 0), ("RouteB", 0), ("RouteB", 1)):
                 advance(10)
-                check(request(zone, entry)[0] == 200, "GP-F03-001 accepts a new explicit route visit")
+                check(request(zone, entry)[0] == 200, "accepts a new explicit route visit")
                 advance(3)
             check(command("{ ReadingsVal('retainedRouteLamp','state','') }") == "untouched",
-                  "GP-F03-001 new exit evidence cannot repeat a consumed route in the same trip")
+                  "new exit evidence cannot repeat a consumed route in the same trip")
             for zone, entry in (("Home", 1), ("Home", 0), ("RouteA", 0), ("RouteB", 1)):
                 advance(10)
-                check(request(zone, entry)[0] == 200, "GP-F03-001 accepts a genuinely new outing")
+                check(request(zone, entry)[0] == 200, "accepts a genuinely new outing")
                 advance(3)
             state = json.loads(command("get GP explain Geo.Test prod format=json"))["state"]
             check(state["trip"]["id"] != retained["id"]
                   and command("{ ReadingsVal('retainedRouteLamp','state','') }") == "on",
-                  "GP-F03-001 a new trip with new evidence may execute the route again")
+                  "a new trip with new evidence may execute the route again")
             check(command("{ ReadingsVal('door','state','') }") == "untouched"
                   and command("{ ReadingsVal('garage','state','') }") == "untouched",
-                  "GP-F03-001 unconfirmed departures never open the door or garage")
+                  "unconfirmed departures never open the door or garage")
             for text in ("set GP mode debug", "delete R.RetainedRoute", "delete A.RetainedRoute",
                          "delete Z.RouteA", "delete Z.RouteB", "delete retainedRouteLamp", "set GP mode active"):
-                check(command(text) == "", "GP-F03-001 cleans up the isolated route")
+                check(command(text) == "", "cleans up the isolated route")
             del zones["RouteA"], zones["RouteB"]
 
-            # R-05 review: retain exact source dates while controlling only
+            # Phone-source timing: retain exact source dates while controlling only
             # the private fixture clocks. All physical outputs remain dummies.
             # An earlier geometry regression changed Work's radius to 110.
             # These journeys require unchanged geometry, not another reset.
             work_geometry = json.loads(command("{ ReadingsVal('Z.Work','gp_geometry','{}') }"))
             zones["Work"] = (zones["Work"][0], work_geometry["lat"], work_geometry["radius"])
             saved_intervals = json.loads(command("{ JSON::PP::encode_json({map { $_ => $defs{$_}{INTERVAL_NORMAL} } qw(p1 p2)}) }"))
-            command("{ no warnings 'redefine';; $main::GP_r05_wall_base=int(GP_Now())+1;; "
-                    "$main::GP_r05_mono_base=GP_Mono()+1;; $main::GP_r05_elapsed=0;; "
-                    "*GP_Now=sub { $main::GP_r05_wall_base+$main::GP_r05_elapsed };; "
-                    "*GP_Mono=sub { $main::GP_r05_mono_base+$main::GP_r05_elapsed };; return 'review clock' }")
-            check(command("set GP mode debug") == "", "pause private R-05 review setup")
+            command("{ no warnings 'redefine';; $main::GP_phone_wall_base=int(GP_Now())+1;; "
+                    "$main::GP_phone_mono_base=GP_Mono()+1;; $main::GP_phone_elapsed=0;; "
+                    "*GP_Now=sub { $main::GP_phone_wall_base+$main::GP_phone_elapsed };; "
+                    "*GP_Mono=sub { $main::GP_phone_mono_base+$main::GP_phone_elapsed };; return 'review clock' }")
+            check(command("set GP mode debug") == "", "pause the isolated phone-source setup")
             zones["R05Near"] = ("place", 0.00135, 20)
             check(command("define Z.R05Near GeoPresence location Geo.Test place") == "", "define nearby review location")
             check(command("attr Z.R05Near zoneId R05Near") == "", "bind nearby review location")
@@ -2013,12 +2013,12 @@ def run(source, encoding="bytestream", help_only=False):
                                  changed=1700000000, id="r05near", blocked=0)
             command("setstate Z.R05Near 2023-11-14 22:13:20 gp_geometry " + json.dumps(near_geometry, separators=(",", ":")))
 
-            def r05_begin(signal="state", window=180, reorder=2, poll=5):
+            def begin_phone_scenario(signal="state", window=180, reorder=2, poll=5):
                 for text in ("set GP mode debug", f"attr Geo.Test phoneSignalMode {signal}",
                              f"attr GP phone_absence_window {window}", f"attr GP reorder_window {reorder}",
                              f"attr GP phone_poll {poll}",
                              "set GP mode active", "set door untouched", "set garage untouched"):
-                    check(command(text) == "", "prepare isolated R-05 review: " + text)
+                    check(command(text) == "", "prepare the isolated phone-source scenario: " + text)
                 refresh_actor_contacts()
                 baseline = int(float(command("{ GP_Now() }"))) - 1
                 for sensor in ("p1", "p2"):
@@ -2026,375 +2026,375 @@ def run(source, encoding="bytestream", help_only=False):
                 command("{ GeoPresence_Timer($defs{GP});; return 'review listener ready' }")
                 return int(float(command("{ GP_Now() }")))
 
-            def r05_at(origin, seconds, *, tick=False):
-                command(f"{{ $main::GP_r05_elapsed={origin + seconds}-$main::GP_r05_wall_base;; return 'review time' }}")
+            def phone_scenario_at(origin, seconds, *, tick=False):
+                command(f"{{ $main::GP_phone_elapsed={origin + seconds}-$main::GP_phone_wall_base;; return 'review time' }}")
                 if tick:
                     command("{ GeoPresence_Timer($defs{GP});; return 'review tick' }")
 
             for case in ("contradiction", "mixed_positive", "genuine_return"):
-                origin = r05_begin(window=20, reorder=10)
-                r05_at(origin, 50)
+                origin = begin_phone_scenario(window=20, reorder=10)
+                phone_scenario_at(origin, 50)
                 for sensor in ("p1", "p2"):
                     phone_state(sensor, "absent", origin + 50)
-                r05_at(origin, 50, tick=True)
-                r05_at(origin, 100)
+                phone_scenario_at(origin, 50, tick=True)
+                phone_scenario_at(origin, 100)
                 exit_body = event_body("Home", 0)
-                check(http_request("POST", "/fhem/geopresence", exit_body, auth_headers())[0] == 200, "GP-R05-001 accepts Home departure")
-                r05_at(origin, 110, tick=True)
-                r05_at(origin, 115, tick=True)
-                r05_at(origin, 134)
+                check(http_request("POST", "/fhem/geopresence", exit_body, auth_headers())[0] == 200, "accepts Home departure")
+                phone_scenario_at(origin, 110, tick=True)
+                phone_scenario_at(origin, 115, tick=True)
+                phone_scenario_at(origin, 134)
                 http_request("POST", "/fhem/geopresence", exit_body, auth_headers())
-                r05_at(origin, 135, tick=True)
+                phone_scenario_at(origin, 135, tick=True)
                 state = json.loads(command("get GP explain Geo.Test prod format=json"))["state"]
                 check(any(event["kind"] == "phone_absent" for event in state["queued_phones"]),
-                      "GP-R05-001 really holds a completed absence behind the Geo batch")
-                r05_at(origin, 140 if case == "contradiction" else 190)
+                      "really holds a completed absence behind the Geo batch")
+                phone_scenario_at(origin, 140 if case == "contradiction" else 190)
                 phone_state("p1", "present", origin + (190 if case == "genuine_return" else 90))
                 if case == "mixed_positive":
                     phone_state("p2", "present", origin + 185)
-                r05_at(origin, 140 if case == "contradiction" else 190, tick=True)
+                phone_scenario_at(origin, 140 if case == "contradiction" else 190, tick=True)
                 if case == "contradiction":
-                    r05_at(origin, 144, tick=True)
+                    phone_scenario_at(origin, 144, tick=True)
                     state = json.loads(command("get GP explain Geo.Test prod format=json"))["state"]
-                    check(state.get("trip") and not state["trip"]["armed"], "GP-R05-001 preserves suspicion but rejects the contradicted completion")
-                    r05_at(origin, 190)
+                    check(state.get("trip") and not state["trip"]["armed"], "preserves suspicion but rejects the contradicted completion")
+                    phone_scenario_at(origin, 190)
                     request("Home", 1, motion="walking")
-                    r05_at(origin, 200, tick=True)
-                    r05_at(origin, 261, tick=True)
+                    phone_scenario_at(origin, 200, tick=True)
+                    phone_scenario_at(origin, 261, tick=True)
                 check(command("{ ReadingsVal('door','state','') }") == ("lock unlocked" if case == "genuine_return" else "untouched")
                       and command("{ ReadingsVal('garage','state','') }") == "untouched",
-                      "GP-R05-001 uses the actual temporal relationship: " + case)
+                      "uses the actual temporal relationship: " + case)
                 if case == "genuine_return":
                     actor_reading("feedback", "pulse_state", "confirmed")
-                    r05_at(origin, 191, tick=True)
+                    phone_scenario_at(origin, 191, tick=True)
 
             for mixed_positive in (False, True):
-                label = "GP-R05-005" if mixed_positive else "GP-R05-002"
-                origin = r05_begin()
-                r05_at(origin, 50)
+                label = "mixed historical presence" if mixed_positive else "delayed historical presence"
+                origin = begin_phone_scenario()
+                phone_scenario_at(origin, 50)
                 for sensor in ("p1", "p2"):
                     phone_state(sensor, "absent", origin + 50)
-                r05_at(origin, 50, tick=True)
-                r05_at(origin, 70)
+                phone_scenario_at(origin, 50, tick=True)
+                phone_scenario_at(origin, 70)
                 request("Work", 0)
-                r05_at(origin, 72, tick=True)
-                r05_at(origin, 80, tick=True)
+                phone_scenario_at(origin, 72, tick=True)
+                phone_scenario_at(origin, 80, tick=True)
                 state = json.loads(command("get GP explain Geo.Test prod format=json"))["state"]
                 check(state.get("trip", {}).get("armed"), label + " independent departure really qualified: " + state.get("last_reason", ""))
                 saved_id = state["trip"]["id"]
-                r05_at(origin, 100)
+                phone_scenario_at(origin, 100)
                 command("{ GP_ResetController($defs{GP},'resume');; GeoPresence_Timer($defs{GP});; return 'restored session' }")
                 state = json.loads(command("get GP explain Geo.Test prod format=json"))["state"]
                 check(state["resume"]["status"] == "restored" and state["trip"]["id"] == saved_id,
                       label + " restores the old trip against the available negative source")
-                r05_at(origin, 150)
+                phone_scenario_at(origin, 150)
                 phone_state("p1", "present", origin + 90)
                 if mixed_positive:
                     phone_state("p2", "present", origin + 150)
-                r05_at(origin, 150, tick=True)
+                phone_scenario_at(origin, 150, tick=True)
                 state = json.loads(command("get GP explain Geo.Test prod format=json"))["state"]
                 check(not state.get("trip") and not state.get("arrival"), label + " late pre-start presence revoked the restored permission")
                 check(json.loads(command("{ ReadingsVal('Geo.Test','gp_trip_checkpoint','{}') }"))["status"] == "none",
                       label + " historical revocation reaches the checkpoint")
-                r05_at(origin, 200)
+                phone_scenario_at(origin, 200)
                 request("Home", 1, motion="automotive")
-                r05_at(origin, 203, tick=True)
-                r05_at(origin, 264, tick=True)
+                phone_scenario_at(origin, 203, tick=True)
+                phone_scenario_at(origin, 264, tick=True)
                 check(command("{ ReadingsVal('door','state','') }") == "untouched"
                       and command("{ ReadingsVal('garage','state','') }") == "untouched",
                       label + " mixed or historical presence and later Home issue no old opening")
 
             for case in ("combined_stale", "separate_stale", "early_pending_home", "early_newer_position", "fresh_valid"):
-                origin = r05_begin()
-                r05_at(origin, 50)
+                origin = begin_phone_scenario()
+                phone_scenario_at(origin, 50)
                 for sensor in ("p1", "p2"):
                     phone_state(sensor, "absent", origin + 50)
-                r05_at(origin, 50, tick=True)
-                r05_at(origin, 80)
-                check(request("Home", 0)[0] == 200, "GP-R05-008 accepts Home departure")
-                r05_at(origin, 80, tick=True)
-                r05_at(origin, 82, tick=True)
-                r05_at(origin, 85, tick=True)
-                r05_at(origin, 100)
-                check(request("Outer", 0)[0] == 200, "GP-R05-008 accepts independent Geo departure")
-                r05_at(origin, 100, tick=True)
-                r05_at(origin, 102, tick=True)
+                phone_scenario_at(origin, 50, tick=True)
+                phone_scenario_at(origin, 80)
+                check(request("Home", 0)[0] == 200, "accepts Home departure")
+                phone_scenario_at(origin, 80, tick=True)
+                phone_scenario_at(origin, 82, tick=True)
+                phone_scenario_at(origin, 85, tick=True)
+                phone_scenario_at(origin, 100)
+                check(request("Outer", 0)[0] == 200, "accepts independent Geo departure")
+                phone_scenario_at(origin, 100, tick=True)
+                phone_scenario_at(origin, 102, tick=True)
                 state = json.loads(command("get GP explain Geo.Test prod format=json"))["state"]
                 check(state["trip"]["armed"] and not state["trip"].get("phone_qualification"),
-                      "GP-R05-008 departure is qualified without a phone completion")
+                      "departure is qualified without a phone completion")
                 received = 170 if case.startswith("early_") else 230
                 if case == "early_pending_home":
-                    r05_at(origin, 165)
+                    phone_scenario_at(origin, 165)
                     request("Home", 1, motion="walking")
-                    r05_at(origin, 165, tick=True)
-                    r05_at(origin, 167, tick=True)
+                    phone_scenario_at(origin, 165, tick=True)
+                    phone_scenario_at(origin, 167, tick=True)
                     state = json.loads(command("get GP explain Geo.Test prod format=json"))["state"]
-                    check(state.get("arrival"), "GP-R05-008 newer Home is waiting before the delayed short return")
+                    check(state.get("arrival"), "newer Home is waiting before the delayed short return")
                 else:
                     if case == "early_newer_position":
-                        r05_at(origin, 160)
+                        phone_scenario_at(origin, 160)
                         request("R05Near", 1)
-                        r05_at(origin, 162, tick=True)
-                    r05_at(origin, received - 5, tick=True)
-                r05_at(origin, received)
+                        phone_scenario_at(origin, 162, tick=True)
+                    phone_scenario_at(origin, received - 5, tick=True)
+                phone_scenario_at(origin, received)
                 phone_state("p1", "present", origin + (180 if case == "fresh_valid" else 120))
                 if case != "separate_stale":
                     phone_state("p2", "present", origin + received)
                 source_time = command("{ ReadingsTimestamp('p1','presence','') }")
-                r05_at(origin, received, tick=True)
+                phone_scenario_at(origin, received, tick=True)
                 if case == "separate_stale":
-                    r05_at(origin, 235)
+                    phone_scenario_at(origin, 235)
                     phone_state("p2", "present", origin + 235)
-                    r05_at(origin, 235, tick=True)
+                    phone_scenario_at(origin, 235, tick=True)
                 state = json.loads(command("get GP explain Geo.Test prod format=json"))["state"]
                 eligible = case == "fresh_valid"
                 check(command("{ ReadingsVal('door','state','') }") == ("lock unlocked" if eligible else "untouched")
                       and command("{ ReadingsVal('garage','state','') }") == ("on" if eligible else "untouched"),
-                      "GP-R05-008 the first relevant presence determines permission: " + case)
+                      "the first relevant presence determines permission: " + case)
                 check(not state.get("trip") and not state.get("arrival")
                       and json.loads(command("{ ReadingsVal('Geo.Test','gp_trip_checkpoint','{}') }"))["status"] == "none",
-                      "GP-R05-008 the old trip is consumed or revoked")
+                      "the old trip is consumed or revoked")
                 check(command("{ ReadingsTimestamp('p1','presence','') }") == source_time,
-                      "GP-R05-008 source observation time stays unchanged")
+                      "source observation time stays unchanged")
                 if eligible:
                     actor_reading("feedback", "pulse_state", "confirmed")
                     actor_reading("upper", "state", "closed")
                     actor_reading("lower", "state", "open")
                     actor_reading("gate", "state", "on")
-                    r05_at(origin, 231, tick=True)
+                    phone_scenario_at(origin, 231, tick=True)
                 else:
-                    r05_at(origin, 300)
+                    phone_scenario_at(origin, 300)
                     request("Home", 1, motion="walking")
-                    r05_at(origin, 303, tick=True)
-                    r05_at(origin, 364, tick=True)
+                    phone_scenario_at(origin, 303, tick=True)
+                    phone_scenario_at(origin, 364, tick=True)
                     check(command("{ ReadingsVal('door','state','') }") == "untouched"
                           and command("{ ReadingsVal('garage','state','') }") == "untouched",
-                          "GP-R05-008 later Home cannot reuse the invalid old permission")
+                          "later Home cannot reuse the invalid old permission")
 
             for phone_qualified in (False, True):
-                origin = r05_begin()
-                r05_at(origin, 50)
+                origin = begin_phone_scenario()
+                phone_scenario_at(origin, 50)
                 for sensor in ("p1", "p2"):
                     phone_state(sensor, "absent", origin + 50)
-                r05_at(origin, 50, tick=True)
-                r05_at(origin, 80)
+                phone_scenario_at(origin, 50, tick=True)
+                phone_scenario_at(origin, 80)
                 request("Home", 0)
-                r05_at(origin, 80, tick=True)
-                r05_at(origin, 82, tick=True)
-                r05_at(origin, 85, tick=True)
+                phone_scenario_at(origin, 80, tick=True)
+                phone_scenario_at(origin, 82, tick=True)
+                phone_scenario_at(origin, 85, tick=True)
                 if phone_qualified:
-                    r05_at(origin, 265, tick=True)
+                    phone_scenario_at(origin, 265, tick=True)
                 else:
-                    r05_at(origin, 100)
+                    phone_scenario_at(origin, 100)
                     request("Outer", 0)
-                    r05_at(origin, 100, tick=True)
-                    r05_at(origin, 102, tick=True)
+                    phone_scenario_at(origin, 100, tick=True)
+                    phone_scenario_at(origin, 102, tick=True)
                 returned = 300 if phone_qualified else 200
-                r05_at(origin, returned)
+                phone_scenario_at(origin, returned)
                 phone_state("p1", "present", origin + returned)
-                r05_at(origin, returned, tick=True)
+                phone_scenario_at(origin, returned, tick=True)
                 state = json.loads(command("get GP explain Geo.Test prod format=json"))["state"]
                 check(state["phase"] == "home" and not state.get("trip") and state.get("last_trip"),
-                      "GP-R05-010 the first trip completed before the later status cycle")
+                      "the first trip completed before the later status cycle")
                 old_bounds = {key: state["last_trip"][key] for key in ("id", "away_time", "away_mono")}
                 check(bool(state["last_trip"].get("phone_qualification")) == phone_qualified,
-                      "GP-R05-010 covers independent Geo and phone-qualified completed trips")
+                      "covers independent Geo and phone-qualified completed trips")
                 actor_reading("feedback", "pulse_state", "confirmed")
                 if not phone_qualified:
                     actor_reading("gate", "state", "on")
                     actor_reading("upper", "state", "closed")
                     actor_reading("lower", "state", "open")
-                r05_at(origin, returned + 1, tick=True)
+                phone_scenario_at(origin, returned + 1, tick=True)
                 command("set door untouched")
                 command("set garage untouched")
-                r05_at(origin, returned + 70)
+                phone_scenario_at(origin, returned + 70)
                 for sensor in ("p1", "p2"):
                     phone_state(sensor, "absent", origin + returned + 70)
-                r05_at(origin, returned + 70, tick=True)
-                r05_at(origin, returned + 220)
+                phone_scenario_at(origin, returned + 70, tick=True)
+                phone_scenario_at(origin, returned + 220)
                 request("R05Near", 1)
-                r05_at(origin, returned + 222, tick=True)
-                r05_at(origin, returned + 250, tick=True)
+                phone_scenario_at(origin, returned + 222, tick=True)
+                phone_scenario_at(origin, returned + 250, tick=True)
                 state = json.loads(command("get GP explain Geo.Test prod format=json"))["state"]
                 check(state["phase"] == "away" and not state.get("trip")
                       and state["position_time"] == origin + returned + 220
                       and command("{ ReadingsVal('rr_Test','state','') }") == "absent",
-                      "GP-R05-010 later absence kept the newer nearby position without a new trip")
-                r05_at(origin, returned + 255)
+                      "later absence kept the newer nearby position without a new trip")
+                phone_scenario_at(origin, returned + 255)
                 phone_state("p1", "present", origin + returned + 190)
                 phone_state("p2", "present", origin + returned + 255)
                 source_times = command("{ join('|',map { ReadingsTimestamp($_,'presence','') } qw(p1 p2)) }")
-                r05_at(origin, returned + 255, tick=True)
+                phone_scenario_at(origin, returned + 255, tick=True)
                 state = json.loads(command("get GP explain Geo.Test prod format=json"))["state"]
                 check(state["phone"]["state"] == "present" and state["phase"] == "home"
                       and state["position_time"] == origin + returned + 255
                       and command("{ ReadingsVal('rr_Test','state','') }") == "home",
-                      "GP-R05-010 current presence updates both statuses despite the completed trip")
+                      "current presence updates both statuses despite the completed trip")
                 check({key: state["last_trip"][key] for key in old_bounds} == old_bounds,
-                      "GP-R05-010 status does not renew completed departure bounds")
+                      "status does not renew completed departure bounds")
                 for seconds in (returned + 260, returned + 440):
-                    r05_at(origin, seconds, tick=True)
+                    phone_scenario_at(origin, seconds, tick=True)
                     check(command("{ ReadingsVal('Geo.Test','gp_phase','') }") == "home"
                           and command("{ ReadingsVal('rr_Test','state','') }") == "home",
-                          "GP-R05-010 unchanged positive sources retain both home statuses")
+                          "unchanged positive sources retain both home statuses")
                 check(command("{ join('|',map { ReadingsTimestamp($_,'presence','') } qw(p1 p2)) }") == source_times,
-                      "GP-R05-010 polling retains original source dates")
+                      "polling retains original source dates")
                 check(not state.get("trip") and not state.get("arrival")
                       and command("{ ReadingsVal('door','state','') }") == "untouched"
                       and command("{ ReadingsVal('garage','state','') }") == "untouched",
-                      "GP-R05-010 later presence creates no new opening")
+                      "later presence creates no new opening")
 
-            origin = r05_begin()
-            r05_at(origin, 50)
+            origin = begin_phone_scenario()
+            phone_scenario_at(origin, 50)
             for sensor in ("p1", "p2"):
                 phone_state(sensor, "absent", origin + 50)
             source_times = command("{ join('|',map { ReadingsTimestamp($_,'presence','') } qw(p1 p2)) }")
-            r05_at(origin, 50, tick=True)
-            r05_at(origin, 100)
+            phone_scenario_at(origin, 50, tick=True)
+            phone_scenario_at(origin, 100)
             request("Home", 0)
-            r05_at(origin, 100, tick=True)
-            r05_at(origin, 102, tick=True)
-            r05_at(origin, 105, tick=True)
-            r05_at(origin, 120)
+            phone_scenario_at(origin, 100, tick=True)
+            phone_scenario_at(origin, 102, tick=True)
+            phone_scenario_at(origin, 105, tick=True)
+            phone_scenario_at(origin, 120)
             request("R05Near", 1)
-            r05_at(origin, 122, tick=True)
-            r05_at(origin, 285, tick=True)
+            phone_scenario_at(origin, 122, tick=True)
+            phone_scenario_at(origin, 285, tick=True)
             state = json.loads(command("get GP explain Geo.Test prod format=json"))["state"]
-            check(state["trip"]["armed"] and state["trip"]["scope"] == "local", "GP-R05-003 nearby position did not block the completed held absence")
+            check(state["trip"]["armed"] and state["trip"]["scope"] == "local", "nearby position did not block the completed held absence")
             check(command("{ join('|',map { ReadingsTimestamp($_,'presence','') } qw(p1 p2)) }") == source_times,
-                  "GP-R05-003 confirms absence without refreshing either sensor")
-            r05_at(origin, 300)
+                  "confirms absence without refreshing either sensor")
+            phone_scenario_at(origin, 300)
             request("Home", 1, motion="walking")
-            r05_at(origin, 303, tick=True)
-            r05_at(origin, 361, tick=True)
+            phone_scenario_at(origin, 303, tick=True)
+            phone_scenario_at(origin, 361, tick=True)
             check(command("{ ReadingsVal('door','state','') }") == "lock unlocked"
                   and command("{ ReadingsVal('garage','state','') }") == "untouched",
-                  "GP-R05-003 legitimate local return opens only the dummy door")
+                  "legitimate local return opens only the dummy door")
             actor_reading("feedback", "pulse_state", "confirmed")
-            r05_at(origin, 362, tick=True)
+            phone_scenario_at(origin, 362, tick=True)
 
             command("{ $defs{$_}{INTERVAL_NORMAL}=120 for qw(p1 p2);; return 'long measurement interval' }")
             for case in ("same_batch", "separate_batch", "after_deadline_before_poll"):
-                origin = r05_begin("measurement")
-                r05_at(origin, 100)
+                origin = begin_phone_scenario("measurement")
+                phone_scenario_at(origin, 100)
                 request("Home", 0)
-                r05_at(origin, 100, tick=True)
-                r05_at(origin, 102, tick=True)
-                r05_at(origin, 105)
+                phone_scenario_at(origin, 100, tick=True)
+                phone_scenario_at(origin, 102, tick=True)
+                phone_scenario_at(origin, 105)
                 for sensor in ("p1", "p2"):
                     phone_state(sensor, "absent", origin + 105)
-                r05_at(origin, 105, tick=True)
-                r05_at(origin, 300)
+                phone_scenario_at(origin, 105, tick=True)
+                phone_scenario_at(origin, 300)
                 phone_state("p1", "absent", origin + 300)
-                r05_at(origin, 300, tick=True)
-                r05_at(origin, 309)
+                phone_scenario_at(origin, 300, tick=True)
+                phone_scenario_at(origin, 309)
                 if case == "same_batch":
                     request("Home", 1, motion="walking", observed=origin + 305)
-                r05_at(origin, 310)
+                phone_scenario_at(origin, 310)
                 phone_state("p2", "absent", origin + 310)
                 if case != "after_deadline_before_poll":
-                    r05_at(origin, 310, tick=True)
+                    phone_scenario_at(origin, 310, tick=True)
                 if case != "same_batch":
-                    r05_at(origin, 315)
+                    phone_scenario_at(origin, 315)
                     request("Home", 1, motion="walking", observed=origin + (305 if case == "separate_batch" else 315))
-                r05_at(origin, 311 if case == "same_batch" else 317, tick=True)
+                phone_scenario_at(origin, 311 if case == "same_batch" else 317, tick=True)
                 state = json.loads(command("get GP explain Geo.Test prod format=json"))["state"]
                 check(bool(state.get("arrival")) == (case == "after_deadline_before_poll"),
-                      "GP-R05-004 applies the same completion bound: " + case)
-                r05_at(origin, 378, tick=True)
+                      "applies the same completion bound: " + case)
+                phone_scenario_at(origin, 378, tick=True)
                 check(command("{ ReadingsVal('door','state','') }") == ("lock unlocked" if case == "after_deadline_before_poll" else "untouched")
                       and command("{ ReadingsVal('garage','state','') }") == "untouched",
-                      "GP-R05-004 only a genuinely later return opens: " + case)
+                      "only a genuinely later return opens: " + case)
                 if case == "after_deadline_before_poll":
                     actor_reading("feedback", "pulse_state", "confirmed")
-                    r05_at(origin, 379, tick=True)
+                    phone_scenario_at(origin, 379, tick=True)
 
             for staggered in (False, True):
                 interval = 120 if staggered else 7
                 command(f"{{ $defs{{$_}}{{INTERVAL_NORMAL}}={interval} for qw(p1 p2);; return 'review sample interval' }}")
-                origin = r05_begin("measurement", poll=7)
+                origin = begin_phone_scenario("measurement", poll=7)
                 base_mono = float(command("{ GP_Mono() }"))
-                r05_at(origin, 98, tick=True)
-                r05_at(origin, 100)
+                phone_scenario_at(origin, 98, tick=True)
+                phone_scenario_at(origin, 100)
                 request("Home", 0)
-                r05_at(origin, 100, tick=True)
-                r05_at(origin, 102, tick=True)
-                r05_at(origin, 105)
+                phone_scenario_at(origin, 100, tick=True)
+                phone_scenario_at(origin, 102, tick=True)
+                phone_scenario_at(origin, 105)
                 for sensor in ("p1", "p2"):
                     phone_state(sensor, "absent", origin + 105)
-                r05_at(origin, 105, tick=True)
+                phone_scenario_at(origin, 105, tick=True)
                 for seconds in range(112, 281, 7):
-                    r05_at(origin, seconds)
+                    phone_scenario_at(origin, seconds)
                     phone_state("p1", "absent", origin + seconds)
                     if not staggered or seconds == 280:
                         phone_state("p2", "absent", origin + seconds)
                     if not staggered or seconds != 280:
-                        r05_at(origin, seconds, tick=True)
-                r05_at(origin, 286)
+                        phone_scenario_at(origin, seconds, tick=True)
+                phone_scenario_at(origin, 286)
                 request("Home", 1, motion="walking")
-                r05_at(origin, 287)
+                phone_scenario_at(origin, 287)
                 phone_state("p1", "absent", origin + 287)
                 if not staggered:
                     phone_state("p2", "absent", origin + 287)
                 source_times = command("{ join('|',map { ReadingsTimestamp($_,'presence','') } qw(p1 p2)) }")
-                r05_at(origin, 287, tick=True)
+                phone_scenario_at(origin, 287, tick=True)
                 state = json.loads(command("get GP explain Geo.Test prod format=json"))["state"]
                 completion = next(event for event in state["queued_phones"] if event["kind"] == "phone_absent")
                 check(completion["qualified_at"] == origin + 285
                       and abs(completion["qualified_mono"] - base_mono - 285) < 1e-6,
-                      "GP-R05-006 extra measurements preserve both completion bounds")
-                r05_at(origin, 288, tick=True)
+                      "extra measurements preserve both completion bounds")
+                phone_scenario_at(origin, 288, tick=True)
                 state = json.loads(command("get GP explain Geo.Test prod format=json"))["state"]
-                check(state.get("arrival"), "GP-R05-006 return after the actual deadline starts its normal wait")
+                check(state.get("arrival"), "return after the actual deadline starts its normal wait")
                 check(command("{ join('|',map { ReadingsTimestamp($_,'presence','') } qw(p1 p2)) }") == source_times,
-                      "GP-R05-006 polling leaves source timestamps unchanged")
-                r05_at(origin, 347, tick=True)
+                      "polling leaves source timestamps unchanged")
+                phone_scenario_at(origin, 347, tick=True)
                 check(command("{ ReadingsVal('door','state','') }") == "lock unlocked"
                       and command("{ ReadingsVal('garage','state','') }") == "untouched",
-                      "GP-R05-006 valid return opens only the dummy door")
+                      "valid return opens only the dummy door")
                 actor_reading("feedback", "pulse_state", "confirmed")
-                r05_at(origin, 348, tick=True)
+                phone_scenario_at(origin, 348, tick=True)
 
-            check(command("set GP mode debug") == "", "prepare GP-R05-009 status profile")
-            check(command("attr Geo.Test sourceMode phone_only") == "", "GP-R05-009 uses phone-only status without Geo events")
+            check(command("set GP mode debug") == "", "prepare status profile")
+            check(command("attr Geo.Test sourceMode phone_only") == "", "uses phone-only status without Geo events")
             command("{ $defs{$_}{INTERVAL_NORMAL}=120 for qw(p1 p2);; return 'review source interval' }")
             for signal in ("state", "measurement"):
-                origin = r05_begin(signal)
-                r05_at(origin, 50)
+                origin = begin_phone_scenario(signal)
+                phone_scenario_at(origin, 50)
                 for sensor in ("p1", "p2"):
                     phone_state(sensor, "absent", origin + 50)
-                r05_at(origin, 50, tick=True)
+                phone_scenario_at(origin, 50, tick=True)
                 if signal == "measurement":
-                    r05_at(origin, 100)
+                    phone_scenario_at(origin, 100)
                     for sensor in ("p1", "p2"):
                         phone_state(sensor, "absent", origin + 100)
-                    r05_at(origin, 100, tick=True)
-                r05_at(origin, 225, tick=True)
-                r05_at(origin, 230, tick=True)
+                    phone_scenario_at(origin, 100, tick=True)
+                phone_scenario_at(origin, 225, tick=True)
+                phone_scenario_at(origin, 230, tick=True)
                 state = json.loads(command("get GP explain Geo.Test prod format=json"))["state"]
                 check(state["phase"] == "away" and not state.get("trip") and not state.get("last_trip")
                       and command("{ ReadingsVal('rr_Test','state','') }") == "absent",
-                      "GP-R05-009 full absence interval sets both statuses absent without a trip")
-                r05_at(origin, 235)
+                      "full absence interval sets both statuses absent without a trip")
+                phone_scenario_at(origin, 235)
                 phone_state("p1", "present", origin + 120)
                 phone_state("p2", "present", origin + 235)
                 source_times = command("{ join('|',map { ReadingsTimestamp($_,'presence','') } qw(p1 p2)) }")
-                r05_at(origin, 235, tick=True)
+                phone_scenario_at(origin, 235, tick=True)
                 state = json.loads(command("get GP explain Geo.Test prod format=json"))["state"]
                 check(state["phone"]["state"] == "present" and state["phase"] == "home"
                       and command("{ ReadingsVal('rr_Test','state','') }") == "home",
-                      "GP-R05-009 fresh simultaneous presence sets phone, GeoPresence and ROOMMATE home: " + signal)
+                      "fresh simultaneous presence sets phone, GeoPresence and ROOMMATE home: " + signal)
                 for seconds in (240, 420):
-                    r05_at(origin, seconds, tick=True)
+                    phone_scenario_at(origin, seconds, tick=True)
                     state = json.loads(command("get GP explain Geo.Test prod format=json"))["state"]
                     check(state["phase"] == "home" and command("{ ReadingsVal('rr_Test','state','') }") == "home",
-                          "GP-R05-009 status remains home without another detector message")
+                          "status remains home without another detector message")
                 check(command("{ join('|',map { ReadingsTimestamp($_,'presence','') } qw(p1 p2)) }") == source_times,
-                      "GP-R05-009 source dates remain unchanged")
+                      "source dates remain unchanged")
                 check(not state.get("trip") and not state.get("last_trip") and not state.get("arrival")
                       and command("{ ReadingsVal('door','state','') }") == "untouched"
                       and command("{ ReadingsVal('garage','state','') }") == "untouched",
-                      "GP-R05-009 status creates no opening permission or actor output")
+                      "status creates no opening permission or actor output")
 
             command("{ no warnings 'redefine';; $main::GP_fixture_offset=GP_Now()-Time::HiRes::time();; "
                     "*GP_Now=sub { Time::HiRes::time()+$main::GP_fixture_offset };; "
@@ -2406,11 +2406,11 @@ def run(source, encoding="bytestream", help_only=False):
                          "attr Geo.Test sourceMode geofency_phone",
                          "deleteattr GP phone_absence_window", "deleteattr GP reorder_window",
                          "deleteattr GP phone_poll", "set GP mode active"):
-                check(command(text) == "", "restore the original fixture after R-05 review: " + text)
+                check(command(text) == "", "restore the original phone-source fixture: " + text)
             del zones["R05Near"]
             advance(1)
 
-            # R-05/F-10: a valid held return can revoke an old trip even when
+            # a valid held return can revoke an old trip even when
             # its reading was not processed within the action freshness budget.
             for pending_home in (False, True):
                 command("{ GP_ResetController($defs{GP});; return 'reset' }")
@@ -2419,35 +2419,35 @@ def run(source, encoding="bytestream", help_only=False):
                 phone_state("p2", "absent")
                 advance(5)
                 advance(180)
-                check(request("Work", 0)[0] == 200, "F-10 accepts independent departure evidence")
+                check(request("Work", 0)[0] == 200, "accepts independent departure evidence")
                 advance(3)
                 advance(90)
                 command("set door untouched")
                 command("set garage untouched")
                 if pending_home:
-                    check(request("Home", 1, motion="walking")[0] == 200, "F-10 accepts a provisional Home return")
+                    check(request("Home", 1, motion="walking")[0] == 200, "accepts a provisional Home return")
                     advance(3)
                     check(json.loads(command("get GP explain Geo.Test prod format=json"))["state"].get("arrival"),
-                          "F-10 Home return is waiting before delayed phone processing")
+                          "Home return is waiting before delayed phone processing")
                 phone_state("p1", "present")
                 observed = command("{ ReadingsTimestamp('p1','presence','') }")
                 advance(100)
                 state = json.loads(command("get GP explain Geo.Test prod format=json"))["state"]
                 check(state["phone"]["state"] == "present" and state["phone"]["health"] == "held",
-                      "F-10 still accepts the healthy held positive source")
-                check(not state.get("trip") and not state.get("arrival"), "F-10 revokes trip and pending return despite the old observation")
+                      "still accepts the healthy held positive source")
+                check(not state.get("trip") and not state.get("arrival"), "revokes trip and pending return despite the old observation")
                 check(json.loads(command("{ ReadingsVal('Geo.Test','gp_trip_checkpoint','{}') }"))["status"] == "none",
-                      "F-10 revoked trip cannot resume")
+                      "revoked trip cannot resume")
                 check(command("{ ReadingsTimestamp('p1','presence','') }") == observed,
-                      "F-10 did not manufacture a fresh positive reading")
-                check(request("Home", 1, motion="automotive")[0] == 200, "F-10 accepts a subsequent fresh Home entry")
+                      "did not manufacture a fresh positive reading")
+                check(request("Home", 1, motion="automotive")[0] == 200, "accepts a subsequent fresh Home entry")
                 advance(3)
                 advance(61)
                 check(command("{ ReadingsVal('door','state','') }") == "untouched"
                       and command("{ ReadingsVal('garage','state','') }") == "untouched",
-                      "F-10 neither delayed presence nor a later Home entry reuses the old permission")
+                      "neither delayed presence nor a later Home entry reuses the old permission")
 
-            # R-05/F-14: unchanged negatives observed before Home exit still
+            # unchanged negatives observed before Home exit still
             # supply a new complete interval, never their previous qualification.
             command("{ GP_ResetController($defs{GP});; return 'reset' }")
             advance(40)
@@ -2458,27 +2458,27 @@ def run(source, encoding="bytestream", help_only=False):
             advance(10)
             command("set door untouched")
             command("set garage untouched")
-            check(request("Home", 0)[0] == 200, "F-14 accepts Home exit after the phones became absent")
+            check(request("Home", 0)[0] == 200, "accepts Home exit after the phones became absent")
             advance(3)
             advance(5)
             state = json.loads(command("get GP explain Geo.Test prod format=json"))["state"]
             check(state["phone"].get("negative_since") is not None and not state["trip"]["armed"],
-                  "F-14 starts a new unqualified interval using unchanged negative states")
+                  "starts a new unqualified interval using unchanged negative states")
             advance(170)
             check(not json.loads(command("get GP explain Geo.Test prod format=json"))["state"]["trip"]["armed"],
-                  "F-14 cannot reuse elapsed time from before Home exit")
+                  "cannot reuse elapsed time from before Home exit")
             advance(11)
             state = json.loads(command("get GP explain Geo.Test prod format=json"))["state"]
-            check(state["trip"]["armed"] and state["trip"]["scope"] == "local", "F-14 full new interval confirms a local walk")
+            check(state["trip"]["armed"] and state["trip"]["scope"] == "local", "full new interval confirms a local walk")
             check(command("{ join('|',map { ReadingsTimestamp($_,'presence','') } qw(p1 p2)) }") == source_times,
-                  "F-14 neither sensor needed another negative message or a refreshed timestamp")
+                  "neither sensor needed another negative message or a refreshed timestamp")
             refresh_actor_contacts()
-            check(request("Home", 1, motion="walking")[0] == 200, "F-14 accepts the new walking return")
+            check(request("Home", 1, motion="walking")[0] == 200, "accepts the new walking return")
             advance(3)
             advance(58)
             check(command("{ ReadingsVal('door','state','') }") == "lock unlocked"
                   and command("{ ReadingsVal('garage','state','') }") == "untouched",
-                  "F-14 a qualified local walk opens only the dummy door")
+                  "a qualified local walk opens only the dummy door")
             actor_reading("feedback", "pulse_state", "confirmed")
             advance(1)
 
@@ -2493,14 +2493,14 @@ def run(source, encoding="bytestream", help_only=False):
             advance(3)
             advance(5)
             advance(100)
-            check(request("Home", 1, motion="walking")[0] == 200, "R-05 accepts Home return before absence is qualified")
+            check(request("Home", 1, motion="walking")[0] == 200, "accepts Home return before absence is qualified")
             advance(81)
             state = json.loads(command("get GP explain Geo.Test prod format=json"))["state"]
-            check(not state.get("trip") and not state.get("arrival"), "R-05 orders Home return before a later completed absence")
+            check(not state.get("trip") and not state.get("arrival"), "orders Home return before a later completed absence")
             advance(61)
             check(command("{ ReadingsVal('door','state','') }") == "untouched"
                   and command("{ ReadingsVal('garage','state','') }") == "untouched",
-                  "R-05 waiting cannot retroactively authorize the premature Home return")
+                  "waiting cannot retroactively authorize the premature Home return")
 
             # Real departures with lagging indoor presence (19/20 September),
             # including negatives already qualifying before the outer webhook.
@@ -2641,7 +2641,7 @@ def run(source, encoding="bytestream", help_only=False):
                       "diagnostic proves one door request despite duplicates")
                 check(any(row.get("zone") == "Z.Home" and row.get("geometry_changes") == f"radius: {old_radius} -> {old_radius + 25}"
                           for row in rows), "diagnostic attributes geometry values to Home")
-            # F-11: an accepted Home entry keeps its arrival identity after a
+            # an accepted Home entry keeps its arrival identity after a
             # newer empty entry. Its late walking data must still veto garage.
             for phone_return in (False, True):
                 command("{ GP_ResetController($defs{GP});; return 'reset' }")
@@ -2649,7 +2649,7 @@ def run(source, encoding="bytestream", help_only=False):
                 phone_state("p1", "absent")
                 phone_state("p2", "absent")
                 advance(5)
-                check(request("Outer", 0)[0] == 200, "F-11 remote departure accepted")
+                check(request("Outer", 0)[0] == 200, "remote departure accepted")
                 advance(3)
                 advance(90)
                 refresh_actor_contacts()
@@ -2659,38 +2659,38 @@ def run(source, encoding="bytestream", help_only=False):
                 log_start = len(log_path.read_text())
                 home = event_body("Home", 1)
                 check(http_request("POST", "/fhem/geopresence", home, auth_headers())[0] == 200,
-                      "F-11 original empty Home entry accepted")
+                      "original empty Home entry accepted")
                 advance(3)
                 first = json.loads(command("get GP explain Geo.Test prod format=json"))["state"]["arrival"]
-                check(first["vehicle_eligible"], "F-11 initially has the remote vehicle fallback")
+                check(first["vehicle_eligible"], "initially has the remote vehicle fallback")
                 advance(2)
-                check(request("Home", 1)[0] == 200, "F-11 newer empty Home entry accepted")
+                check(request("Home", 1)[0] == 200, "newer empty Home entry accepted")
                 advance(3)
                 latest = json.loads(command("get GP explain Geo.Test prod format=json"))["state"]["arrival"]["latest_home"]
-                check(latest["time"] > first["event"]["time"], "F-11 position advanced during the same arrival")
+                check(latest["time"] > first["event"]["time"], "position advanced during the same arrival")
                 advance(1)
                 check(http_request("POST", "/fhem/geopresence", home + "&motion=walking", auth_headers())[0] == 200,
-                      "F-11 older walking supplement accepted")
+                      "older walking supplement accepted")
                 if phone_return:
                     phone_state("p1", "present")
                 advance(5 if phone_return else 3)
                 state = json.loads(command("get GP explain Geo.Test prod format=json"))["state"]
                 check(state["motion"] == "walking" and state["motion_time"] == first["event"]["time"],
-                      "F-11 walking keeps the original observation time")
+                      "walking keeps the original observation time")
                 if not phone_return:
                     pending = state["arrival"]
                     check(pending["latest_home"] == latest and state["position_time"] == latest["time"],
-                          "F-11 supplement does not rewind the newer Home evidence")
+                          "supplement does not rewind the newer Home evidence")
                     check(pending["started"] == first["started"] and pending["start_mono"] == first["start_mono"]
                           and pending["due_mono"] == first["due_mono"] and not pending["vehicle_eligible"],
-                          "F-11 walking changes permission without restarting the original wait")
+                          "walking changes permission without restarting the original wait")
                     check(command("{ ReadingsVal('door','state','') }") == "untouched",
-                          "F-11 supplement itself issues no opening")
+                          "supplement itself issues no opening")
                     refresh_actor_contacts()
                     advance(max(0, pending["due_mono"] - float(command("{ GP_Mono() }"))) + 0.1)
                 check(command("{ ReadingsVal('door','state','') }") == "lock unlocked"
                       and command("{ ReadingsVal('garage','state','') }") == "untouched",
-                      "F-11 confirms only the door, phone_return=" + str(phone_return))
+                      "confirms only the door, phone_return=" + str(phone_return))
                 actor_reading("feedback", "pulse_state", "confirmed")
                 advance(1)
                 http_request("POST", "/fhem/geopresence", home + "&motion=walking", auth_headers())
@@ -2698,15 +2698,15 @@ def run(source, encoding="bytestream", help_only=False):
                 rows = [json.loads(line[line.index("{"):]) for line in log_path.read_text()[log_start:].splitlines() if "{" in line]
                 check(sum(row.get("reason") == "actor command dispatched" and row.get("kind") == "door_open" for row in rows) == 1
                       and not any(row.get("reason") == "actor command dispatched" and row.get("kind") == "garage_open" for row in rows),
-                      "F-11 diagnostics prove one door request without any garage request")
-            # GP-F11-001: the accepted approach precedes Home in a separate
+                      "diagnostics prove one door request without any garage request")
+            # the accepted approach precedes Home in a separate
             # timer batch, with an equal or older observation timestamp.
             # The preceding installation checks deliberately omitted Drive.
             for text in ("set GP mode debug", "define Z.Drive GeoPresence location Geo.Test approach",
                          "attr Z.Drive zoneId Drive", "set GP mode active"):
-                check(command(text) == "", "GP-F11-001 prepares the optional approach: " + text)
+                check(command(text) == "", "prepares the optional approach: " + text)
             advance(40)
-            check(request("Drive", 1)[0] == 200, "GP-F11-001 initializes productive approach geometry")
+            check(request("Drive", 1)[0] == 200, "initializes productive approach geometry")
             advance(3)
             for same_time in (True, False):
                 for phone_return in (False, True):
@@ -2716,62 +2716,62 @@ def run(source, encoding="bytestream", help_only=False):
                     phone_state("p2", "absent")
                     advance(5)
                     advance(180)
-                    check(request("Outer", 0)[0] == 200, "GP-F11-001 remote departure accepted")
+                    check(request("Outer", 0)[0] == 200, "remote departure accepted")
                     advance(3)
                     advance(90)
                     departure = json.loads(command("get GP explain Geo.Test prod format=json"))["state"]
-                    check(departure["trip"]["armed"], "GP-F11-001 departure is qualified before the approach")
+                    check(departure["trip"]["armed"], "departure is qualified before the approach")
                     refresh_actor_contacts()
                     command("set door untouched")
                     command("set garage untouched")
                     approach = event_body("Drive", 1)
                     check(http_request("POST", "/fhem/geopresence", approach, auth_headers())[0] == 200,
-                          "GP-F11-001 empty approach accepted")
+                          "empty approach accepted")
                     advance(3)
                     state = json.loads(command("get GP explain Geo.Test prod format=json"))["state"]
                     observed = state["zones"]["Z.Drive"]["time"]
                     check(state["phase"] == "returning" and not state.get("arrival"),
-                          "GP-F11-001 approach alone starts no Home wait")
+                          "approach alone starts no Home wait")
                     home_fields = dict(urllib.parse.parse_qsl(event_body("Home", 1)))
                     if same_time:
                         home_fields["date"] = dict(urllib.parse.parse_qsl(approach))["date"]
                     check(http_request("POST", "/fhem/geopresence", urllib.parse.urlencode(home_fields), auth_headers())[0] == 200,
-                          "GP-F11-001 subsequent empty Home accepted")
+                          "subsequent empty Home accepted")
                     advance(3)
                     first = json.loads(command("get GP explain Geo.Test prod format=json"))["state"]["arrival"]
                     check(first["vehicle_eligible"] and (first["event"]["time"] == observed if same_time
                                                        else first["event"]["time"] > observed),
-                          "GP-F11-001 reproduces the remote fallback and observation order")
+                          "reproduces the remote fallback and observation order")
                     advance(1)
                     check(http_request("POST", "/fhem/geopresence", approach + "&motion=walking", auth_headers())[0] == 200,
-                          "GP-F11-001 original approach walking supplement accepted")
+                          "original approach walking supplement accepted")
                     if phone_return:
                         phone_state("p1", "present")
                     advance(5 if phone_return else 3)
                     state = json.loads(command("get GP explain Geo.Test prod format=json"))["state"]
                     check(state["motion"] == "walking" and state["motion_time"] == observed,
-                          "GP-F11-001 walking retains the original approach time")
+                          "walking retains the original approach time")
                     if not phone_return:
                         pending = state["arrival"]
                         check(pending["event"] == first["event"] and not pending["vehicle_eligible"]
                               and pending["start_mono"] == first["start_mono"] and pending["due_mono"] == first["due_mono"],
-                              "GP-F11-001 changes garage permission without changing Home evidence or its wait")
+                              "changes garage permission without changing Home evidence or its wait")
                         refresh_actor_contacts()
                         advance(max(0, pending["due_mono"] - float(command("{ GP_Mono() }"))) + 0.1)
                     check(command("{ ReadingsVal('door','state','') }") == "lock unlocked"
                           and command("{ ReadingsVal('garage','state','') }") == "untouched",
-                          f"GP-F11-001 opens only the door; same_time={same_time} phone_return={phone_return}")
+                          f"opens only the door; same_time={same_time} phone_return={phone_return}")
                     actor_reading("feedback", "pulse_state", "confirmed")
                     advance(1)
-            # GP-F11-002: a nearby place advances position without ending the
+            # a nearby place advances position without ending the
             # approach. A delayed exit between that approach and Home must
             # revoke its automotive origin, whether received before or after Home.
             zones["Near"] = ("place", 0.0009, 20)
             for text in ("set GP mode debug", "define Z.Near GeoPresence location Geo.Test place",
                          "attr Z.Near zoneId Near", "set GP mode active"):
-                check(command(text) == "", "GP-F11-002 prepares a nearby place: " + text)
+                check(command(text) == "", "prepares a nearby place: " + text)
             advance(40)
-            check(request("Near", 1)[0] == 200, "GP-F11-002 initializes nearby place geometry")
+            check(request("Near", 1)[0] == 200, "initializes nearby place geometry")
             advance(3)
             for after_home in (False, True):
                 command("{ GP_ResetController($defs{GP});; return 'reset' }")
@@ -2780,22 +2780,22 @@ def run(source, encoding="bytestream", help_only=False):
                 phone_state("p2", "absent")
                 advance(5)
                 advance(180)
-                check(request("Drive", 0)[0] == 200, "GP-F11-002 local departure accepted")
+                check(request("Drive", 0)[0] == 200, "local departure accepted")
                 advance(3)
                 advance(90)
                 departure = json.loads(command("get GP explain Geo.Test prod format=json"))["state"]
                 check(departure["trip"]["armed"] and departure["trip"]["scope"] == "local",
-                      "GP-F11-002 has no remote vehicle fallback")
+                      "has no remote vehicle fallback")
                 refresh_actor_contacts()
                 command("set door untouched")
                 command("set garage untouched")
                 approach = event_body("Drive", 1)
                 check(http_request("POST", "/fhem/geopresence", approach, auth_headers())[0] == 200,
-                      "GP-F11-002 empty approach accepted")
+                      "empty approach accepted")
                 advance(3)
                 observed = json.loads(command("get GP explain Geo.Test prod format=json"))["state"]["zones"]["Z.Drive"]["time"]
                 advance(17)
-                check(request("Near", 1)[0] == 200, "GP-F11-002 newer nearby observation accepted")
+                check(request("Near", 1)[0] == 200, "newer nearby observation accepted")
                 advance(3)
                 position = json.loads(command("get GP explain Geo.Test prod format=json"))["state"]["position_time"]
                 exit_fields = dict(urllib.parse.parse_qsl(event_body("Drive", 0)))
@@ -2803,46 +2803,46 @@ def run(source, encoding="bytestream", help_only=False):
                 delayed_exit = urllib.parse.urlencode(exit_fields)
                 if not after_home:
                     check(http_request("POST", "/fhem/geopresence", delayed_exit, auth_headers())[0] == 200,
-                          "GP-F11-002 delayed exit accepted before Home")
+                          "delayed exit accepted before Home")
                     advance(3)
                     state = json.loads(command("get GP explain Geo.Test prod format=json"))["state"]
                     check(not state.get("approach") and state["position_time"] == position,
-                          "GP-F11-002 late exit removes the approach without rewinding position")
+                          "late exit removes the approach without rewinding position")
                 advance(7 if after_home else 4)
-                check(request("Home", 1)[0] == 200, "GP-F11-002 later Home entry accepted")
+                check(request("Home", 1)[0] == 200, "later Home entry accepted")
                 advance(3)
                 first = json.loads(command("get GP explain Geo.Test prod format=json"))["state"]["arrival"]
                 if after_home:
                     advance(2)
-                    check(request("Home", 1)[0] == 200, "GP-F11-002 newer Home entry accepted")
+                    check(request("Home", 1)[0] == 200, "newer Home entry accepted")
                     advance(3)
                     latest = json.loads(command("get GP explain Geo.Test prod format=json"))["state"]["arrival"]["latest_home"]
                     check(http_request("POST", "/fhem/geopresence", delayed_exit, auth_headers())[0] == 200,
-                          "GP-F11-002 delayed exit accepted after Home")
+                          "delayed exit accepted after Home")
                     advance(3)
                     pending = json.loads(command("get GP explain Geo.Test prod format=json"))["state"]["arrival"]
                     check(pending["event"] == first["event"] and pending["latest_home"] == latest
                           and pending["start_mono"] == first["start_mono"] and pending["due_mono"] == first["due_mono"],
-                          "GP-F11-002 exit before Home preserves its original wait and newest evidence")
+                          "exit before Home preserves its original wait and newest evidence")
                 advance(1 if after_home else 7)
                 check(http_request("POST", "/fhem/geopresence", approach + "&motion=automotive", auth_headers())[0] == 200,
-                      "GP-F11-002 interrupted automotive supplement received")
+                      "interrupted automotive supplement received")
                 advance(3)
                 pending = json.loads(command("get GP explain Geo.Test prod format=json"))["state"]["arrival"]
                 check(not pending["vehicle_eligible"] and pending["motion"] == "unknown",
-                      "GP-F11-002 interrupted approach cannot qualify the garage")
+                      "interrupted approach cannot qualify the garage")
                 refresh_actor_contacts()
                 advance(max(0, pending["due_mono"] - float(command("{ GP_Mono() }"))) + 0.1)
                 check(command("{ ReadingsVal('door','state','') }") == "lock unlocked"
                       and command("{ ReadingsVal('garage','state','') }") == "untouched",
-                      "GP-F11-002 confirms only the door; exit received after_home=" + str(after_home))
+                      "confirms only the door; exit received after_home=" + str(after_home))
                 actor_reading("feedback", "pulse_state", "confirmed")
                 advance(1)
-            # GP-F11-003: revoking a pre-Home origin must not age the latched
+            # revoking a pre-Home origin must not age the latched
             # Home walking veto into the remote fallback. Also remove a real
             # earlier automotive proof while preserving the later foot veto.
             for text in ("set GP mode debug", "attr GP motion_max_age 20", "set GP mode active"):
-                check(command(text) == "", "GP-F11-003 configures the supported short TTL: " + text)
+                check(command(text) == "", "configures the supported short TTL: " + text)
             for prior_auto, phone_return in ((False, False), (False, True), (True, False)):
                 command("{ GP_ResetController($defs{GP});; return 'reset' }")
                 advance(40)
@@ -2850,7 +2850,7 @@ def run(source, encoding="bytestream", help_only=False):
                 phone_state("p2", "absent")
                 advance(5)
                 advance(180)
-                check(request("Outer", 0)[0] == 200, "GP-F11-003 remote departure accepted")
+                check(request("Outer", 0)[0] == 200, "remote departure accepted")
                 advance(3)
                 advance(90)
                 refresh_actor_contacts()
@@ -2858,30 +2858,30 @@ def run(source, encoding="bytestream", help_only=False):
                 command("set garage untouched")
                 approach = event_body("Drive", 1, motion="automotive" if prior_auto else None)
                 check(http_request("POST", "/fhem/geopresence", approach, auth_headers())[0] == 200,
-                      "GP-F11-003 approach accepted")
+                      "approach accepted")
                 advance(3)
                 observed = json.loads(command("get GP explain Geo.Test prod format=json"))["state"]["zones"]["Z.Drive"]["time"]
                 advance(7)
-                check(request("Home", 1, motion="walking")[0] == 200, "GP-F11-003 fresh Home walking accepted")
+                check(request("Home", 1, motion="walking")[0] == 200, "fresh Home walking accepted")
                 advance(3)
                 first = json.loads(command("get GP explain Geo.Test prod format=json"))["state"]["arrival"]
                 check(bool(first["vehicle_eligible"]) == prior_auto and first["motion"] == "walking",
-                      "GP-F11-003 initial decision distinguishes preceding automotive from the remote fallback")
+                      "initial decision distinguishes preceding automotive from the remote fallback")
                 advance(27)
                 exit_fields = dict(urllib.parse.parse_qsl(event_body("Drive", 0)))
                 exit_fields["date"] = datetime.datetime.fromtimestamp(observed + 5, datetime.timezone.utc).isoformat()
                 check(http_request("POST", "/fhem/geopresence", urllib.parse.urlencode(exit_fields), auth_headers())[0] == 200,
-                      "GP-F11-003 pre-Home exit received after the motion TTL")
+                      "pre-Home exit received after the motion TTL")
                 advance(3)
                 state = json.loads(command("get GP explain Geo.Test prod format=json"))["state"]
                 pending = state["arrival"]
                 check(float(command("{ GP_Now() }")) - state["motion_time"] > 20,
-                      "GP-F11-003 surviving Home walking has aged beyond its TTL")
+                      "surviving Home walking has aged beyond its TTL")
                 check(not pending["vehicle_eligible"] and pending["motion"] == "walking",
-                      "GP-F11-003 retains or recovers the accepted foot veto after revoking older evidence")
+                      "retains or recovers the accepted foot veto after revoking older evidence")
                 check(pending["event"] == first["event"] and pending["start_mono"] == first["start_mono"]
                       and pending["due_mono"] == first["due_mono"] and pending["origin_time"] == first["event"]["time"],
-                      "GP-F11-003 preserves Home evidence and its deadline while revoking approach origins")
+                      "preserves Home evidence and its deadline while revoking approach origins")
                 refresh_actor_contacts()
                 if phone_return:
                     advance(1)
@@ -2891,12 +2891,12 @@ def run(source, encoding="bytestream", help_only=False):
                     advance(max(0, pending["due_mono"] - float(command("{ GP_Mono() }"))) + 0.1)
                 check(command("{ ReadingsVal('door','state','') }") == "lock unlocked"
                       and command("{ ReadingsVal('garage','state','') }") == "untouched",
-                      f"GP-F11-003 confirms only the door; prior_auto={prior_auto} phone_return={phone_return}")
+                      f"confirms only the door; prior_auto={prior_auto} phone_return={phone_return}")
                 actor_reading("feedback", "pulse_state", "confirmed")
                 advance(1)
             for text in ("set GP mode debug", "deleteattr GP motion_max_age"):
-                check(command(text) == "", "GP-F11-003 restores default motion validity: " + text)
-            check(command("delete Z.Near") == "", "GP-F11-002 removes its nearby fixture location")
+                check(command(text) == "", "restores default motion validity: " + text)
+            check(command("delete Z.Near") == "", "removes its nearby fixture location")
             del zones["Near"]
             check(command("delete Z.Drive") == "", "approach regressions restore the fixture without an approach")
             # Geo-only production: real HTTP, timer and ROOMMATE, dummy actors.

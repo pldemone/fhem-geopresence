@@ -1035,7 +1035,7 @@ subtest 'debug simulation, reads and activation cannot affect production' => sub
     is(scalar(grep {/^(?:door|garage) /} @commands),0,'activation does not import simulated trip');
 };
 
-subtest 'F-13 controller rename repairs definitions and replaces its listener session' => sub {
+subtest 'controller rename repairs definitions and replaces its listener session' => sub {
     my %module;{local %defs;GeoPresence_Initialize(\%module);}
     is($module{RenameFn},'GeoPresence_Rename','FHEM rename callback is registered');
     for my $cold (0,1) {
@@ -1067,7 +1067,7 @@ subtest 'F-13 controller rename repairs definitions and replaces its listener se
     }
 };
 
-subtest 'F-13 resident rename preserves credentials and quota while revoking affected journeys' => sub {
+subtest 'resident rename preserves credentials and quota while revoking affected journeys' => sub {
     for my $shared (0,1) {
         my ($c)=shared_actor_fixture();advance(40);
         unless ($shared) {
@@ -1102,7 +1102,7 @@ subtest 'F-13 resident rename preserves credentials and quota while revoking aff
     }
 };
 
-subtest 'GP-R11-001 regex-shaped resident names preserve migrated and unrelated logins' => sub {
+subtest 'regex-shaped resident names preserve migrated and unrelated logins' => sub {
     my ($c)=shared_actor_fixture();mode('GP','debug');
     rename_device('Geo.Test','Geo.A');rename_device('Geo.Other','Geo-A');
     my $other_password='other_password_0123456789';
@@ -1117,7 +1117,7 @@ subtest 'GP-R11-001 regex-shaped resident names preserve migrated and unrelated 
     }
 };
 
-subtest 'GP-R11-001 legacy access is exact and new password operations preserve other people' => sub {
+subtest 'legacy access is exact and new password operations preserve other people' => sub {
     my ($c)=fixture();mode('GP','debug');
     my $old=$keys{'GeoPresence_Geo.Test_auth'};
     $keys{'GeoPresence_Geo-Test_auth'}='foreign legacy verifier';
@@ -1141,7 +1141,7 @@ subtest 'GP-R11-001 legacy access is exact and new password operations preserve 
     is($keys{$other_key},'foreign canonical verifier','delete preserves the other canonical key');
 };
 
-subtest 'GP-SIM-015 one read preserves exact lookup, format precedence and first duplicate' => sub {
+subtest 'one read preserves exact lookup, format precedence and first duplicate' => sub {
     fixture();
     my $old='GeoPresence_Geo.Test_auth:';my $new=GP_AuthKey('Geo.Test').':';
     $attr{global}{modpath}='/configured/fhem';$attr{global}{keyFileName}='task..keys';
@@ -1165,7 +1165,7 @@ subtest 'GP-SIM-015 one read preserves exact lookup, format precedence and first
     }
 };
 
-subtest 'GP-R11-001 partial storage failure cannot retain a stale authentication cache' => sub {
+subtest 'partial storage failure cannot retain a stale authentication cache' => sub {
     my ($c)=fixture();mode('GP','debug');
     my $old=(GP_Auth('Geo.Test'))[1];
     {
@@ -1178,7 +1178,7 @@ subtest 'GP-R11-001 partial storage failure cannot retain a stale authentication
     is((GP_Auth('Geo.Test'))[1],$keys{GP_AuthKey('Geo.Test')},'cached state agrees with the store after partial failure');
 };
 
-subtest 'F-13 renamed locations, actions and rules revoke their affected contexts' => sub {
+subtest 'renamed locations, actions and rules revoke their affected contexts' => sub {
     for my $name ('Z.Home','A.Door','R.Door') {
         my ($c,$cfg)=fixture();advance(40);my $s=GP_State($c,'Geo.Test',0);
         my $listener=$c->{helper}{gp_http};GP_InvalidateDevices($c);
@@ -1190,7 +1190,7 @@ subtest 'F-13 renamed locations, actions and rules revoke their affected context
     like(join('; ',GP_Validate($c)),qr/invalid GeoPresence device name/,'FHEM-permitted names outside the module contract remain visibly invalid');
 };
 
-subtest 'F-13 credential migration failures stay disabled across session reset' => sub {
+subtest 'credential migration failures stay disabled across session reset' => sub {
     for my $fault ('read','write','delete','legacy delete') {
         my ($c)=fixture();my $set=\&setKeyValue;
         my $read=\&FileRead;my $write=\&FileWrite;
@@ -1215,7 +1215,7 @@ subtest 'F-13 credential migration failures stay disabled across session reset' 
     }
 };
 
-subtest 'F-17 ROOMMATE failures remain visible and retry until the state is synchronized' => sub {
+subtest 'ROOMMATE failures remain visible and retry until the state is synchronized' => sub {
     for my $exception (0,1) {
         my ($c,$cfg)=fixture();advance(40);my $s=GP_State($c,'Geo.Test',0);$s->{phase}='home';$s->{desired_status}='home';
         reading('rr_Test','state','absent',$now);my $original=\&CommandSet;my $fail=1;
@@ -1241,7 +1241,7 @@ subtest 'F-17 ROOMMATE failures remain visible and retry until the state is sync
     }
 };
 
-subtest 'F-17 command and log callbacks cannot restore obsolete or superseded requests' => sub {
+subtest 'command and log callbacks cannot restore obsolete or superseded requests' => sub {
     for my $source (qw(command failure_log recovery_log)) {
       for my $change (qw(status mode)) {
         my ($c,$cfg)=fixture();advance(40);my $s=GP_State($c,'Geo.Test',0);$s->{desired_status}='home';
@@ -1317,7 +1317,7 @@ subtest 'HTTP authentication rejects ambiguous catalog users without changing th
     ok(!exists $c->{helper}{gp}{http_rate},'ambiguous identity allocated no person quota');
 };
 
-subtest 'F-12 failed authentication cannot consume a resident webhook quota' => sub {
+subtest 'failed authentication cannot consume a resident webhook quota' => sub {
     my ($c,$cfg)=fixture();advance(40);
     my $body=form($cfg,'Home',1,$now);
     for my $auth ('','Bearer invalid','Basic '.encode_base64('user:wrong',''),
@@ -1334,7 +1334,7 @@ subtest 'F-12 failed authentication cannot consume a resident webhook quota' => 
     is_deeply([\@commands,\@messages],[[],[]],'authentication and quota checks produced no outputs');
 };
 
-subtest 'F-12 residents have independent quotas shared by all modes' => sub {
+subtest 'residents have independent quotas shared by all modes' => sub {
     my ($c,$cfg)=shared_actor_fixture();advance(40);
     # Authenticated invalid payloads exercise the processing limit without
     # filling the independent, controller-wide observation queue.
@@ -1360,7 +1360,7 @@ subtest 'F-12 residents have independent quotas shared by all modes' => sub {
     ok(!exists $c->{helper}{gp}{http_rate}{'Geo.Other'},'removing a resident releases its quota entry');
 };
 
-subtest 'GP-F12-001 quota diagnostics retain the authenticated resident' => sub {
+subtest 'quota diagnostics retain the authenticated resident' => sub {
     my $dir=tempdir(CLEANUP=>1);
     for my $case ([debug=>'auto',1],[learning=>'auto',1],[active=>'1',1],[active=>'auto',0],[debug=>'0',0]) {
         my ($resident_mode,$setting,$enabled)=@$case;
@@ -1389,7 +1389,7 @@ subtest 'GP-F12-001 quota diagnostics retain the authenticated resident' => sub 
     }
 };
 
-subtest 'F-16 webhook quota duration is independent of wall clock corrections' => sub {
+subtest 'webhook quota duration is independent of wall clock corrections' => sub {
     for my $shift (-3600,0,3600) {
         my ($c)=fixture();advance(40);
         my @status=map {(http($c,'isTest=invalid'))[0]} 1..120;
@@ -1653,7 +1653,7 @@ subtest 'rejected outer events preserve a running Home absence qualification wit
     }
 };
 
-subtest 'GP-F03-001: retained Home departures preserve route consumption until a genuinely new trip' => sub {
+subtest 'retained Home departures preserve route consumption until a genuinely new trip' => sub {
     for my $case ([notify=>'enter','location'],[notify=>'exit','group'],[switch_on=>'enter','group'],[switch_on=>'exit','location']) {
         my ($type,$trigger,$selector)=@$case; my $label="$type/$trigger/$selector";
         my ($c)=fixture(); mode('GP','debug'); attribute('Geo.Test','phoneSignalMode','state');
@@ -1752,7 +1752,7 @@ subtest 'old negative phone observations cannot undo Home or DriveIn arrival' =>
     }
 };
 
-sub r05_review_fixture {
+sub phone_timeline_fixture {
     my ($signal,%options)=@_;
     my ($c)=fixture();mode('GP','debug');
     attribute('Geo.Test','phoneSignalMode',$signal);
@@ -1773,9 +1773,9 @@ sub r05_review_fixture {
     return ($c,GP_Config($c,'Geo.Test'),GP_State($c,'Geo.Test',0),$at,$sample,$base);
 }
 
-subtest 'GP-R05-001: only contradicted queued absence completions are revoked' => sub {
+subtest 'only contradicted queued absence completions are revoked' => sub {
     for my $case (qw(contradiction mixed_positive genuine_return)) {
-        my ($c,$cfg,$s,$at,$sample,$base)=r05_review_fixture('state',phone_absence_window=>20,reorder_window=>10);
+        my ($c,$cfg,$s,$at,$sample,$base)=phone_timeline_fixture('state',phone_absence_window=>20,reorder_window=>10);
         $at->(50);$sample->($_,'absent',50) for qw(p1 p2);
         GeoPresence_Timer($c);actor_fresh();
         $at->(100);my $exit=form($cfg,'Home',0,$now);http($c,$exit);
@@ -1803,9 +1803,9 @@ subtest 'GP-R05-001: only contradicted queued absence completions are revoked' =
     }
 };
 
-subtest 'GP-R05-002: delayed pre-start presence revokes only an older restored trip' => sub {
+subtest 'delayed pre-start presence revokes only an older restored trip' => sub {
     for my $case (qw(restored newer_position older_presence new_trip)) {
-        my ($c,$cfg,$s,$at,$sample,$base)=r05_review_fixture('state');
+        my ($c,$cfg,$s,$at,$sample,$base)=phone_timeline_fixture('state');
         $at->(50);$sample->($_,'absent',50) for qw(p1 p2);
         GeoPresence_Timer($c);$at->(70);process($s,$cfg,'Work',0);
         $at->(80);GP_Publish($c,'Geo.Test',$cfg,$s);my $id=$s->{trip}{id};
@@ -1832,9 +1832,9 @@ subtest 'GP-R05-002: delayed pre-start presence revokes only an older restored t
     }
 };
 
-subtest 'GP-R05-005: current presence cannot hide historical counterevidence to a restored trip' => sub {
+subtest 'current presence cannot hide historical counterevidence to a restored trip' => sub {
     for my $case (qw(mixed three_positive older_presence new_trip)) {
-        my ($c,$cfg,$s,$at,$sample,$base)=r05_review_fixture('state');
+        my ($c,$cfg,$s,$at,$sample,$base)=phone_timeline_fixture('state');
         my @sensors=qw(p1 p2);
         if ($case eq 'three_positive') {
             mode('GP','debug');attribute('Geo.Test','phoneProxies','p1,p2,p3');mode('GP','active');
@@ -1867,10 +1867,10 @@ subtest 'GP-R05-005: current presence cannot hide historical counterevidence to 
     }
 };
 
-subtest 'GP-R05-008: a newer sensor cannot replace the actual return time within one session' => sub {
+subtest 'a newer sensor cannot replace the actual return time within one session' => sub {
     for my $case (qw(combined_stale separate_stale fresh_early separate_early early_pending_home
         early_newer_position fresh_valid three_positive new_trip newer_position output_budget)) {
-        my ($c,$cfg,$s,$at,$sample,$base)=r05_review_fixture('state');
+        my ($c,$cfg,$s,$at,$sample,$base)=phone_timeline_fixture('state');
         my @sensors=qw(p1 p2);
         if ($case eq 'three_positive') {
             mode('GP','debug');attribute('Geo.Test','phoneProxies','p1,p2,p3');mode('GP','active');
@@ -1925,10 +1925,10 @@ subtest 'GP-R05-008: a newer sensor cannot replace the actual return time within
     }
 };
 
-subtest 'GP-R05-009: current presence updates status without a trip despite older positive sources' => sub {
+subtest 'current presence updates status without a trip despite older positive sources' => sub {
     for my $case (qw(state reverse three_positive measurement combined_no_trip)) {
         my $signal=$case eq 'measurement' ? 'measurement':'state';
-        my ($c,$cfg,$s,$at,$sample,$base)=r05_review_fixture($signal);
+        my ($c,$cfg,$s,$at,$sample,$base)=phone_timeline_fixture($signal);
         mode('GP','debug');
         attribute('Geo.Test','sourceMode','phone_only') unless $case eq 'combined_no_trip';
         my @sensors=$case eq 'three_positive' ? qw(p1 p2 p3):qw(p1 p2);
@@ -1966,9 +1966,9 @@ subtest 'GP-R05-009: current presence updates status without a trip despite olde
     }
 };
 
-subtest 'GP-R05-010: a completed trip cannot hold later status changes to an old return' => sub {
+subtest 'a completed trip cannot hold later status changes to an old return' => sub {
     for my $case (qw(geo phone_qualified stale_old new_active)) {
-        my ($c,$cfg,$s,$at,$sample,$base)=r05_review_fixture('state');
+        my ($c,$cfg,$s,$at,$sample,$base)=phone_timeline_fixture('state');
         $at->(50);$sample->($_,'absent',50) for qw(p1 p2);GeoPresence_Timer($c);
         $at->(80);http($c,form($cfg,'Home',0,$now));GeoPresence_Timer($c);
         $at->(82);GeoPresence_Timer($c);$at->(85);GeoPresence_Timer($c);
@@ -2040,9 +2040,9 @@ subtest 'GP-R05-010: a completed trip cannot hold later status changes to an old
     }
 };
 
-subtest 'GP-R05-006: additional negative samples do not move an already satisfied deadline' => sub {
+subtest 'additional negative samples do not move an already satisfied deadline' => sub {
     for my $case (qw(regular staggered state)) {
-        my ($c,$cfg,$s,$at,$sample,$base)=r05_review_fixture(
+        my ($c,$cfg,$s,$at,$sample,$base)=phone_timeline_fixture(
             $case eq 'state' ? 'state':'measurement',phone_poll=>7);
         $defs{$_}{INTERVAL_NORMAL}=$case eq 'staggered' ? 120:7 for qw(p1 p2);
         my $base_mono=$mono;
@@ -2070,8 +2070,8 @@ subtest 'GP-R05-006: additional negative samples do not move an already satisfie
     }
 };
 
-subtest 'GP-R05-003: ordinary nearby observations do not consume a held absence completion' => sub {
-    my ($c,$cfg,$s,$at,$sample,$base)=r05_review_fixture('state');
+subtest 'ordinary nearby observations do not consume a held absence completion' => sub {
+    my ($c,$cfg,$s,$at,$sample,$base)=phone_timeline_fixture('state');
     $at->(50);$sample->($_,'absent',50) for qw(p1 p2);GeoPresence_Timer($c);
     $at->(100);http($c,form($cfg,'Home',0,$now));GeoPresence_Timer($c);$at->(102);GeoPresence_Timer($c);
     $at->(105);GeoPresence_Timer($c);my $since=$s->{phone}{negative_since};
@@ -2089,9 +2089,9 @@ subtest 'GP-R05-003: ordinary nearby observations do not consume a held absence 
     is_deeply([grep {/^(?:door|garage) /} @commands],['door lock unlocked'],'normal local return remained eligible');
 };
 
-subtest 'GP-R05-004: measurement completion bounds returns across batches and source types' => sub {
+subtest 'measurement completion bounds returns across batches and source types' => sub {
     for my $case (qw(same_batch separate_batch phone_counter after_deadline after_deadline_before_poll independent_geo)) {
-        my ($c,$cfg,$s,$at,$sample,$base)=r05_review_fixture('measurement');
+        my ($c,$cfg,$s,$at,$sample,$base)=phone_timeline_fixture('measurement');
         $at->(100);http($c,form($cfg,'Home',0,$now));GeoPresence_Timer($c);$at->(102);GeoPresence_Timer($c);
         $at->(105);$sample->($_,'absent',105) for qw(p1 p2);GeoPresence_Timer($c);
         process($s,$cfg,'Work',0) if $case eq 'independent_geo';
@@ -2123,7 +2123,7 @@ subtest 'GP-R05-004: measurement completion bounds returns across batches and so
     }
 };
 
-subtest 'GP-R05-004: a later single positive measurement still updates phone-only status' => sub {
+subtest 'a later single positive measurement still updates phone-only status' => sub {
     my ($c,$cfg)=fixture();$cfg={%$cfg,sourceMode=>'phone_only',phoneSignalMode=>'measurement',proxies=>[qw(p1 p2)]};
     my $s=new_state();advance(105);my $samples=negative_samples();$samples->{$_}{ttl}=270 for keys %$samples;
     phone_tick($s,$cfg,$samples);advance(195);$samples->{p1}{time}=$now;phone_tick($s,$cfg,$samples);
@@ -2134,7 +2134,7 @@ subtest 'GP-R05-004: a later single positive measurement still updates phone-onl
     is(scalar @{$s->{intents}},0,'phone-only status never acquires an opening');
 };
 
-subtest 'F-10: delayed valid phone presence revokes a trip without allowing a stale arrival' => sub {
+subtest 'delayed valid phone presence revokes a trip without allowing a stale arrival' => sub {
     for my $signal_mode (qw(state measurement)) {
         for my $pending (0,1) {
             my ($c,$cfg)=fixture();$cfg->{phoneSignalMode}=$signal_mode;
@@ -2162,7 +2162,7 @@ subtest 'F-10: delayed valid phone presence revokes a trip without allowing a st
     }
 };
 
-subtest 'F-10: status-only phone return clears distant membership for the next actual visit' => sub {
+subtest 'status-only phone return clears distant membership for the next actual visit' => sub {
     my ($c,$cfg)=fixture();$cfg->{phoneSignalMode}='state';my $s=new_state();advance(40);
     process($s,$cfg,'Work',1);advance(1);phone_tick($s,$cfg,negative_samples());
     advance(180);phone_tick($s,$cfg,negative_samples());
@@ -2176,7 +2176,7 @@ subtest 'F-10: status-only phone return clears distant membership for the next a
     is_deeply([map {$_->{kind}} @{$s->{intents}}],['notify'],'new visit still schedules its ordinary notification');
 };
 
-subtest 'F-10: older measurements, future and invalid phone samples cannot revoke a later trip' => sub {
+subtest 'older measurements, future and invalid phone samples cannot revoke a later trip' => sub {
     for my $case (qw(older_measurement future unhealthy expired_measurement)) {
         my ($c,$cfg)=fixture();$cfg->{phoneSignalMode}=$case =~ /measurement/ ? 'measurement':'state';
         my $s=new_state();advance(40);my $positive=negative_samples();$positive->{p1}{value}='present';
@@ -2191,7 +2191,7 @@ subtest 'F-10: older measurements, future and invalid phone samples cannot revok
     }
 };
 
-subtest 'F-10: discovering held presence after Geo departure applies the same veto as before departure' => sub {
+subtest 'discovering held presence after Geo departure applies the same veto as before departure' => sub {
     for my $delay (80,100) {
         my ($c,$cfg)=fixture();$cfg->{phoneSignalMode}='state';my $s=new_state();
         advance(40);my $held=negative_samples();$held->{p1}{value}='present';
@@ -2204,7 +2204,7 @@ subtest 'F-10: discovering held presence after Geo departure applies the same ve
     }
 };
 
-subtest 'R-05: held presence observed before an unconfirmed Home exit preserves the departure suspicion' => sub {
+subtest 'held presence observed before an unconfirmed Home exit preserves the departure suspicion' => sub {
     for my $delay (80,100) {
         my ($c,$cfg)=fixture();$cfg->{phoneSignalMode}='state';my $s=new_state();advance(40);
         my $positive=negative_samples();$positive->{p1}{value}='present';
@@ -2220,7 +2220,7 @@ subtest 'R-05: held presence observed before an unconfirmed Home exit preserves 
     }
 };
 
-subtest 'F-14: held negatives before Home exit start a new full interval without another measurement' => sub {
+subtest 'held negatives before Home exit start a new full interval without another measurement' => sub {
     for my $already_qualified (0,1) {
         my ($c,$cfg)=fixture();$cfg->{phoneSignalMode}='state';
         my $s=GP_State($c,'Geo.Test',0);advance(40);actor_fresh();
@@ -2246,7 +2246,7 @@ subtest 'F-14: held negatives before Home exit start a new full interval without
     }
 };
 
-subtest 'F-14: a Home exit revokes a collected absence and measurement sources still need new observations' => sub {
+subtest 'a Home exit revokes a collected absence and measurement sources still need new observations' => sub {
     for my $signal_mode (qw(state measurement)) {
         my ($c,$cfg)=fixture();$cfg->{phoneSignalMode}=$signal_mode;
         my $s=new_state();advance(40);my $held=negative_samples();phone_tick($s,$cfg,$held);
@@ -2266,7 +2266,7 @@ subtest 'F-14: a Home exit revokes a collected absence and measurement sources s
     }
 };
 
-subtest 'R-05: production and live debug read one immutable phone snapshot per timer' => sub {
+subtest 'production and live debug read one immutable phone snapshot per timer' => sub {
     my ($c,$cfg)=fixture();my $prod=GP_State($c,'Geo.Test',0);my $debug=GP_State($c,'Geo.Test',1);
     advance(40);my $samples=negative_samples();$samples->{p1}{value}='present';
     my $raw=JSON::PP::encode_json($samples);my $reads=0;
@@ -2285,7 +2285,7 @@ subtest 'R-05: production and live debug read one immutable phone snapshot per t
         'simulated debug qualification did not change production continuity');
 };
 
-subtest 'R-05: a later completed absence cannot retroactively authorize an earlier Home entry' => sub {
+subtest 'a later completed absence cannot retroactively authorize an earlier Home entry' => sub {
     for my $negative_before_exit (0,1) {
         for my $return (qw(before_deadline future_date late_observation after_deadline)) {
             my ($c)=fixture();mode('GP','debug');attribute('Geo.Test','phoneSignalMode','state');
@@ -2318,7 +2318,7 @@ subtest 'R-05: a later completed absence cannot retroactively authorize an earli
     }
 };
 
-subtest 'R-05: a fresh but delayed phone return must follow its full absence window' => sub {
+subtest 'a fresh but delayed phone return must follow its full absence window' => sub {
     my ($c,$cfg)=fixture();$cfg->{phoneSignalMode}='state';my $s=new_state();advance(40);
     process($s,$cfg,'Home',0);advance(1);my $negative=negative_samples();phone_tick($s,$cfg,$negative);
     advance(170);my $positive=negative_samples();$positive->{p1}{value}='present';
@@ -3561,7 +3561,7 @@ sub simulate_process_restart {
     return (GP_Config($c,'Geo.Test'),GP_State($c,'Geo.Test',0));
 }
 
-subtest 'F-15: fresh contexts do not reuse trip IDs when clocks and startup counters repeat' => sub {
+subtest 'fresh contexts do not reuse trip IDs when clocks and startup counters repeat' => sub {
     my ($c)=fixture();
     my %ids;
     for (1..3) {
@@ -3591,7 +3591,7 @@ subtest 'F-15: fresh contexts do not reuse trip IDs when clocks and startup coun
         'long device names do not exceed the existing checkpoint ID limit');
 };
 
-subtest 'F-15: a restored legacy ID is retained while subsequent trips use the new session' => sub {
+subtest 'a restored legacy ID is retained while subsequent trips use the new session' => sub {
     for my $version (1,2) {
         my ($c,$cfg,$s)=saved_trip_fixture('remote');
         my $cp=JSON::PP::decode_json(GP_Read('Geo.Test','gp_trip_checkpoint',''));
@@ -3640,7 +3640,7 @@ sub checkpoint_work {
     return [$encodes,$writes];
 }
 
-subtest 'F-04: diagnostics, rejected observations and unchanged retries do no checkpoint work' => sub {
+subtest 'diagnostics, rejected observations and unchanged retries do no checkpoint work' => sub {
     my ($c,$cfg,$s)=saved_trip_fixture('remote');
     my $before={%{$defs{'Geo.Test'}{READINGS}{gp_trip_checkpoint}}};
     my $observed=$s->{zones}{'Z.Work'}{time};
@@ -3668,7 +3668,7 @@ subtest 'F-04: diagnostics, rejected observations and unchanged retries do no ch
     is_deeply($defs{'Geo.Test'}{READINGS}{gp_trip_checkpoint},$before,'saved value and reading timestamp stay unchanged');
 };
 
-subtest 'F-04: accepted travel observations persist memberships, exits and visit consumption once' => sub {
+subtest 'accepted travel observations persist memberships, exits and visit consumption once' => sub {
     my ($c,$cfg,$s)=saved_trip_fixture('remote');
     my $id=$s->{trip}{id}; my $away=$s->{trip}{away_time};
     advance(1); process($s,$cfg,'Work',0);
@@ -3695,7 +3695,7 @@ subtest 'F-04: accepted travel observations persist memberships, exits and visit
     is(scalar @messages,1,'restart did not repeat the notification');
 };
 
-subtest 'F-04: opening consumption is saved while duplicate rules leave it unchanged' => sub {
+subtest 'opening consumption is saved while duplicate rules leave it unchanged' => sub {
     my ($c,$cfg,$s)=saved_trip_fixture('remote'); advance(70);
     $s->{intents}=[];
     my $e=ev('Home',1,$now,'automotive');
@@ -3713,7 +3713,7 @@ subtest 'F-04: opening consumption is saved while duplicate rules leave it uncha
     is(scalar(grep {/^(?:door|garage) /} @commands),0,'restart cannot repeat consumed opening actions');
 };
 
-subtest 'F-04: motion supplements and delayed revocations update the saved evidence' => sub {
+subtest 'motion supplements and delayed revocations update the saved evidence' => sub {
     my ($c,$cfg,$s)=saved_trip_fixture('remote');
     advance(70); process($s,$cfg,'Drive',1); my $approach=$now;
     GP_Checkpoint($c,'Geo.Test',$cfg,$s);
@@ -3737,7 +3737,7 @@ subtest 'F-04: motion supplements and delayed revocations update the saved evide
     is($cp->{status},'qualified','the valid Home arrival kept its trip');
 };
 
-subtest 'F-04: expired movement and display data are checkpointed once without inventing exits' => sub {
+subtest 'expired movement and display data are checkpointed once without inventing exits' => sub {
     my ($c,$cfg,$s)=saved_trip_fixture('remote');
     advance(70); process($s,$cfg,'Drive',1,'automotive'); GP_Checkpoint($c,'Geo.Test',$cfg,$s);
     advance($cfg->{approach_timeout}+1);
@@ -3769,7 +3769,7 @@ subtest 'F-04: expired movement and display data are checkpointed once without i
     is($s->{members}{'Z.Drive'}{entry},1,'restart retained the explicit membership');
 };
 
-subtest 'F-04: losing qualification invalidates a clean checkpoint even with blocked outputs' => sub {
+subtest 'losing qualification invalidates a clean checkpoint even with blocked outputs' => sub {
     for my $cause (qw(trip armed conflict phase geometry)) {
         my ($c,$cfg,$s)=saved_trip_fixture('remote');
         $c->{helper}{gp}{ready}=0;
@@ -3786,7 +3786,7 @@ subtest 'F-04: losing qualification invalidates a clean checkpoint even with blo
     }
 };
 
-subtest 'F-04: restored checkpoints stay unchanged and externally edited readings are repaired' => sub {
+subtest 'restored checkpoints stay unchanged and externally edited readings are repaired' => sub {
     my ($c,$cfg,$s)=saved_trip_fixture('remote');
     my $before={%{$defs{'Geo.Test'}{READINGS}{gp_trip_checkpoint}}};
     is_deeply(checkpoint_work(sub {($cfg,$s)=simulate_process_restart($c)}),[0,0],'process restart did not re-encode unchanged travel data');
@@ -3803,7 +3803,7 @@ subtest 'F-04: restored checkpoints stay unchanged and externally edited reading
     is_deeply(checkpoint_work(sub {GP_Checkpoint($c,'Geo.Test',$cfg,$s)}),[0,0],'repair did not cause repeated writes');
 };
 
-subtest 'F-03: thousands of visits retain one consumption slot and a small recoverable checkpoint' => sub {
+subtest 'thousands of visits retain one consumption slot and a small recoverable checkpoint' => sub {
     my ($c)=fixture(); mode('GP','debug'); attribute('R.Work','cooldown',0);
     mode('GP','active'); GeoPresence_Timer($c);
     my $cfg=GP_Config($c,'Geo.Test'); my $s=GP_State($c,'Geo.Test',0); advance(40);
@@ -3865,7 +3865,7 @@ sub legacy_consumption_checkpoint {
     return $cp;
 }
 
-subtest 'F-03: version 1 recovery imports current visits, trip consumption and cooldowns once' => sub {
+subtest 'version 1 recovery imports current visits, trip consumption and cooldowns once' => sub {
     my ($c,$cfg,$s)=consumption_fixture(); my $id=$s->{trip}{id}; my $away=$s->{trip}{away_time};
     my $cp=legacy_consumption_checkpoint(300);
     reading('Geo.Test','gp_trip_checkpoint',JSON::PP::encode_json($cp),$now);
@@ -3889,7 +3889,7 @@ subtest 'F-03: version 1 recovery imports current visits, trip consumption and c
     is(scalar @messages,0,'consumed arrival notification was not replayed');
 };
 
-subtest 'F-03: module reload compacts a live oversized legacy history before writing it' => sub {
+subtest 'module reload compacts a live oversized legacy history before writing it' => sub {
     my ($c,$cfg,$s)=consumption_fixture(); my $id=$s->{trip}{id}; my $away=$s->{trip}{away_time};
     my $cp=legacy_consumption_checkpoint(1997);
     cmp_ok(length(JSON::PP::encode_json($cp)),'>',65536,'equivalent old history exceeded the checkpoint limit');
@@ -3912,7 +3912,7 @@ subtest 'F-03: module reload compacts a live oversized legacy history before wri
     is(scalar @messages,0,'reload did not dispatch historical notifications');
 };
 
-subtest 'F-03: malformed or incomplete compact consumption cannot restore a permission' => sub {
+subtest 'malformed or incomplete compact consumption cannot restore a permission' => sub {
     for my $case (qw(missing_visits missing_cooldown missing_actions unknown_visit future_visit fractional_visit unknown_action action_value unknown_cooldown legacy_field)) {
         my ($c,$cfg,$s)=saved_trip_fixture('remote');
         my $cp=JSON::PP::decode_json(GP_Read('Geo.Test','gp_trip_checkpoint',''));
@@ -4100,7 +4100,7 @@ sub nonopening_fixture {
     return ($c,$cfg,$s);
 }
 
-subtest 'F-08: manual Home during the door callback revokes the remaining garage plan' => sub {
+subtest 'manual Home during the door callback revokes the remaining garage plan' => sub {
     my ($c,$cfg,$s)=pending_fixture('automotive');complete_arrival($s,$cfg);actor_fresh();
     is_deeply([map {$_->{kind}} @{$s->{intents}}],['door_open','garage_open'],'both openings are planned');
     my $revision=$s->{output_revision};
@@ -4117,7 +4117,7 @@ subtest 'F-08: manual Home during the door callback revokes the remaining garage
     is($s->{door_result},'confirmed','the already issued door request still receives feedback');
 };
 
-subtest 'F-09: every opening uses current clocks after a synchronous callback' => sub {
+subtest 'every opening uses current clocks after a synchronous callback' => sub {
     for my $delay (89,90,91) {
         my ($c,$cfg,$s)=pending_fixture('automotive');complete_arrival($s,$cfg);actor_fresh();
         my ($old_wall,$old_mono)=($now,$mono);
@@ -4132,7 +4132,7 @@ subtest 'F-09: every opening uses current clocks after a synchronous callback' =
     is_deeply(\@commands,[],'stale caller clocks cannot authorize even the first output');
 };
 
-subtest 'R-07: notification and switch callbacks use the same revocable output gate' => sub {
+subtest 'notification and switch callbacks use the same revocable output gate' => sub {
     for my $first (qw(notify switch_on)) {
         for my $reason (qw(manual expired)) {
             my ($c,$cfg,$s)=nonopening_fixture($first);
@@ -4149,7 +4149,7 @@ subtest 'R-07: notification and switch callbacks use the same revocable output g
     }
 };
 
-subtest 'R-07: small wall-clock corrections cannot extend a monotonic output deadline' => sub {
+subtest 'small wall-clock corrections cannot extend a monotonic output deadline' => sub {
     my ($c,$cfg,$s)=nonopening_fixture('notify');advance(89);
     $on_message=sub {$mono+=2;$now-=2};
     GP_Dispatch($c,'Geo.Test',$cfg,$s,0,$now,$mono);
@@ -4159,7 +4159,7 @@ subtest 'R-07: small wall-clock corrections cannot extend a monotonic output dea
         'small correction stays below the discontinuity threshold');
 };
 
-subtest 'R-07: changed configuration cancels pending outputs without rebuilding it' => sub {
+subtest 'changed configuration cancels pending outputs without rebuilding it' => sub {
     for my $cold (0,1) {
         for my $event ('MODIFIED contact','ATTR contact event-on-change-reading state','DELETEATTR contact',
                 'DEFINED contact','RENAMED contact contact.New') {
@@ -4183,7 +4183,7 @@ subtest 'R-07: changed configuration cancels pending outputs without rebuilding 
     }
 };
 
-subtest 'R-07: unrelated configuration changes retain another resident output batch' => sub {
+subtest 'unrelated configuration changes retain another resident output batch' => sub {
     my ($c,$cfg,$s)=nonopening_fixture('notify');
     $on_message=sub {
         device('rr_New','ROOMMATE');$attr{rr_New}{rr_locationUnderway}='underway';
@@ -4195,7 +4195,7 @@ subtest 'R-07: unrelated configuration changes retain another resident output ba
     is_deeply(\@commands,['lamp on'],'unrelated setup cannot cancel the still-authorized switch');
 };
 
-subtest 'R-07: expiration during subscription leaves no unissued actor reservation' => sub {
+subtest 'expiration during subscription leaves no unissued actor reservation' => sub {
     my ($c,$cfg,$s)=pending_fixture('automotive');complete_arrival($s,$cfg);actor_fresh();
     my $subscribe=\&setNotifyDev;my $delayed=0;
     {
@@ -4210,7 +4210,7 @@ subtest 'R-07: expiration during subscription leaves no unissued actor reservati
     is_deeply($c->{helper}{gp}{actors},{},'undispatched reservation is removed');
 };
 
-subtest 'GP-R07-001: display aliases cannot revoke a valid opening sequence' => sub {
+subtest 'display aliases cannot revoke a valid opening sequence' => sub {
     for my $name (qw(Geo.Test rr_Test door)) {
         for my $operation (qw(set del)) {
             my ($c,$cfg,$s)=pending_fixture('automotive');complete_arrival($s,$cfg);actor_fresh();
@@ -4230,7 +4230,7 @@ subtest 'GP-R07-001: display aliases cannot revoke a valid opening sequence' => 
     }
 };
 
-subtest 'GP-R07-002: a clock correction during the arrival wait cannot extend output freshness' => sub {
+subtest 'a clock correction during the arrival wait cannot extend output freshness' => sub {
     for my $delay (90,95) {
         my ($c,$cfg,$s)=pending_fixture('unknown');my $receipt=$mono;
         advance(50);$now-=10;GP_CheckClock($s,$cfg,$now,$mono);advance(10);
@@ -4248,7 +4248,7 @@ subtest 'GP-R07-002: a clock correction during the arrival wait cannot extend ou
     is_deeply($s->{intents},[],'expired confirmation creates no output plans');
 };
 
-subtest 'GP-R07-002: receipt clocks survive the webhook reorder queue' => sub {
+subtest 'receipt clocks survive the webhook reorder queue' => sub {
     my ($c,$cfg)=fixture();my $s=GP_State($c,'Geo.Test',0);
     advance(40);process($s,$cfg,'Work',0);advance(90);
     my $receipt=$mono;
@@ -4259,7 +4259,7 @@ subtest 'GP-R07-002: receipt clocks survive the webhook reorder queue' => sub {
     is($s->{intents}[0]{expires_mono},$receipt+150,'reordering does not shift the action deadline');
 };
 
-subtest 'GP-R07-003: controller bulk deletions obey the active configuration guard' => sub {
+subtest 'controller bulk deletions obey the active configuration guard' => sub {
     for my $pattern ('action_max_ag.',undef) {
         my ($c,$cfg,$s)=pending_fixture('unknown',action_max_age=>180);complete_arrival($s,$cfg);actor_fresh();
         my $error;
@@ -4271,7 +4271,7 @@ subtest 'GP-R07-003: controller bulk deletions obey the active configuration gua
     }
 };
 
-subtest 'GP-R07-003: committed controller deletions revoke every affected output even with cold caches' => sub {
+subtest 'committed controller deletions revoke every affected output even with cold caches' => sub {
     for my $cold (0,1) {
         for my $pattern ('action_max_ag.',undef) {
             my ($c,$cfg,$s)=pending_fixture('unknown',action_max_age=>180);complete_arrival($s,$cfg);actor_fresh();
@@ -4294,7 +4294,7 @@ subtest 'GP-R07-003: committed controller deletions revoke every affected output
     }
 };
 
-subtest 'GP-R07-003: deletion patterns validate and reset their combined change once' => sub {
+subtest 'deletion patterns validate and reset their combined change once' => sub {
     my ($c)=fixture();mode('GP','debug');
     attribute('GP','action_max_age',200);attribute('GP','reorder_window',120);
     like(delete_attributes('GP','action_max_ag.'),qr/smaller than action_max_age/,
@@ -4314,7 +4314,7 @@ subtest 'GP-R07-003: deletion patterns validate and reset their combined change 
     is($c->{helper}{gp_config},$catalog,'diagnostic pattern keeps the prepared configuration');
 };
 
-subtest 'GP-R07-004: ROOMMATE alias deletion patterns preserve the remaining opening' => sub {
+subtest 'ROOMMATE alias deletion patterns preserve the remaining opening' => sub {
     for my $pattern ('^alias$','a.ias','[a]lias','^(alias|room)$','(?x) ^ alias $') {
         for my $cold (0,1) {
             my ($c,$cfg,$s)=pending_fixture('automotive');complete_arrival($s,$cfg);actor_fresh();
@@ -4337,7 +4337,7 @@ subtest 'GP-R07-004: ROOMMATE alias deletion patterns preserve the remaining ope
     is_deeply(\@commands,['door lock unlocked'],'a pattern removing a functional ROOMMATE attribute still revokes the garage');
 };
 
-subtest 'GP-R07-005: deleting obsolete attributes refreshes cached validation without compiling in callbacks' => sub {
+subtest 'deleting obsolete attributes refreshes cached validation without compiling in callbacks' => sub {
     for my $case (['R.Work','^(role|condition)$',[qw(role condition)],qr/unsupported rule attribute/],
                   ['R.Work','(?x) ^ (role | condition) $',[qw(role condition)],qr/unsupported rule attribute/],
                   ['GP','^(mode|operatingMode)$',[qw(mode operatingMode)],qr/remove obsolete attribute/],
@@ -4359,7 +4359,7 @@ subtest 'GP-R07-005: deleting obsolete attributes refreshes cached validation wi
     }
 };
 
-subtest 'F-05: distinct observation times need no pairwise batch conflict comparisons' => sub {
+subtest 'distinct observation times need no pairwise batch conflict comparisons' => sub {
     my ($c,$cfg)=fixture();advance(100);my $latest=$now;
     for my $age (reverse 0..63) {
         is((http($c,form($cfg,'Home',1,$latest-$age)))[0],200,'fresh distinct observation accepted');
@@ -4378,7 +4378,7 @@ subtest 'F-05: distinct observation times need no pairwise batch conflict compar
     ok(!$s->{conflict},'distinct times do not quarantine the batch');
 };
 
-subtest 'F-06: a continuous event stream cannot extend the first receipt window' => sub {
+subtest 'a continuous event stream cannot extend the first receipt window' => sub {
     my ($c,$cfg)=fixture();advance(40);
     for my $step (0..5) {
         is((http($c,form($cfg,'Work',1,$now)))[0],200,"stream observation $step accepted");
@@ -4390,7 +4390,7 @@ subtest 'F-06: a continuous event stream cannot extend the first receipt window'
     is(GP_State($c,'Geo.Test',0)->{last_observed},$now,'the last window includes its newest received observation');
 };
 
-subtest 'F-06: the due batch includes newer counterevidence before confirming arrival' => sub {
+subtest 'the due batch includes newer counterevidence before confirming arrival' => sub {
     for my $exit (qw(Home Drive Outer Work)) {
         my ($c,$cfg,$s)=pending_fixture('automotive');
         advance(8);
@@ -4405,7 +4405,7 @@ subtest 'F-06: the due batch includes newer counterevidence before confirming ar
     }
 };
 
-subtest 'F-06: productive and debug batches keep independent fixed windows' => sub {
+subtest 'productive and debug batches keep independent fixed windows' => sub {
     my ($c,$cfg)=fixture();advance(40);
     is((http($c,form($cfg,'Work',1,$now)))[0],200,'productive observation accepted');
     advance(1);
@@ -4421,7 +4421,7 @@ subtest 'F-06: productive and debug batches keep independent fixed windows' => s
     is(scalar @messages,1,'debug processing creates no real notification');
 };
 
-subtest 'F-11: an older entry in the same pending arrival can supply missing motion' => sub {
+subtest 'an older entry in the same pending arrival can supply missing motion' => sub {
     for my $case ([first=>'walking'],[later=>'walking'],[first=>'automotive'],[later=>'automotive']) {
         my ($which,$motion)=@$case;
         my ($c,$cfg,$s)=pending_fixture('unknown');
@@ -4452,7 +4452,7 @@ subtest 'F-11: an older entry in the same pending arrival can supply missing mot
     }
 };
 
-subtest 'F-11: HTTP motion supplement survives the geometry filter after newer Home entries' => sub {
+subtest 'HTTP motion supplement survives the geometry filter after newer Home entries' => sub {
     for my $phone (0,1) {
         my ($c,$cfg)=fixture();my $s=GP_State($c,'Geo.Test',0);
         advance(40);http($c,form($cfg,'Work',0,$now));advance(3);GeoPresence_Timer($c);
@@ -4477,7 +4477,7 @@ subtest 'F-11: HTTP motion supplement survives the geometry filter after newer H
     }
 };
 
-subtest 'GP-F11-001: the current approach retains its motion origin on entering Home' => sub {
+subtest 'the current approach retains its motion origin on entering Home' => sub {
     for my $gap (0,5) {
         for my $phone (0,1) {
             my ($c,$cfg)=fixture();my $s=GP_State($c,'Geo.Test',0);
@@ -4508,7 +4508,7 @@ subtest 'GP-F11-001: the current approach retains its motion origin on entering 
     }
 };
 
-subtest 'GP-F11-001: an early approach cannot requalify or consume its pending Home arrival' => sub {
+subtest 'an early approach cannot requalify or consume its pending Home arrival' => sub {
     my ($c,$cfg)=fixture();my $s=GP_State($c,'Geo.Test',0);
     advance(40);process($s,$cfg,'Work',0);advance(50);
     my $approach=ev('Drive',1,$now);GP_Process($s,$cfg,$approach,$now,$mono);
@@ -4522,7 +4522,7 @@ subtest 'GP-F11-001: an early approach cannot requalify or consume its pending H
     is_deeply(\@commands,['door lock unlocked'],'qualified Home arrival still opens only the door');
 };
 
-subtest 'GP-F11-001: an interrupted or superseded approach cannot donate motion to Home' => sub {
+subtest 'an interrupted or superseded approach cannot donate motion to Home' => sub {
     for my $boundary (qw(Home Drive Outer remote phone timeout newer_approach)) {
         my ($c,$cfg)=fixture();my $s=GP_State($c,'Geo.Test',0);
         advance(40);process($s,$cfg,'Work',0);advance(90);
@@ -4549,7 +4549,7 @@ subtest 'GP-F11-001: an interrupted or superseded approach cannot donate motion 
     }
 };
 
-subtest 'GP-F11-002: delayed exits interrupt the approach origin without rewinding position' => sub {
+subtest 'delayed exits interrupt the approach origin without rewinding position' => sub {
     for my $zone (qw(Home Drive Outer)) {
         for my $after_home (0,1) {
             my ($c,$cfg)=fixture();my $s=GP_State($c,'Geo.Test',0);
@@ -4595,7 +4595,7 @@ subtest 'GP-F11-002: delayed exits interrupt the approach origin without rewindi
     }
 };
 
-subtest 'GP-F11-002: HTTP filter retains an unchanged delayed exit before Home' => sub {
+subtest 'HTTP filter retains an unchanged delayed exit before Home' => sub {
     for my $case (qw(interrupted earlier_exit changed_geometry new_approach)) {
         my ($c,$cfg)=fixture();my $s=GP_State($c,'Geo.Test',0);
         advance(40);http($c,form($cfg,'Checkpoint',1,$now,latitude=>0.0009,radius=>20));advance(3);GeoPresence_Timer($c);
@@ -4624,7 +4624,7 @@ subtest 'GP-F11-002: HTTP filter retains an unchanged delayed exit before Home' 
     }
 };
 
-subtest 'GP-F11-002: late exits revoke cached approach motion and retain newer Home motion' => sub {
+subtest 'late exits revoke cached approach motion and retain newer Home motion' => sub {
     for my $home_motion (qw(unknown automotive walking)) {
         my ($c,$cfg)=fixture();my $s=GP_State($c,'Geo.Test',0);
         $cfg->{arrival_wait_automotive}=60;
@@ -4643,7 +4643,7 @@ subtest 'GP-F11-002: late exits revoke cached approach motion and retain newer H
     }
 };
 
-subtest 'GP-F11-003: a pre-Home exit preserves the latched walking veto after its TTL' => sub {
+subtest 'a pre-Home exit preserves the latched walking veto after its TTL' => sub {
     for my $zone (qw(Home Drive Outer)) {
         for my $phone (0,1) {
             my ($c)=fixture();mode('GP','debug');attribute('GP','motion_max_age',20);mode('GP','active');
@@ -4675,7 +4675,7 @@ subtest 'GP-F11-003: a pre-Home exit preserves the latched walking veto after it
     }
 };
 
-subtest 'GP-F11-003: only revoked motion is reassessed at its original evaluation time' => sub {
+subtest 'only revoked motion is reassessed at its original evaluation time' => sub {
     for my $case ([walking=>'unknown',1,'unknown'],[automotive=>'walking',0,'walking'],
                   [automotive=>'running',0,'running'],[automotive=>'cycling',0,'cycling'],
                   [unknown=>'automotive',1,'automotive'],[unknown=>'walking',1,'automotive','automotive']) {
@@ -4703,7 +4703,7 @@ subtest 'GP-F11-003: only revoked motion is reassessed at its original evaluatio
     }
 };
 
-subtest 'F-11: supplements cannot replace newer motion or enter another arrival' => sub {
+subtest 'supplements cannot replace newer motion or enter another arrival' => sub {
     for my $newer (qw(walking automotive)) {
         my ($c,$cfg,$s)=pending_fixture('unknown');my $old={%{$s->{arrival}{event}}};
         advance(5);process($s,$cfg,'Home',1,$newer);my $time=$s->{motion_time};
@@ -4720,7 +4720,7 @@ subtest 'F-11: supplements cannot replace newer motion or enter another arrival'
     is_deeply($s->{arrival}{event},$current,'successor keeps its own original evidence');
 };
 
-subtest 'F-11: an unaccepted origin or changed old geometry cannot supply motion' => sub {
+subtest 'an unaccepted origin or changed old geometry cannot supply motion' => sub {
     for my $case (qw(unseen geometry)) {
         my ($c,$cfg)=fixture();my $s=GP_State($c,'Geo.Test',0);
         advance(40);http($c,form($cfg,'Work',0,$now));advance(3);GeoPresence_Timer($c);
@@ -4736,7 +4736,7 @@ subtest 'F-11: an unaccepted origin or changed old geometry cannot supply motion
     }
 };
 
-subtest 'F-11: a late exit still uses the newest Home entry after motion enrichment' => sub {
+subtest 'a late exit still uses the newest Home entry after motion enrichment' => sub {
     my ($c,$cfg,$s)=pending_fixture('unknown');my $old={%{$s->{arrival}{event}}};
     advance(5);process($s,$cfg,'Home',1);my $latest={%{$s->{arrival}{latest_home}}};
     advance(3);GP_Process($s,$cfg,{%$old,motion=>'walking',received=>$now,received_mono=>$mono},$now,$mono);

@@ -1,3 +1,19 @@
+# GeoPresence - presence and location automation for FHEM.
+# SPDX-License-Identifier: GPL-3.0-only
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, version 3 of the License.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program in the LICENSE file. If not, see
+# <https://www.gnu.org/licenses/>.
+
 package main;
 
 use strict;
@@ -62,6 +78,7 @@ my @GP_CHECKPOINT_STATE_FIELDS = qw(location position_time boundary zones member
 my $GP_PHONE_DEPARTURE_REASON = 'Home exit and qualified phone absence';
 my %GP_AUTH;
 
+# GP_UsesSource: Check whether a resident profile enables the requested source.
 sub GP_UsesSource {
     my ($mode,$source)=@_;
     $mode //= 'geofency_phone';
@@ -69,6 +86,7 @@ sub GP_UsesSource {
         : $mode =~ /\A(?:geofency_phone|geofency_only)\z/) ? 1:0;
 }
 
+# GP_ResidentAttrEnabled: Check whether an attribute applies to the resident's selected sources.
 sub GP_ResidentAttrEnabled {
     my ($mode,$key)=@_;
     return GP_UsesSource($mode,'phone') if $key =~ /\A(?:phoneProxies|phoneSignalMode)\z/;
@@ -76,6 +94,7 @@ sub GP_ResidentAttrEnabled {
     return 1;
 }
 
+# GP_RuleAttrEnabled: Check whether a rule attribute applies to its trigger and selector.
 sub GP_RuleAttrEnabled {
     my ($name,$key)=@_;
     my $trigger=GP_Attr($name,'trigger','');
@@ -86,6 +105,7 @@ sub GP_RuleAttrEnabled {
     return 1;
 }
 
+# GP_AttrSpec: Format an attribute name with its supported widget choices.
 # These lists describe the normal FHEMWEB widgets; they never write attributes,
 # publish events or change runtime permissions. Keep enum validation in sync.
 sub GP_AttrSpec {
@@ -93,11 +113,13 @@ sub GP_AttrSpec {
     return $GP_ENUMS{$key} ? $key.':'.join(',',@{$GP_ENUMS{$key}}) : $key;
 }
 
+# GP_MatchingAttrs: Match attribute names against a deletion pattern without propagating regex errors.
 sub GP_MatchingAttrs {
     my ($key,@keys)=@_;
     return eval {grep {!length($key) || /^$key$/} @keys};
 }
 
+# GP_ConfigAttrKeys: Identify protected configuration keys affected by an attribute change.
 # The pre-commit guard protects changes to supported business parameters.
 # Global invalidation also covers display names and obsolete validation inputs.
 sub GP_ConfigAttrKeys {
@@ -109,6 +131,7 @@ sub GP_ConfigAttrKeys {
         @{$GP_ATTRS{$d->{SUBTYPE}//''}//[]});
 }
 
+# GP_UpdateAttrLists: Refresh subtype-specific FHEMWEB attribute widgets and device choices.
 sub GP_UpdateAttrLists {
     my ($only)=@_;
     my (@devices,@proxies,%choices,%groups);
@@ -164,8 +187,10 @@ sub GP_UpdateAttrLists {
     }
 }
 
+# GP_AuthKey: Derive a regex-safe key-store identifier from a resident name.
 sub GP_AuthKey { return 'GeoPresence_auth_v2_'.sha256_hex($_[0]); }
 
+# GP_AuthPath: Resolve the FHEM key-store path using the core's filename cleanup.
 # FHEM treats key names as regex patterns. New keys use only a fixed prefix
 # and hex digits; legacy names must be compared literally in the same file.
 sub GP_AuthPath {
@@ -174,6 +199,7 @@ sub GP_AuthPath {
     return GP_Attr('global','modpath','.').'/FHEM/FhemUtils/'.$file;
 }
 
+# GP_ReadAuth: Read the preferred password verifier with an exact-name legacy fallback.
 sub GP_ReadAuth {
     my ($resident)=@_;
     my ($error,@lines)=FileRead(GP_AuthPath());
@@ -181,6 +207,8 @@ sub GP_ReadAuth {
     my $current=GP_AuthKey($resident).':';
     my $old='GeoPresence_'.$resident.'_auth:';
     my $legacy;
+    # Keep the first legacy value until the scan rules out a preferred key.
+    # Even an empty preferred value prevents an old password from becoming valid.
     for my $line (@lines) {
         return (undef,substr($line,length $current)) if index($line,$current)==0;
         $legacy=substr($line,length $old) if !defined($legacy) && index($line,$old)==0;
@@ -188,8 +216,10 @@ sub GP_ReadAuth {
     return (undef,$legacy);
 }
 
+# GP_StoreAuth: Store or delete a password verifier and remove its exact legacy entries.
 sub GP_StoreAuth {
     my ($resident,$secret)=@_;
+    # Keep the core write semantics: legacy cleanup may fail after the new value is stored.
     my $error=setKeyValue(GP_AuthKey($resident),$secret);
     return $error if $error;
     my $file=GP_AuthPath();
@@ -202,6 +232,7 @@ sub GP_StoreAuth {
     return @lines==$count ? undef:FileWrite($file,@lines);
 }
 
+# GP_Auth: Cache credential lookup results while honoring a persisted migration failure.
 sub GP_Auth {
     my ($resident)=@_;
     unless ($GP_AUTH{$resident}) {
@@ -211,6 +242,7 @@ sub GP_Auth {
     return @{$GP_AUTH{$resident}};
 }
 
+# GeoPresence_Initialize: Register FHEM callbacks and reset existing controllers after a module reload.
 sub GeoPresence_Initialize {
     my ($hash) = @_;
     $hash->{DefFn} = 'GeoPresence_Define';
@@ -232,11 +264,16 @@ sub GeoPresence_Initialize {
     }
 }
 
+# GP_Now: Return Unix time in seconds for observation dates and diagnostics.
 sub GP_Now { return Time::HiRes::time(); }
+
+# GP_Mono: Return monotonic seconds for elapsed-time budgets.
 sub GP_Mono { return Time::HiRes::clock_gettime(Time::HiRes::CLOCK_MONOTONIC()); }
 
+# GP_CPU: Return process CPU time for timer diagnostics.
 sub GP_CPU { my ($user,$system)=times; return $user+$system; }
 
+# GP_Profile: Measure a timer phase while preserving return context and exceptions.
 # Passive timing within a timer invocation only. Nested spans have exclusive
 # self time, so a slow FHEM callback is not also charged to all its callers.
 # Preserve the caller's context and exception; no commands or events are added.
@@ -268,33 +305,55 @@ sub GP_Profile {
     die $error unless $ok;
     return $context ? @result : $result;
 }
+
+# GP_Attr: Read an attribute with a fallback when no value is defined.
 sub GP_Attr { return ($attr{$_[0]} // {})->{$_[1]} // $_[2]; }
+
+# GP_List: Split a comma-separated attribute into nonempty entries.
 sub GP_List { return grep { length } split /,/, ($_[0] // ''); }
+
+# GP_Name: Validate a GeoPresence device name.
 sub GP_Name { return defined($_[0]) && $_[0] =~ /\A[A-Za-z][A-Za-z0-9_.-]*\z/; }
+
+# GP_Group: Validate a group name and its maximum length.
 sub GP_Group { return GP_Name($_[0]) && length($_[0])<=64; }
+
+# GP_Id: Validate a webhook user, device, or location identifier.
 sub GP_Id { return defined($_[0]) && $_[0] =~ /\A[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\z/; }
+
+# GP_Number: Recognize the decimal number format accepted by configuration and observations.
 sub GP_Number { return defined($_[0]) && $_[0] =~ /\A-?(?:\d+(?:\.\d*)?|\.\d+)\z/; }
+
+# GP_IPv4: Validate a concrete IPv4 address and its octets.
 sub GP_IPv4 {
     my ($address)=@_;
     return 0 unless defined($address) && $address =~ /\A(?:0|[1-9][0-9]{0,2})(?:\.(?:0|[1-9][0-9]{0,2})){3}\z/;
     my @octets=split /\./,$address;
     return $octets[0]>0 && $octets[0]<224 && !grep {$_>255} @octets;
 }
+
+# GP_PeerListValid: Validate a bounded list of distinct allowed IPv4 peers.
 sub GP_PeerListValid {
     my ($value)=@_;
     return 0 unless defined($value) && length($value);
     my @peers=split /,/,$value,-1;my %seen;
     return @peers<=16 && !grep {!GP_IPv4($_) || $seen{$_}++} @peers;
 }
+
+# GP_Field: Read a device internal with a fallback for missing devices or values.
 sub GP_Field { return ($defs{$_[0] // ''} // {})->{$_[1]} // $_[2]; }
+
+# GP_IsOpening: Identify actions that require the shared opening safety checks.
 sub GP_IsOpening { return ($_[0]//'') =~ /\A(?:door_open|garage_open)\z/; }
 
+# GP_LogPathValid: Validate a diagnostic log path before it is configured.
 sub GP_LogPathValid {
     my ($path)=@_;
     return defined($path) && length($path)<=512 && $path =~ m{\A[A-Za-z0-9_./%+-]+\.(?:log|txt)\z}
         && $path !~ /%(?![YmdHM])/;
 }
 
+# GP_LogPath: Resolve the diagnostic log filename for the current local date.
 sub GP_LogPath {
     my ($c)=@_;
     my $pattern=GP_Attr($c->{NAME},'logFile','');
@@ -302,6 +361,7 @@ sub GP_LogPath {
     return POSIX::strftime($pattern,localtime(GP_Now()));
 }
 
+# GP_DebugLogEnabled: Decide whether diagnostics are enabled for the controller and event mode.
 # Logging is an output adapter, never a Reading update or FHEM event. The
 # operating mode controls actions; debugLog independently controls diagnostics.
 sub GP_DebugLogEnabled {
@@ -315,6 +375,7 @@ sub GP_DebugLogEnabled {
     return $mode eq 'debug' || $mode eq 'learning' ? 1:0;
 }
 
+# GP_LogText: Decode, sanitize, and bound text written to operational logs.
 sub GP_LogText {
     my ($text)=@_;
     $text//='';
@@ -325,12 +386,14 @@ sub GP_LogText {
     return substr($text,0,512);
 }
 
+# GP_LogResident: Resolve a resident's human-readable name for log messages.
 sub GP_LogResident {
     my ($r)=@_;
     my $rr=GP_Field($r,'ROOMMATE',$r);
     return GP_LogText(GP_Attr($r,'alias',GP_Attr($rr,'alias',$rr)));
 }
 
+# GP_NormalLog: Write a sanitized operational message through FHEM's logger.
 # Only short, human-readable actions and operational warnings use FHEM's log.
 sub GP_NormalLog {
     my ($c,$level,$text)=@_;
@@ -340,6 +403,7 @@ sub GP_NormalLog {
     GP_Profile($c,'normal_log',$c->{NAME},sub {Log3($c->{NAME},$level,$unicodeEncoding ? $line : encode('UTF-8',$line))});
 }
 
+# GP_LogAction: Translate selected productive decisions into concise operational messages.
 sub GP_LogAction {
     my ($c,$r,$row)=@_;
     my $reason=$row->{reason}//'';
@@ -382,6 +446,7 @@ sub GP_LogAction {
     GP_NormalLog($c,$level,$who.': '.$text) if length $text;
 }
 
+# GP_Log: Record operational notices and bounded, filtered file diagnostics.
 # Structured diagnostics go exclusively to logFile, independent of verbose.
 # Only selected fields enter it, never headers, bodies or credentials.
 sub GP_Log {
@@ -424,6 +489,7 @@ sub GP_Log {
     } else { delete @{$c->{helper}}{qw(gp_log_error gp_log_warning)}; }
 }
 
+# GP_WriteLog: Append a UTF-8 diagnostic line and return any file error.
 sub GP_WriteLog {
     my ($path,$level,$text)=@_;
     my $error;
@@ -435,6 +501,7 @@ sub GP_WriteLog {
     return $error;
 }
 
+# GP_LogDecision: Route a decision to operational and diagnostic logs for its mode.
 sub GP_LogDecision {
     my ($c,$r,$row,$debug)=@_;
     my $level=$row->{diagnostic_only} ? 5 : 4;
@@ -444,6 +511,7 @@ sub GP_LogDecision {
     GP_Log($c,$level,'decision',{%$row,resident=>$r,mode=>$debug ? 'debug':'active'});
 }
 
+# GP_LogTrace: Write only the unlogged tail of a resident's bounded trace.
 sub GP_LogTrace {
     my ($c,$r,$s,$debug)=@_;
     my $trace=$s->{trace};
@@ -461,6 +529,7 @@ sub GP_LogTrace {
     }
 }
 
+# GP_RecordAction: Record an actual adapter result even if a callback replaced its context.
 sub GP_RecordAction {
     my ($c,$r,$s,$now,$reason,$detail)=@_;
     # Only actual output adapters and retained hardware reservations call here.
@@ -474,24 +543,33 @@ sub GP_RecordAction {
     }
 }
 
+# GP_Reading: Return a Reading record or an empty fallback.
 sub GP_Reading { return ((GP_Field($_[0], 'READINGS', {}))->{$_[1]} // {}); }
+
+# GP_Read: Read a Reading value with a fallback when no value is defined.
 sub GP_Read { return GP_Reading($_[0], $_[1])->{VAL} // $_[2]; }
+
+# GP_Controller: Resolve the controller that owns a GeoPresence device.
 sub GP_Controller {
     my ($d) = @_;
     return unless $d && ($d->{TYPE} // '') eq 'GeoPresence';
     return $d if ($d->{SUBTYPE} // '') eq 'controller';
     return $defs{$d->{CONTROLLER} // ''};
 }
+
+# GP_Residents: Return resident names from the controller's membership inventory.
 sub GP_Residents {
     my ($c) = @_;
     return @{$c ? GP_Inventory($c)->{residents} : []};
 }
 
+# GP_DeviceNames: Return all GeoPresence device names belonging to the controller.
 sub GP_DeviceNames {
     my ($c)=@_;
     return @{$c ? GP_Inventory($c)->{devices} : []};
 }
 
+# GP_Inventory: Build or reuse the controller's sorted device membership index.
 # Membership is independent of attributes. Administrative callers must not
 # compile adapters, rules or validation just to enumerate residents.
 sub GP_Inventory {
@@ -510,6 +588,7 @@ sub GP_Inventory {
     return $c->{helper}{gp_devices}=$inventory;
 }
 
+# GP_Dependencies: Build or reuse resident dependencies for configuration guards.
 # This index is needed before an edit is committed to protect affected active
 # residents. It contains references only, never executable adapter parameters.
 sub GP_Dependencies {
@@ -551,6 +630,7 @@ sub GP_Dependencies {
     return $inventory->{dependencies}=$index;
 }
 
+# GP_Catalog: Prepare shared rules, adapters, identities, and static validation inputs.
 # Configuration is immutable between configuration changes. Runtime readings,
 # transport availability and geometry observation times do not belong here.
 sub GP_Catalog {
@@ -621,6 +701,7 @@ sub GP_Catalog {
     return $c->{helper}{gp_config}=$catalog;
 }
 
+# GP_InvalidateConfig: Invalidate prepared configuration or a selected resident view.
 sub GP_InvalidateConfig {
     my ($c,$r,$debug)=@_;
     return unless $c;
@@ -633,6 +714,7 @@ sub GP_InvalidateConfig {
     delete $catalog->{views}{$_}{$r} for defined($debug) ? ($debug?'debug':'prod') : qw(prod debug);
 }
 
+# GP_InvalidateDevices: Discard the membership inventory and its derived configuration.
 sub GP_InvalidateDevices {
     my ($c)=@_;
     return unless $c;
@@ -640,6 +722,7 @@ sub GP_InvalidateDevices {
     GP_InvalidateConfig($c);
 }
 
+# GP_Mode: Read a supported stored mode, falling back to disabled.
 sub GP_Mode {
     my ($name)=@_;
     my $value=GP_Read($name,'mode','disabled');
@@ -648,6 +731,7 @@ sub GP_Mode {
     return 'disabled';
 }
 
+# GP_StoreMode: Store an operating mode without Reading events or user callbacks.
 sub GP_StoreMode {
     my ($d,$mode)=@_;
     # Operator state belongs in fhem.save, not in a second configuration attr.
@@ -655,6 +739,7 @@ sub GP_StoreMode {
     setReadingsVal($d,'mode',$mode,POSIX::strftime('%Y-%m-%d %H:%M:%S',localtime(GP_Now())));
 }
 
+# GP_EffectiveMode: Combine controller, resident, and test modes into the effective mode.
 sub GP_EffectiveMode {
     my ($c,$r,$test)=@_;
     my $cm=GP_Mode($c->{NAME}); my $rm=GP_Mode($r);
@@ -664,6 +749,7 @@ sub GP_EffectiveMode {
     return 'active';
 }
 
+# GP_ModeReason: Explain how controller and resident modes determine current behavior.
 sub GP_ModeReason {
     my ($c,$r)=@_;
     return 'Controller is disabled' if GP_Mode($c->{NAME}) eq 'disabled';
@@ -674,6 +760,7 @@ sub GP_ModeReason {
     return 'Controller and resident are active';
 }
 
+# GP_UpdateModes: Refresh resident mode displays without emitting events.
 sub GP_UpdateModes {
     my ($c)=@_;
     for my $r (GP_Residents($c)) {
@@ -688,6 +775,7 @@ sub GP_UpdateModes {
     }
 }
 
+# GP_AffectedResidents: Identify residents affected by a device or proposed reference change.
 sub GP_AffectedResidents {
     my ($c,$d,$change)=@_;
     my $kind=$d->{SUBTYPE}//''; my $name=$d->{NAME};
@@ -708,6 +796,7 @@ sub GP_AffectedResidents {
     return sort grep {GP_Field($_,'SUBTYPE','') eq 'resident' && GP_Field($_,'CONTROLLER','') eq $c->{NAME}} keys %res;
 }
 
+# GP_ConfigChangeError: Reject configuration edits that affect active residents or an active controller.
 sub GP_ConfigChangeError {
     my ($c,$d,$change)=@_;
     return unless $c && $init_done;
@@ -718,6 +807,7 @@ sub GP_ConfigChangeError {
     return;
 }
 
+# GP_ConfigChanged: Reset affected contexts and defer rebuilding the committed configuration.
 sub GP_ConfigChanged {
     my ($c,$d,$change)=@_;
     return unless $c;
@@ -733,6 +823,7 @@ sub GP_ConfigChanged {
     GP_InvalidateConfig($c);
 }
 
+# GeoPresence_Define: Validate a new device definition or change an existing location's role.
 sub GeoPresence_Define {
     my ($hash, $def) = @_;
     my ($name, $type, $kind, @args) = split /\s+/, $def;
@@ -798,6 +889,7 @@ sub GeoPresence_Define {
     return;
 }
 
+# GP_ResetController: Start a new controller session while retaining active actor reservations.
 sub GP_ResetController {
     my ($c,$policy) = @_;
     $policy//='invalidate';
@@ -840,6 +932,7 @@ sub GP_ResetController {
     GP_ScheduleTimer($c,0.1) if defined &InternalTimer;
 }
 
+# GP_ResetResident: Discard a resident's runtime contexts and reset its session metadata.
 sub GP_ResetResident {
     my ($c,$r,$keep)=@_; $keep//='';
     my $rt=$c->{helper}{gp} or return;
@@ -854,6 +947,7 @@ sub GP_ResetResident {
     GP_StoreMode($defs{$r},'disabled') if $keep ne 'learning' && GP_Mode($r) eq 'learning';
     delete $rt->{errors}{$r};
     @{$rt->{queue}}=grep {$_->{resident} ne $r} @{$rt->{queue}};
+    # An old name must not leave session clocks or counters for a later device to inherit.
     if (exists $defs{$r}) {
         $rt->{resident_start}{$r}=GP_Now();
         $rt->{resident_mono}{$r}=GP_Mono();
@@ -863,6 +957,7 @@ sub GP_ResetResident {
     }
 }
 
+# GeoPresence_Undef: Guard device removal and release or invalidate its owned runtime resources.
 sub GeoPresence_Undef {
     my ($hash) = @_;
     my $c = GP_Controller($hash);
@@ -887,6 +982,7 @@ sub GeoPresence_Undef {
     return;
 }
 
+# GeoPresence_Delete: Remove a deleted resident's cached and stored webhook credentials.
 sub GeoPresence_Delete {
     my ($hash) = @_;
     return unless ($hash->{SUBTYPE} // '') eq 'resident';
@@ -894,6 +990,7 @@ sub GeoPresence_Delete {
     return GP_StoreAuth($hash->{NAME},undef);
 }
 
+# GeoPresence_Rename: Repair internal bindings and revoke affected plans after a FHEM rename.
 sub GeoPresence_Rename {
     my ($new,$old)=@_;
     my $d=$defs{$new} or return;
@@ -901,6 +998,7 @@ sub GeoPresence_Rename {
     my $kind=$d->{SUBTYPE};my $rt=$c->{helper}{gp};
     my $owner=$kind eq 'controller' ? $old:$c->{NAME};
     my $inventory=$c->{helper}{gp_devices};
+    # FHEM already moved the device; cached membership may still contain its old name.
     my @devices=$inventory
         ? grep {defined} map {$defs{$_ eq $old ? $new:$_}} @{$inventory->{devices}}
         : grep {($_->{TYPE}//'') eq 'GeoPresence' && ($_->{CONTROLLER}//'') eq $owner} values %defs;
@@ -916,6 +1014,7 @@ sub GeoPresence_Rename {
         # Public rule attributes are not silently rewritten. Revoke every
         # resident of a shared rule when its resident selector becomes stale.
         next unless ($child->{SUBTYPE}//'') eq 'rule' && $kind =~ /\A(?:resident|action|rule)\z/;
+        # Resident renames need the selector itself; other renames can filter rules first.
         next if ($kind eq 'rule' && $child!=$d)
             || ($kind eq 'action' && GP_Attr($child->{NAME},'action','') ne $old);
         my @res=GP_List(GP_Attr($child->{NAME},'residents',''));
@@ -965,6 +1064,7 @@ sub GeoPresence_Rename {
     return;
 }
 
+# GeoPresence_Attr: Validate attribute edits before FHEM commits them and invalidate affected state.
 sub GeoPresence_Attr {
     my ($cmd, $name, $key, $value) = @_;
     $key//=''; # FHEM omits the key when deleteattr removes all attributes.
@@ -1055,6 +1155,7 @@ sub GeoPresence_Attr {
     return;
 }
 
+# GP_Distance: Calculate the great-circle distance between two positions in meters.
 sub GP_Distance {
     my ($a, $b) = @_;
     my $rad = 3.141592653589793 / 180;
@@ -1064,6 +1165,7 @@ sub GP_Distance {
     return 6371000 * 2 * atan2(sqrt($p), sqrt(1-$p));
 }
 
+# GP_HasGeometry: Check that a circle has valid coordinates and a supported radius.
 sub GP_HasGeometry {
     my ($g)=@_;
     return $g && GP_Number($g->{lat}) && abs($g->{lat})<=90
@@ -1071,12 +1173,14 @@ sub GP_HasGeometry {
         && GP_Number($g->{radius}) && $g->{radius}>0 && $g->{radius}<=100000;
 }
 
+# GP_MissingGeometry: List configured Geo locations that still lack valid geometry.
 sub GP_MissingGeometry {
     my ($cfg)=@_;
     return () unless GP_UsesSource($cfg->{sourceMode},'geo');
     return grep {!GP_HasGeometry($cfg->{zones}{$_})} sort keys %{$cfg->{zones}};
 }
 
+# GP_ValidGeometryRecord: Validate saved geometry against the resident and location identities.
 sub GP_ValidGeometryRecord {
     my ($g,$r,$zone)=@_;
     return ref($g) eq 'HASH' && GP_HasGeometry($g)
@@ -1086,6 +1190,7 @@ sub GP_ValidGeometryRecord {
         && GP_Number($g->{changed}) && $g->{changed}>0 && $g->{changed}<=$g->{time};
 }
 
+# GP_Geometry: Load or reuse geometry in the selected production or debug pool.
 sub GP_Geometry {
     my ($c,$r,$zone,$debug)=@_;
     my $pool=$debug ? 'debug':'prod';
@@ -1106,6 +1211,7 @@ sub GP_Geometry {
     return $cache->{$zone}=$g;
 }
 
+# GP_GeometryErrors: Report missing, conflicting, or incorrectly nested technical circles.
 sub GP_GeometryErrors {
     my ($cfg)=@_;
     return () if $cfg->{sourceMode} eq 'phone_only';
@@ -1131,6 +1237,7 @@ sub GP_GeometryErrors {
     return @errors;
 }
 
+# GP_RevokeGeometry: Clear travel permissions and pending outputs after a geometry change.
 sub GP_RevokeGeometry {
     my ($s,$time,$now)=@_;
     delete @{$s}{qw(trip arrival approach automotive motion motion_time desired_status conflict)};
@@ -1141,6 +1248,7 @@ sub GP_RevokeGeometry {
     GP_Trace($s,$now,'geometry learned or changed; trip and pending actions revoked');
 }
 
+# GP_UpdateGeometry: Accept fresh geometry and report whether it changed, conflicted, or stayed unchanged.
 sub GP_UpdateGeometry {
     my ($c,$r,$debug,$s,$e,$cfg,$now)=@_;
     return 'same' unless $e->{kind} eq 'geo';
@@ -1174,6 +1282,7 @@ sub GP_UpdateGeometry {
     return $conflict ? 'conflict' : $changed ? 'changed':'same';
 }
 
+# GP_GeometrySync: Synchronize position after geometry changes without planning actions.
 sub GP_GeometrySync {
     my ($s,$cfg,$e,$now,$mono)=@_;
     return unless $e->{kind} eq 'geo';
@@ -1208,6 +1317,7 @@ sub GP_GeometrySync {
     GP_Trace($s,$now,'geometry synchronization; no actions');
 }
 
+# GP_PublishGeometry: Persist changed productive geometry as ordinary, event-free Readings.
 sub GP_PublishGeometry {
     my ($c,$r,$s)=@_;
     my $rt=$c->{helper}{gp};
@@ -1224,6 +1334,7 @@ sub GP_PublishGeometry {
     }
 }
 
+# GP_ApplyGeometry: Explicitly copy reviewed debug geometry into saved production metadata.
 sub GP_ApplyGeometry {
     my ($c,$r)=@_;
     my $learned=GP_Learned($c,$r);
@@ -1273,6 +1384,7 @@ sub GP_ApplyGeometry {
         .'Geometry is stored in normal readings; use FHEM state saving for persistence.';
 }
 
+# GP_Config: Build or reuse a resident view with geometry from the selected runtime pool.
 sub GP_Config {
     my ($c, $r, $debug) = @_;
     my $catalog=GP_Catalog($c);
@@ -1290,6 +1402,7 @@ sub GP_Config {
     return $catalog->{views}{$pool}{$r}=$cfg;
 }
 
+# GP_BaseConfig: Build or reuse a resident's static configuration and rule index.
 sub GP_BaseConfig {
     my ($c,$r)=@_;
     my $catalog=GP_Catalog($c);
@@ -1322,6 +1435,7 @@ sub GP_BaseConfig {
     return $catalog->{config}{$r}=$cfg;
 }
 
+# GP_ConfigRevision: Fingerprint configuration fields that determine observation and action semantics.
 sub GP_ConfigRevision {
     my ($cfg)=@_;
     # Keep lookup indexes and memoized values out of the semantic fingerprint.
@@ -1334,6 +1448,7 @@ sub GP_ConfigRevision {
     return $cfg->{revision};
 }
 
+# GP_Validate: Collect configuration errors for selected residents and activation requirements.
 sub GP_Validate {
     my ($c, $only, $activation, $prepared_cfg) = @_;
     return ('Controller missing') unless $c;
@@ -1362,6 +1477,7 @@ sub GP_Validate {
     return grep {!$seen{$_}++} @errors;
 }
 
+# GP_ValidateResident: Check source, identity, location, and rule requirements for a resident.
 sub GP_ValidateResident {
     my ($c,$r,$cfg,$catalog)=@_;
     my @errors;
@@ -1421,6 +1537,7 @@ sub GP_ValidateResident {
     return @errors;
 }
 
+# GP_ValidateRule: Check a rule's action, selectors, and arrival restrictions.
 sub GP_ValidateRule {
     my ($c,$rule,$resident,$cfg) = @_;
     my @err; my $name=$rule->{name};
@@ -1463,6 +1580,7 @@ sub GP_ValidateRule {
     return @err;
 }
 
+# GP_ValidateAction: Check an adapter's required devices, fixed command, and permitted parameters.
 sub GP_ValidateAction {
     my ($a)=@_;
     my ($name,$type,$p)=@{$a}{qw(name type params)};
@@ -1483,11 +1601,13 @@ sub GP_ValidateAction {
     return @err;
 }
 
+# GP_SafeText: Check notification text against length and character restrictions.
 sub GP_SafeText {
     my ($s) = @_;
     return defined($s) && length($s) && length($s)<=500 && $s !~ /[\x00-\x1f\x7f;{}\\]/;
 }
 
+# GP_ParseTime: Parse a strict ISO 8601 timestamp into epoch seconds and canonical time text.
 sub GP_ParseTime {
     my ($s) = @_;
     return unless defined($s) && $s =~ /\A(\d{4})-(\d\d)-(\d\d)T(\d\d):(\d\d):(\d\d)(\.\d{1,9})?(Z|[+-]\d\d:\d\d)\z/;
@@ -1507,6 +1627,7 @@ sub GP_ParseTime {
     return ($t+0+$frac, sprintf('%d',$t).$fraction);
 }
 
+# GP_ReadingTime: Convert a FHEM Reading's local timestamp into epoch seconds.
 sub GP_ReadingTime {
     my ($device,$reading)=@_;
     my $s=GP_Reading($device,$reading)->{TIME}//'';
@@ -1515,12 +1636,14 @@ sub GP_ReadingTime {
     return $@ ? undef : $t;
 }
 
+# GP_FormFieldLabel: Describe a form field for diagnostics without including its value.
 sub GP_FormFieldLabel {
     my ($key,$number)=@_;
     return $key if $key =~ /\A(?:device|id|date|entry|isTest|name|latitude|longitude|radius|motion|currentLatitude|currentLongitude|address|wifiSSID|wifiBSSID|beaconUUID|major|minor|notes)\z/;
     return "extra field $number";
 }
 
+# GP_DecodeForm: Decode a bounded UTF-8 form into fields, an error, and diagnostic metadata.
 sub GP_DecodeForm {
     my ($body)=@_;
     return (undef,'Request too large') if length($body)>16384;
@@ -1554,11 +1677,13 @@ sub GP_DecodeForm {
     return (\%p,undef,{ignored_multiline=>join(',',@multiline)});
 }
 
+# GP_NewPhone: Create an enabled or disabled phone-continuity state.
 sub GP_NewPhone {
     return {state=>'disabled',health=>'disabled',samples=>{},ever_present=>0} if defined($_[0]) && !$_[0];
     return {state=>'unknown',health=>'unknown',samples=>{},ever_present=>0};
 }
 
+# GP_ResetNegative: Clear absence qualification and optionally advance its observation boundary.
 sub GP_ResetNegative {
     my ($s,$after)=@_;
     my $p=$s->{phone};
@@ -1567,6 +1692,7 @@ sub GP_ResetNegative {
     $p->{negative_after}=$after if defined($after) && $after>($p->{negative_after}//0);
 }
 
+# GP_NewState: Create a resident context with independent trip and output namespaces.
 sub GP_NewState {
     my ($now,$mono,$generation,$source_mode)=@_;
     # A fresh namespace keeps local trip counters distinct across process starts
@@ -1578,12 +1704,14 @@ sub GP_NewState {
         mono=>$mono, wall=>$now, output_revision=>0, action_visits=>{}, action_last=>{}, trace=>[], intents=>[]};
 }
 
+# GP_RevokeOutputs: Invalidate existing intent revisions and clear pending output plans.
 sub GP_RevokeOutputs {
     my ($s)=@_;
     $s->{output_revision}++;
     $s->{intents}=[];
 }
 
+# GP_RevokeDependentOutputs: Revoke plans for residents that depend on changed device names.
 sub GP_RevokeDependentOutputs {
     my ($c,@names)=@_;
     my $rt=$c->{helper}{gp} or return;
@@ -1595,6 +1723,7 @@ sub GP_RevokeDependentOutputs {
     }
 }
 
+# GP_Trace: Append a bounded decision record with its observation and session context.
 sub GP_Trace {
     my ($s,$now,$reason,$extra)=@_;
     unless (($extra//{})->{diagnostic_only}) {
@@ -1608,6 +1737,7 @@ sub GP_Trace {
     shift @{$s->{trace}} while @{$s->{trace}}>1000;
 }
 
+# GP_StartTrip: Create an unarmed trip when no current trip exists.
 sub GP_StartTrip {
     my ($s,$event,$scope)=@_;
     return $s->{trip} if $s->{trip};
@@ -1617,6 +1747,7 @@ sub GP_StartTrip {
     return $s->{trip};
 }
 
+# GP_LeaveHome: Record a Home exit and begin a new absence-qualification interval.
 sub GP_LeaveHome {
     my ($s,$cfg,$e,$mono)=@_;
     my $trip=GP_StartTrip($s,$e,'local');
@@ -1628,6 +1759,7 @@ sub GP_LeaveHome {
     $s->{phase}='leaving';
 }
 
+# GP_DepartureTime: Return the departure boundary relevant to later phone presence.
 sub GP_DepartureTime {
     my ($trip)=@_;
     return unless $trip;
@@ -1637,12 +1769,14 @@ sub GP_DepartureTime {
     return $time;
 }
 
+# GP_Fresh: Check observation and receipt ages against freshness and future limits.
 sub GP_Fresh {
     my ($cfg,$e,$now)=@_;
     return $now-$e->{time}<=$cfg->{action_max_age} && $e->{time}<=$now+$cfg->{future_tolerance}
         && $now-$e->{received}<=$cfg->{action_max_age};
 }
 
+# GP_AfterStart: Apply the session-start boundary, including validated restart recovery.
 sub GP_AfterStart {
     my ($s,$cfg,$e)=@_;
     # A validated saved departure already supplies the missing initial context.
@@ -1654,6 +1788,7 @@ sub GP_AfterStart {
     return $e->{time}>$s->{start}+$margin;
 }
 
+# GP_AwayLongEnough: Check that a return follows the full absolute and monotonic absence interval.
 sub GP_AwayLongEnough {
     my ($cfg,$trip,$e,$mono)=@_;
     my $phone=($trip->{away_reason}//'') eq $GP_PHONE_DEPARTURE_REASON;
@@ -1668,6 +1803,7 @@ sub GP_AwayLongEnough {
             && ($e->{received_mono}//$mono)>=$proof->{qualified_mono}));
 }
 
+# GP_RememberEvent: Retain bounded duplicate-detection metadata and the original receipt clocks.
 sub GP_RememberEvent {
     my ($s,$e)=@_;
     return unless $e->{key};
@@ -1676,10 +1812,12 @@ sub GP_RememberEvent {
     delete $s->{seen}{shift @{$s->{seen_order}}} while @{$s->{seen_order}}>2000;
 }
 
+# GP_UsefulMotion: Recognize motion values that affect arrival timing or vehicle eligibility.
 sub GP_UsefulMotion {
     return ($_[0]//'') =~ /\A(?:automotive|walking|running|cycling)\z/;
 }
 
+# GP_MotionOrigin: Find an accepted observation allowed to supply motion to this approach or arrival.
 sub GP_MotionOrigin {
     my ($s,$cfg,$e)=@_;
     my $origin=$s->{arrival}//$s->{approach};
@@ -1702,6 +1840,7 @@ sub GP_MotionOrigin {
     return $seen;
 }
 
+# GP_EnrichDuplicate: Add missing motion without refreshing the original observation or receipt times.
 sub GP_EnrichDuplicate {
     my ($s,$cfg,$e,$now,$mono)=@_;
     my $seen=GP_MotionOrigin($s,$cfg,$e) or return;
@@ -1720,6 +1859,7 @@ sub GP_EnrichDuplicate {
     return 1;
 }
 
+# GP_MergeBatchMotion: Enrich the first duplicate in a batch before arrival planning can consume it.
 sub GP_MergeBatchMotion {
     my (@events)=@_;
     my %first;
@@ -1733,6 +1873,7 @@ sub GP_MergeBatchMotion {
     }
 }
 
+# GP_PhoneVeto: Check whether current phone presence contradicts a proposed Geo departure.
 sub GP_PhoneVeto {
     my ($s,$cfg,$time)=@_;
     my $p=$s->{phone};
@@ -1741,6 +1882,7 @@ sub GP_PhoneVeto {
             || (($cfg->{phoneSignalMode}//'state') eq 'state' && $p->{health} eq 'held'));
 }
 
+# GP_Arm: Qualify a departure while respecting contradictory phone evidence.
 sub GP_Arm {
     my ($s,$cfg,$e,$now,$mono,$scope,$previous_position)=@_;
     # Measurement timestamps order evidence. A latched positive state remains
@@ -1786,6 +1928,7 @@ sub GP_Arm {
     return 1;
 }
 
+# GP_VehicleEligible: Evaluate recent movement and remote-trip evidence for garage eligibility.
 sub GP_VehicleEligible {
     my ($s,$cfg,$now)=@_;
     return 1 if defined($s->{automotive}) && $now-$s->{automotive}<=$cfg->{motion_max_age};
@@ -1793,6 +1936,7 @@ sub GP_VehicleEligible {
     return $s->{trip} && ($s->{trip}{scope}//'') eq 'remote';
 }
 
+# GP_LocationEvents: Update explicit memberships and derive location and group transitions.
 # Explicit membership is separate from the display's geometric/age inference.
 # Missing exits and expired readings never manufacture a group exit.
 sub GP_LocationEvents {
@@ -1828,6 +1972,7 @@ sub GP_LocationEvents {
     return @events;
 }
 
+# GP_ExitEvidence: Find an explicit prior exit within the current trip and before the trigger.
 sub GP_ExitEvidence {
     my ($s,$reference,$time)=@_;
     my $trip=$s->{trip} or return;
@@ -1835,6 +1980,7 @@ sub GP_ExitEvidence {
     return defined($exit) && $exit>=$trip->{start} && $exit<$time ? $exit:undef;
 }
 
+# GP_ConsumptionSlot: Derive an action's consumption key and whether it belongs to the trip.
 sub GP_ConsumptionSlot {
     my ($rule,$selector)=@_;
     return (join('|',$rule->{type},$rule->{params}{target}//''),1) if GP_IsOpening($rule->{type});
@@ -1842,6 +1988,7 @@ sub GP_ConsumptionSlot {
         $rule->{trigger} eq 'arrival' || length($rule->{afterExit}//'') ? 1:0);
 }
 
+# GP_ConsumptionSlots: Cache the configured consumption and cooldown slots needed by recovery.
 # Prepared once per configuration, only when recovery or migration needs it.
 sub GP_ConsumptionSlots {
     my ($cfg)=@_;
@@ -1863,6 +2010,7 @@ sub GP_ConsumptionSlots {
     return $cfg->{consumption_slots}=$slots;
 }
 
+# GP_CompactConsumption: Import current consumption from legacy history without retaining past visits.
 # One-time import for version 1 checkpoints and live states from an older module.
 # Read only the current visit/trip keys; never carry the old history forward.
 sub GP_CompactConsumption {
@@ -1892,6 +2040,7 @@ sub GP_CompactConsumption {
     }
 }
 
+# GP_Rules: Plan matching actions after permission, consumption, and cooldown checks.
 sub GP_Rules {
     my ($s,$cfg,$trigger,$e,$now,$mono)=@_;
     my $selector=$trigger eq 'arrival' ? 'arrival' : length($e->{group}//'')
@@ -1939,6 +2088,7 @@ sub GP_Rules {
     }
 }
 
+# GP_CancelArrival: Discard the approach and cancel any pending Home arrival.
 sub GP_CancelArrival {
     my ($s,$now,$reason)=@_;
     delete $s->{approach};
@@ -1946,6 +2096,7 @@ sub GP_CancelArrival {
     GP_Trace($s,$now,'arrival cancelled',{confirmation=>$reason});
 }
 
+# GP_InterruptsArrival: Check whether a technical-zone exit interrupts the current arrival origin.
 sub GP_InterruptsArrival {
     my ($s,$cfg,$e)=@_;
     my $origin=$s->{arrival}//$s->{approach};
@@ -1954,6 +2105,7 @@ sub GP_InterruptsArrival {
         && (($cfg->{zones}{$e->{zone}}//{})->{role}//'') =~ /\A(?:home|approach|outer)\z/;
 }
 
+# GP_ArrivalMotion: Select movement evidence fresh enough to determine the arrival wait.
 sub GP_ArrivalMotion {
     my ($s,$cfg,$now)=@_;
     my $motion=$s->{motion}//'unknown';
@@ -1966,6 +2118,7 @@ sub GP_ArrivalMotion {
     return $motion;
 }
 
+# GP_UpdateArrivalMotion: Refresh a pending arrival's motion decision while retaining its time anchors.
 sub GP_UpdateArrivalMotion {
     my ($s,$cfg,$p,$now,$evaluated_at)=@_;
     # Revoking older evidence must not age an unaffected, latched decision.
@@ -1982,6 +2135,7 @@ sub GP_UpdateArrivalMotion {
         wait_seconds=>$wait,deadline=>$p->{deadline}}) if $changed;
 }
 
+# GP_BeginArrival: Create or update a qualified Home arrival and its motion-based wait.
 sub GP_BeginArrival {
     my ($s,$cfg,$e,$now,$mono)=@_;
     my $p=$s->{arrival};
@@ -2017,6 +2171,7 @@ sub GP_BeginArrival {
     GP_UpdateArrivalMotion($s,$cfg,$p,$now,$now);
 }
 
+# GP_ActionFresh: Check an action's absolute expiry, including its allowed arrival wait.
 sub GP_ActionFresh {
     my ($cfg,$e,$now)=@_;
     # Only the module's confirmation path supplies this allowance. Keep the
@@ -2025,12 +2180,14 @@ sub GP_ActionFresh {
     return $e->{time}<=$now+$cfg->{future_tolerance} && $now<=GP_ActionExpiry($cfg,$e);
 }
 
+# GP_ActionExpiry: Derive absolute expiry from the oldest observation or receipt time.
 sub GP_ActionExpiry {
     my ($cfg,$e)=@_;
     my $oldest=$e->{time}<$e->{received} ? $e->{time}:$e->{received};
     return $oldest+$cfg->{action_max_age}+($e->{arrival_wait_budget}//0);
 }
 
+# GP_ActionMonoExpiry: Anchor an action's remaining time budget to its monotonic receipt clock.
 sub GP_ActionMonoExpiry {
     my ($cfg,$e,$now,$mono)=@_;
     # Convert the observation's age at receipt only once. Later wall-clock
@@ -2039,6 +2196,7 @@ sub GP_ActionMonoExpiry {
     return $received+GP_ActionExpiry($cfg,$e)-$e->{received};
 }
 
+# GP_ConfirmArrival: Complete a due Home wait only while its evidence and time budgets remain valid.
 sub GP_ConfirmArrival {
     my ($s,$cfg,$now,$mono)=@_;
     my $p=$s->{arrival} or return;
@@ -2059,6 +2217,7 @@ sub GP_ConfirmArrival {
     GP_Arrive($s,$cfg,$e,$now,$mono);
 }
 
+# GP_Arrive: Finalize an arrival, plan eligible rules, and close its current trip.
 sub GP_Arrive {
     my ($s,$cfg,$e,$now,$mono)=@_;
     local $s->{trace_context}={source=>$e->{kind},zone=>$e->{zone}};
@@ -2076,6 +2235,7 @@ sub GP_Arrive {
     GP_Home($s,$cfg,$e->{time});
 }
 
+# GP_Home: Set Home status and clear obsolete return and absence context.
 sub GP_Home {
     my ($s,$cfg,$time)=@_;
     my ($home)=map {$cfg->{zones}{$_}} @{$cfg->{roles}{home}//[]};
@@ -2097,6 +2257,7 @@ sub GP_Home {
     GP_ResetNegative($s,$boundary);
 }
 
+# GP_CheckClock: Revoke permissions when wall and monotonic clocks diverge beyond tolerance.
 sub GP_CheckClock {
     my ($s,$cfg,$now,$mono)=@_;
     if (abs(($now-$s->{wall})-($mono-$s->{mono}))>$cfg->{future_tolerance}) {
@@ -2109,6 +2270,7 @@ sub GP_CheckClock {
     $s->{wall}=$now; $s->{mono}=$mono;
 }
 
+# GP_Contradiction: Check whether two simultaneous Geo observations are geometrically incompatible.
 sub GP_Contradiction {
     my ($a,$b,$cfg)=@_;
     return 0 unless $a->{time}==$b->{time};
@@ -2122,6 +2284,7 @@ sub GP_Contradiction {
     return 0;
 }
 
+# GP_BatchConflict: Detect conflicts among fresh Geo observations with equal timestamps.
 # Geometry has already kept these observations in chronological order. Only
 # equal observation times can contradict each other; freshness is checked once
 # per event rather than again for every pair in the complete batch.
@@ -2140,6 +2303,7 @@ sub GP_BatchConflict {
     return 0;
 }
 
+# GP_ProcessPhone: Apply phone observations, historical revocations, and status-only returns.
 sub GP_ProcessPhone {
     my ($s,$cfg,$e,$now,$mono)=@_;
     # Historical presence cannot authorize a current arrival. It may still
@@ -2227,6 +2391,7 @@ sub GP_ProcessPhone {
     return GP_Arrive($s,$cfg,$e,$now,$mono);
 }
 
+# GP_Process: Apply one observation to travel, membership, motion, and action-planning state.
 sub GP_Process {
     my ($s,$cfg,$e,$now,$mono)=@_;
     # Keep the cause on every decision made for this observation. Dynamic scope
@@ -2361,6 +2526,7 @@ sub GP_Process {
     return;
 }
 
+# GP_PhoneSamples: Read PRESENCE sources with their timestamps and health information.
 sub GP_PhoneSamples {
     my ($cfg,$now)=@_;
     return {} unless GP_UsesSource($cfg->{sourceMode},'phone');
@@ -2383,6 +2549,7 @@ sub GP_PhoneSamples {
     return \%samples;
 }
 
+# GP_PhoneEvidence: Classify samples into presence, full absence, and return-time evidence.
 sub GP_PhoneEvidence {
     my ($s,$cfg,$samples,$now)=@_;
     my $p=$s->{phone};
@@ -2391,6 +2558,8 @@ sub GP_PhoneEvidence {
     my $departure=GP_DepartureTime($s->{trip});
     my $new_positive;
     my $negative=0;
+    # Track each source separately so a newer positive cannot hide an older, newly
+    # received contradiction from another source.
     for my $name (@{$cfg->{proxies}}) {
         my $v=$samples->{$name}//{};
         my $t=$v->{time};
@@ -2422,6 +2591,7 @@ sub GP_PhoneEvidence {
     return ($latest,$new_positive,$negative==@{$cfg->{proxies}} ? $observed:undef,$arrival_time);
 }
 
+# GP_Phone: Advance phone continuity and return any resulting presence or absence observation.
 # State sources latch present/absent until a change or fault. Measurement sources
 # additionally require periodic measurements and a TTL. Neither contract refreshes
 # the source timestamp just because GeoPresence polls the reading.
@@ -2514,6 +2684,7 @@ sub GP_Phone {
     return;
 }
 
+# GP_TickState: Advance departure grace and expire approach and display data.
 sub GP_TickState {
     my ($s,$cfg,$now,$mono)=@_;
     GP_CheckClock($s,$cfg,$now,$mono);
@@ -2538,6 +2709,7 @@ sub GP_TickState {
     return;
 }
 
+# GP_HTTPConfigError: Return the first listener configuration error, or undef for a valid setup.
 sub GP_HTTPConfigError {
     my ($c)=@_;
     my $port=GP_Attr($c->{NAME},'webhookPort',$GP_DEFAULT_WEBHOOK_PORT);
@@ -2554,6 +2726,7 @@ sub GP_HTTPConfigError {
     return;
 }
 
+# GP_CloseHTTPClient: Unregister and close a transient HTTP client.
 # This listener never enters FHEMWEB or FHEM's command parser. FHEMWEB dispatches
 # XHR/cmd before FWEXT authentication, even on an otherwise restricted URL.
 # Transient selectlist entries use the core's direct callbacks, not FHEM devices.
@@ -2566,6 +2739,7 @@ sub GP_CloseHTTPClient {
     delete $h->{FD};
 }
 
+# GP_StopHTTP: Close the dedicated listener and all of its pending clients.
 sub GP_StopHTTP {
     my ($c)=@_;
     my $http=delete $c->{helper}{gp_http};
@@ -2578,6 +2752,7 @@ sub GP_StopHTTP {
     delete $server->{FD};
 }
 
+# GP_OpenHTTP: Bind the nonblocking webhook listener and register its FHEM callback.
 sub GP_OpenHTTP {
     my ($c,$port)=@_;
     my $address=GP_Attr($c->{NAME},'webhookBindAddress','127.0.0.1');
@@ -2594,6 +2769,7 @@ sub GP_OpenHTTP {
     return;
 }
 
+# GP_EnsureHTTP: Maintain listener configuration and close clients whose deadlines expired.
 sub GP_EnsureHTTP {
     my ($c)=@_;
     if (my $error=GP_HTTPConfigError($c)) { GP_StopHTTP($c); return $error; }
@@ -2613,6 +2789,7 @@ sub GP_EnsureHTTP {
     return;
 }
 
+# GP_AcceptHTTP: Accept a bounded number of clients from explicitly allowed socket peers.
 sub GP_AcceptHTTP {
     my ($server)=@_;
     my $c=$defs{$server->{OWNER}};
@@ -2632,6 +2809,7 @@ sub GP_AcceptHTTP {
     }
 }
 
+# GP_HTTPFrame: Parse one bounded HTTP request without invoking FHEM's command parser.
 # Parse exactly one bounded request, without decoding the URL or combining it
 # with the body. No transfer coding, duplicate headers, folding or pipelining.
 # An empty return means that more bytes are needed; errors carry an HTTP status.
@@ -2665,6 +2843,7 @@ sub GP_HTTPFrame {
     return ({method=>$method,path=>$path,headers=>\%headers,body=>substr($input,$end+4)});
 }
 
+# GP_HTTPResponse: Build a UTF-8 plain-text response with the required status headers.
 sub GP_HTTPResponse {
     my ($status,$text)=@_;
     my %labels=(200=>'OK',400=>'Bad Request',401=>'Unauthorized',403=>'Forbidden',404=>'Not Found',405=>'Method Not Allowed',
@@ -2677,6 +2856,7 @@ sub GP_HTTPResponse {
         .($status==405 ? "Allow: POST\r\n" : '')."\r\n".$content;
 }
 
+# GP_ReadHTTP: Read a nonblocking request and prepare its HTTP response.
 sub GP_ReadHTTP {
     my ($h)=@_;
     return GP_CloseHTTPClient($h) if GP_Mono()>=$h->{deadline};
@@ -2697,6 +2877,7 @@ sub GP_ReadHTTP {
     $h->{directWriteFn}=\&GP_WriteHTTP;
 }
 
+# GP_WriteHTTP: Flush a nonblocking response and close the completed connection.
 sub GP_WriteHTTP {
     my ($h)=@_;
     return GP_CloseHTTPClient($h) if GP_Mono()>=$h->{deadline};
@@ -2708,6 +2889,7 @@ sub GP_WriteHTTP {
     GP_CloseHTTPClient($h) unless length $h->{output};
 }
 
+# GP_ClearCheckpoint: Persist an inactive checkpoint only when its diagnostic value changes.
 sub GP_ClearCheckpoint {
     my ($r,$reason)=@_;
     my $d=$defs{$r} or return;
@@ -2716,6 +2898,7 @@ sub GP_ClearCheckpoint {
     setReadingsVal($d,'gp_trip_checkpoint',$value,POSIX::strftime('%Y-%m-%d %H:%M:%S',localtime(GP_Now())));
 }
 
+# GP_ResumeRevision: Bind restart recovery to configuration, identities, and stored credentials.
 sub GP_ResumeRevision {
     my ($c,$r,$cfg)=@_;
     # Geometry, rules, adapters and source contract are part of the cfg hash.
@@ -2729,6 +2912,7 @@ sub GP_ResumeRevision {
         auth=>sha256_hex($auth//''),roommate=>$cfg->{roommate}}));
 }
 
+# GP_Checkpoint: Persist qualified unfinished travel or clear evidence that is no longer valid.
 sub GP_Checkpoint {
     my ($c,$r,$cfg,$s)=@_;
     my $rt=$c->{helper}{gp};
@@ -2770,6 +2954,7 @@ sub GP_Checkpoint {
     $s->{checkpoint_value}=GP_Read($r,'gp_trip_checkpoint','');
 }
 
+# GP_ResumeTrip: Restore validated unfinished travel without recreating old timers or commands.
 sub GP_ResumeTrip {
     my ($c,$r,$cfg,$s)=@_;
     my $raw=GP_Read($r,'gp_trip_checkpoint','');
@@ -2798,6 +2983,7 @@ sub GP_ResumeTrip {
                     && !ref($trip->{scope}) && ($trip->{scope}//'') =~ /\A(?:local|remote)\z/
                     && defined($trip->{id}) && !ref($trip->{id}) && length($trip->{id})<=256
                     && $trip->{id} =~ /\A[A-Za-z0-9_.:\-]+\z/;
+                # Accept persisted travel fields only; runtime queues and timers are not restorable.
                 my %trip_keys=map {$_=>1} @GP_CHECKPOINT_TRIP_FIELDS;
                 my %state_keys=map {$_=>1} (@GP_CHECKPOINT_STATE_FIELDS,
                     $legacy ? qw(notify_seen notify_order notify_last) : qw(action_visits action_last));
@@ -2878,6 +3064,7 @@ sub GP_ResumeTrip {
                         && $v<=(($state->{$slot->[0]}//{})->{$slot->[1]}//0);
                 }
                 die "invalid action cooldown\n" if grep {!exists $slots->{last}{$_}} keys %{$state->{action_last}//{}};
+                # Later local presence overrides the saved absence, even if the checkpoint is valid.
                 my $rrtime=GP_ReadingTime($cfg->{roommate},'state');
                 die "a later ROOMMATE Home state superseded the departure\n" if defined($rrtime)
                     && $rrtime>=int($trip->{away_time}) && GP_Read($cfg->{roommate},'state','') =~ /\A(?:home|gotosleep|asleep|awoken)\z/;
@@ -2922,6 +3109,7 @@ sub GP_ResumeTrip {
     GP_Trace($s,$now,'qualified unfinished trip restored; waiting for a new return',{source=>'restart'});
 }
 
+# GP_State: Return or initialize a resident context and attempt pending productive recovery.
 sub GP_State {
     my ($c,$r,$debug,$cfg)=@_;
     my $rt=$c->{helper}{gp};
@@ -2941,6 +3129,7 @@ sub GP_State {
     return $rt->{$pool}{$r};
 }
 
+# GP_Normalize: Validate decoded Geofency fields and return an internal observation or an error.
 sub GP_Normalize {
     my ($c,$r,$cfg,$p,$now,$learning)=@_;
     return (undef,'Invalid device identifier') unless GP_Id($p->{device});
@@ -2978,6 +3167,7 @@ sub GP_Normalize {
         zone_position=>$position,current_position=>$current,revision=>GP_ConfigRevision($cfg)},undef);
 }
 
+# GP_Learned: Return captured enrollment data while its device binding still matches.
 sub GP_Learned {
     my ($c,$r)=@_;
     my $learned=$c->{helper}{gp}{learned}{$r};
@@ -2990,6 +3180,7 @@ sub GP_Learned {
     return $learned;
 }
 
+# GP_LearningDeviceConflict: Detect a device identifier already configured or being learned elsewhere.
 sub GP_LearningDeviceConflict {
     my ($c,$r,$device)=@_;
     return 'Invalid device identifier' unless GP_Id($device);
@@ -3004,6 +3195,7 @@ sub GP_LearningDeviceConflict {
     return;
 }
 
+# GP_CaptureLocation: Capture fresh test geometry in the active learning session without actions.
 sub GP_CaptureLocation {
     my ($c,$r,$e,$cfg,$now)=@_;
     my $learned=GP_Learned($c,$r) or return (503,'Learning expired; start again');
@@ -3028,6 +3220,7 @@ sub GP_CaptureLocation {
     return (200,'OK learning captured; no actions');
 }
 
+# GP_BeginLearning: Validate enrollment prerequisites and open a bounded learning window.
 sub GP_BeginLearning {
     my ($c,$r)=@_;
     return 'Enable the controller with set '.$c->{NAME}.' mode debug or active first' if GP_Mode($c->{NAME}) eq 'disabled';
@@ -3053,6 +3246,7 @@ sub GP_BeginLearning {
     return 'Learning for 15 minutes; send Geofency entry/exit tests to the normal webhook URL; use set '.$r.' learnConfirm afterwards';
 }
 
+# GP_ExpireLearning: Stop expired learning reception while retaining data for explicit confirmation.
 sub GP_ExpireLearning {
     my ($c,$r)=@_;
     return unless GP_Mode($r) eq 'learning';
@@ -3064,6 +3258,7 @@ sub GP_ExpireLearning {
     GP_Log($c,3,'learning_expired',{resident=>$r,mode=>'learning',reason=>'Reception stopped; resident disabled; captured data awaits explicit learnConfirm'});
 }
 
+# GP_LearnConfirm: Confirm captured setup data and leave the resident disabled.
 sub GP_LearnConfirm {
     my ($c,$r)=@_;
     return 'Controller unavailable' unless $c && $c->{helper}{gp};
@@ -3099,6 +3294,7 @@ sub GP_LearnConfirm {
     return 'Learning confirmed; deviceId '.$learned->{device}.' configured; resident disabled; create locations and applyGeometry before testing';
 }
 
+# GP_SetMode: Validate a requested operating mode and reset contexts affected by the transition.
 sub GP_SetMode {
     my ($d,$mode)=@_;
     my $kind=$d->{SUBTYPE}//''; my $name=$d->{NAME}; my $c=GP_Controller($d);
@@ -3135,6 +3331,7 @@ sub GP_SetMode {
     return;
 }
 
+# GP_HTTP: Handle a dedicated webhook request and record its response diagnostics.
 # Called only by the dedicated listener; there is no FHEMWEB command dispatcher.
 sub GP_HTTP {
     my ($c,$method,$path,$headers,$body)=@_;
@@ -3146,6 +3343,7 @@ sub GP_HTTP {
     return ($status,$text);
 }
 
+# GP_HandleHTTP: Authenticate, validate, and route a webhook into learning or the event queue.
 sub GP_HandleHTTP {
     my ($c,$method,$path,$headers,$body,$diag)=@_;
     return (404,'Unknown webhook') unless $c;
@@ -3223,6 +3421,7 @@ sub GP_HandleHTTP {
     return (200,$mode eq 'debug' ? 'OK debug accepted; no actions' : 'OK accepted in current FHEM session');
 }
 
+# GP_ActorFeedbackSources: List the device and Reading pairs used to confirm an opening request.
 sub GP_ActorFeedbackSources {
     my ($intent)=@_;
     my $p=$intent->{params};
@@ -3230,11 +3429,13 @@ sub GP_ActorFeedbackSources {
         : ([$p->{stateDevice},'state'],[$p->{upperContact},'state'],[$p->{lowerContact},'state']);
 }
 
+# GP_ReadingFingerprint: Combine a Reading's timestamp and value to detect actual updates.
 sub GP_ReadingFingerprint {
     my ($device,$reading)=@_;
     return (GP_Reading($device,$reading)->{TIME}//'')."\0".GP_Read($device,$reading,'');
 }
 
+# GP_ActorReadingFresh: Check for feedback observed after an actor reservation was created.
 sub GP_ActorReadingFresh {
     my ($actor,$device,$reading)=@_;
     my $time=GP_ReadingTime($device,$reading);
@@ -3247,6 +3448,7 @@ sub GP_ActorReadingFresh {
     return $current ne $watch->{before} || $current eq ($watch->{observed}//'');
 }
 
+# GP_UpdateNotifyDevices: Subscribe the controller to global, ROOMMATE, and active actor events.
 sub GP_UpdateNotifyDevices {
     my ($c)=@_;
     my %devices=(global=>1);
@@ -3258,6 +3460,7 @@ sub GP_UpdateNotifyDevices {
     setNotifyDev($c,$notify) if ($c->{NOTIFYDEV}//'') ne $notify;
 }
 
+# GP_ActorPositionUsable: Validate a position source against its health, timestamp, and signal mode.
 sub GP_ActorPositionUsable {
     my ($device,$reading,$start,$mode)=@_;
     my $d=$defs{$device} or return 0;
@@ -3276,6 +3479,7 @@ sub GP_ActorPositionUsable {
     return $mode eq 'measurement' ? $time>$start : 1;
 }
 
+# GP_ActorView: Classify door or garage position from validated contact and state Readings.
 sub GP_ActorView {
     my ($intent,$start,$actor)=@_;
     my $p=$intent->{params};
@@ -3305,6 +3509,7 @@ sub GP_ActorView {
     return 'unknown';
 }
 
+# GP_ActorResult: Return a retained or freshly confirmed completion result for an actor request.
 sub GP_ActorResult {
     my ($actor)=@_;
     return $actor->{completion} if defined($actor->{completion});
@@ -3320,6 +3525,7 @@ sub GP_ActorResult {
     return;
 }
 
+# GP_CanOutput: Check current session, mode, and resident bindings before publishing or dispatching.
 sub GP_CanOutput {
     my ($c,$r,$s,$cfg,$debug)=@_;
     my $rt=$c->{helper}{gp};
@@ -3335,6 +3541,7 @@ sub GP_CanOutput {
     return 1;
 }
 
+# GP_OutputReady: Return current clocks only when an intent still passes all output guards.
 sub GP_OutputReady {
     my ($c,$r,$cfg,$s,$debug,$intent)=@_;
     my $current=GP_CanOutput($c,$r,$s,$cfg,$debug);
@@ -3373,6 +3580,7 @@ sub GP_OutputReady {
     return;
 }
 
+# GP_Dispatch: Dispatch eligible intents or record simulated plans through the fixed adapters.
 sub GP_Dispatch {
     my ($c,$r,$cfg,$s,$debug)=@_;
     # Consuming the trip is checkpointed BEFORE any synchronous device/logging
@@ -3470,8 +3678,10 @@ sub GP_Dispatch {
     }
 }
 
+# GP_Publish: Persist travel evidence, synchronize ROOMMATE, and publish changed resident Readings.
 sub GP_Publish {
     my ($c,$r,$cfg,$s)=@_;
+    # A revoked checkpoint must reach saved Readings even when status output is blocked.
     GP_Checkpoint($c,$r,$cfg,$s);
     return unless GP_CanOutput($c,$r,$s,$cfg,0);
     if (my $status=delete $s->{desired_status}) {
@@ -3526,6 +3736,7 @@ sub GP_Publish {
     GP_Profile($c,'resident_reading_callbacks',$r,sub {readingsEndUpdate($d,1)});
 }
 
+# GP_ActorFeedback: Complete or time out shared actor reservations and update waiting residents.
 sub GP_ActorFeedback {
     my ($c,$now,$mono)=@_;
     my $rt=$c->{helper}{gp};
@@ -3546,6 +3757,7 @@ sub GP_ActorFeedback {
     GP_UpdateNotifyDevices($c);
 }
 
+# GeoPresence_Timer: Run a guarded controller tick, reschedule it, and record its timing.
 sub GeoPresence_Timer {
     my ($c)=@_;
     return unless $defs{$c->{NAME}} && $defs{$c->{NAME}}==$c && $c->{helper}{gp};
@@ -3601,6 +3813,7 @@ sub GeoPresence_Timer {
     }
 }
 
+# GP_TimerSample: Summarize elapsed time, CPU use, and exclusive work by timer phase.
 sub GP_TimerSample {
     my ($c,$now,$mono,$cpu,$lag)=@_;
     my $work=$c->{helper}{gp_work};
@@ -3614,6 +3827,7 @@ sub GP_TimerSample {
         slowest_phase=>$top->{phase}//'unmeasured',slowest_target=>$top->{target}//'',slowest_self_ms=>$top->{self_ms}//0};
 }
 
+# GP_TimerSampleView: Return a rounded presentation copy of a timer sample.
 sub GP_TimerSampleView {
     my ($sample)=@_;
     return unless $sample;
@@ -3623,17 +3837,20 @@ sub GP_TimerSampleView {
     return \%view;
 }
 
+# GP_ScheduleTimer: Schedule the next callback and retain its monotonic due time.
 sub GP_ScheduleTimer {
     my ($c,$delay)=@_;
     $c->{helper}{gp_timer_due}=GP_Mono()+$delay;
     InternalTimer(GP_Now()+$delay,'GeoPresence_Timer',$c,0);
 }
 
+# GP_TimerCurrent: Check that the controller and runtime session still belong to the live device.
 sub GP_TimerCurrent {
     my ($c,$rt)=@_;
     return ($defs{$c->{NAME}}//0)==$c && ($c->{helper}{gp}//0)==$rt;
 }
 
+# GP_TimerStep: Process listeners, phone samples, ordered batches, arrivals, and outputs.
 sub GP_TimerStep {
     my ($c,$rt,$now,$mono)=@_;
     my $registration=GP_Profile($c,'listener',$c->{NAME},sub {GP_EnsureHTTP($c)});
@@ -3658,6 +3875,7 @@ sub GP_TimerStep {
         next if @errors;
         my @pools=$mode eq 'active' ? (0) : (1);
         push @pools,1 if $mode eq 'active' && exists $rt->{debug}{$r};
+        # Share source Readings across due pools; each pool retains its own continuity state.
         my $live_samples;
         for my $debug (@pools) {
             my $target=$r.($debug ? ' (debug)':' (production)');
@@ -3760,6 +3978,7 @@ sub GP_TimerStep {
     }
 }
 
+# GeoPresence_Notify: Maintain configuration, revocations, and feedback from FHEM events.
 sub GeoPresence_Notify {
     my ($c,$device)=@_;
     return unless ($c->{SUBTYPE}//'') eq 'controller';
@@ -3882,6 +4101,7 @@ sub GeoPresence_Notify {
     return;
 }
 
+# GP_SetList: Build the native FHEMWEB Set menu without changing runtime state.
 # FHEMWEB obtains its set menu by calling SetFn with "?". Return whitespace-
 # separated command:widget entries, never a usage sentence. The native select
 # widget decodes '#' as a space in argument combinations. Merely displaying
@@ -3909,6 +4129,7 @@ sub GP_SetList {
         sort keys %choices);
 }
 
+# GeoPresence_Set: Handle user commands that change modes, setup data, or debug state.
 sub GeoPresence_Set {
     my ($hash,$name,$command,@args)=@_;
     $command //= '?';
@@ -3933,6 +4154,7 @@ sub GeoPresence_Set {
         return 'Random source unavailable' unless defined($n) && $n==16;
         my $salt=unpack('H*',$bytes);
         my $error=GP_StoreAuth($name,$salt.':'.sha256_hex($salt.':'.$args[0]));
+        # The preferred key may have changed even if legacy cleanup returned an error.
         delete $GP_AUTH{$name};
         return $error if $error;
         setReadingsVal($hash,'gp_auth_error','',POSIX::strftime('%Y-%m-%d %H:%M:%S',localtime(GP_Now())))
@@ -3995,6 +4217,7 @@ sub GeoPresence_Set {
     return 'Debug state updated; no productive changes';
 }
 
+# GP_ReportTime: Format an observed timestamp or an explicit missing-value label.
 # Presentation reads snapshots only. Never call GP_State, GP_Rules, GP_Phone,
 # GP_ConfirmArrival or a dispatcher from these helpers: a get is not an event.
 sub GP_ReportTime {
@@ -4003,6 +4226,7 @@ sub GP_ReportTime {
     return POSIX::strftime('%Y-%m-%d %H:%M:%S %Z',localtime($time));
 }
 
+# GP_ReportDuration: Format an elapsed duration for human-readable reports.
 sub GP_ReportDuration {
     my ($seconds)=@_;
     return 'Unknown' unless defined($seconds) && GP_Number($seconds);
@@ -4012,6 +4236,7 @@ sub GP_ReportDuration {
     return sprintf('%d h %02d min',int($seconds/3600),int($seconds/60)%60);
 }
 
+# GP_ReportValue: Normalize report text to Unicode and remove control characters.
 sub GP_ReportValue {
     my ($text)=@_;
     $text//='';
@@ -4020,6 +4245,7 @@ sub GP_ReportValue {
     return $text;
 }
 
+# GP_ReportEscape: Escape report content for HTML, including non-ASCII characters.
 sub GP_ReportEscape {
     my ($text)=@_;
     $text=GP_ReportValue($text);
@@ -4031,6 +4257,7 @@ sub GP_ReportEscape {
     return $text;
 }
 
+# GP_ReportJSON: Encode report data as JSON safe for the selected FHEM transport.
 sub GP_ReportJSON {
     my ($value,$web)=@_;
     my $json=$web ? JSON::PP->new->canonical->ascii->encode($value) : $GP_JSON->encode($value);
@@ -4040,6 +4267,7 @@ sub GP_ReportJSON {
     return $json;
 }
 
+# GP_ReportCell: Render an escaped report cell and link known device names in FHEMWEB.
 sub GP_ReportCell {
     my ($text)=@_;
     my $escaped=GP_ReportEscape($text);
@@ -4049,12 +4277,14 @@ sub GP_ReportCell {
     return $escaped;
 }
 
+# GP_ReportLine: Format one complete text-report value with an optional prefix.
 sub GP_ReportLine {
     my ($text,$prefix)=@_;
     # One complete value per line; the terminal controls any visual wrapping.
     return ($prefix//'').GP_ReportValue($text)."\n";
 }
 
+# GP_RenderReport: Render structured report sections as escaped HTML or plain text.
 sub GP_RenderReport {
     my ($report,$html)=@_;
     my $title=$report->{title}//'GeoPresence';
@@ -4119,6 +4349,7 @@ sub GP_RenderReport {
     return $out;
 }
 
+# GP_ReportTrace: Build a newest-first history section from previously recorded decisions.
 sub GP_ReportTrace {
     my ($trace,$limit,$all)=@_;
     my @rows;
@@ -4139,6 +4370,7 @@ sub GP_ReportTrace {
         note=>@rows ? 'Newest first. This is recorded history, not a new evaluation.' : 'No decisions recorded in this session.'};
 }
 
+# GP_ReportActorResult: Translate stored actor result codes into readable labels.
 sub GP_ReportActorResult {
     my ($result)=@_;
     my %labels=(not_requested=>'No request in this session',dispatch_started=>'Dispatch started',
@@ -4148,6 +4380,7 @@ sub GP_ReportActorResult {
     return $labels{$result//'not_requested'}//$result;
 }
 
+# GP_ReportResident: Build a resident report from recorded decisions and current source Readings.
 sub GP_ReportResident {
     my ($c,$r,$s,$cfg,$debug,$errors,$now,$mono,$value)=@_;
     my $mode=GP_EffectiveMode($c,$r,0);
@@ -4284,6 +4517,7 @@ sub GP_ReportResident {
     return $report;
 }
 
+# GP_GetReport: Convert command data into structured, human-readable report sections.
 sub GP_GetReport {
     my ($hash,$command,$args,$value,$limit,$prepared_cfg)=@_;
     my $c=GP_Controller($hash);my $now=GP_Now();
@@ -4361,6 +4595,7 @@ sub GP_GetReport {
     return $report;
 }
 
+# GP_GetList: Build the native FHEMWEB Get menu for the selected device.
 # Use FHEMWEB's native select widget. '#' is decoded to an argument separator
 # by fhemweb.js, just as it is for the controller's set commands.
 sub GP_GetList {
@@ -4372,6 +4607,7 @@ sub GP_GetList {
         .(@choices ? 'select,'.join(',',@choices) : 'textField').' logStatus timerStats';
 }
 
+# GeoPresence_Get: Serve read-only Get commands as text, HTML, or JSON.
 sub GeoPresence_Get {
     my ($hash,$name,$command,@args)=@_;
     $command//='?';
@@ -4425,6 +4661,7 @@ sub GeoPresence_Get {
     return $unicodeEncoding ? $text : encode('UTF-8',$text);
 }
 
+# GP_GetData: Collect report data without creating journey state or planning actions.
 sub GP_GetData {
     my ($hash,$name,$command,@args)=@_;
     my $c=GP_Controller($hash);
