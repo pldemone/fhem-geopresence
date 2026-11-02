@@ -2232,6 +2232,8 @@ sub GP_Arrive {
     GP_Rules($s,$cfg,'arrival',$e,$now,$mono);
     $s->{last_trip}=$s->{trip} if $s->{trip};
     delete $s->{trip};
+    # Confirmation preserves the Geo display; a fresh phone event can show Home.
+    $s->{location}='home' if $e->{kind} eq 'phone_present';
     GP_Home($s,$cfg,$e->{time});
 }
 
@@ -2249,7 +2251,6 @@ sub GP_Home {
         }
     }
     $s->{phase}='home';
-    $s->{location}='home';
     my $boundary=($s->{position_time}//0)>$time ? $s->{position_time}:$time;
     $s->{boundary}=$boundary if $boundary>$s->{boundary};
     delete @{$s}{qw(approach automotive conflict)};
@@ -2366,7 +2367,7 @@ sub GP_ProcessPhone {
         GP_CancelArrival($s,$now,'local phone presence revoked departure');
         GP_RevokeOutputs($s);
         if ($e->{time}>=$position) {
-            $s->{position_time}=$e->{time}; GP_Home($s,$cfg,$e->{time});
+            $s->{position_time}=$e->{time}; $s->{location}='home'; GP_Home($s,$cfg,$e->{time});
         } else {
             GP_ResetNegative($s,$e->{time});
             $s->{phase}='away' if $s->{phase} eq 'returning' || $s->{phase} eq 'leaving';
@@ -2684,10 +2685,9 @@ sub GP_Phone {
     return;
 }
 
-# GP_TickState: Advance departure grace and expire approach and display data.
+# GP_TickState: Advance departure grace and expire approach and display data after clock validation.
 sub GP_TickState {
     my ($s,$cfg,$now,$mono)=@_;
-    GP_CheckClock($s,$cfg,$now,$mono);
     if ($s->{phase} eq 'leaving' && $s->{trip} && defined($s->{trip}{leave_mono})
         && $mono-$s->{trip}{leave_mono}>=$cfg->{departure_grace}) {
         if (!GP_UsesSource($cfg->{sourceMode},'phone') || $s->{phone}{state} ne 'present') { $s->{phase}='away'; $s->{desired_status}='absent'; }
@@ -2697,14 +2697,13 @@ sub GP_TickState {
         delete @{$s}{qw(approach automotive motion motion_time)};
         $s->{phase}='away' if $s->{trip};
     }
+    # Display expiry hides the label without changing accepted zone evidence.
+    return if ($s->{location}//'unknown') eq 'unknown';
     for my $name (keys %{$s->{zones}}) {
-        my $z=$s->{zones}{$name};
-        if ($now-$z->{time}>$cfg->{zone_display_max_age}) {
-            if ($z->{entry}) { $z->{entry}=0; $s->{checkpoint_dirty}=1; }
-            if (($s->{location}//'') ne 'unknown' && ($s->{location}//'') eq $cfg->{zones}{$name}{label}) {
-                $s->{location}='unknown'; $s->{checkpoint_dirty}=1;
-            }
-        }
+        next unless $s->{location} eq $cfg->{zones}{$name}{label};
+        next unless $now-$s->{zones}{$name}{time}>$cfg->{zone_display_max_age};
+        $s->{location}='unknown'; $s->{checkpoint_dirty}=1;
+        last;
     }
     return;
 }
@@ -5312,7 +5311,7 @@ get Geo.PERSON explain debug</pre>
       <p><b>Applies to:</b> Controller<br>
       <b>Default:</b> <code>43200</code> seconds (12 hours)<br>
       <b>Range:</b> greater than 0 through 172800</p>
-      <p>Expire old zone observations for display. Explicit group membership and prior-exit evidence do not arise from display expiry; a missing exit stays missing. This does not end a confirmed remote trip or trigger an opening.</p>
+      <p>Expire old location labels for display only. The last accepted zone entry/exit and its observation time remain unchanged, so a pending Home arrival keeps its original wait even when the display age is shorter. Confirmation preserves the computed Geo display, including unknown and custom labels; fresh location or phone events can update it. Actual exits and newer incompatible positions still invalidate Home evidence. Display expiry creates no group exit or prior-exit evidence and does not trigger an opening.</p>
       <p><b>Example:</b></p>
       <pre style="white-space: pre-wrap; overflow-wrap: anywhere;">attr System.GeoPresence zone_display_max_age 43200</pre>
     </li>

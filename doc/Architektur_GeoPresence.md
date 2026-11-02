@@ -1,6 +1,6 @@
 # GeoPresence – Architektur
 
-**Version 0.76 · Stand 01.11.2026 · Handbuch 2.38**
+**Version 0.77 · Stand 02.11.2026 · Handbuch 2.39**
 
 Diese Beschreibung spezifiziert den aktuellen Aufbau von `FHEM/98_GeoPresence.pm`. Einrichtung und Bedienung stehen im [Handbuch](GeoPresence_Handbuch.md); Prüfabläufe und Testprogramm sind in der [Testanleitung](GeoPresence_Testanleitung.md) beschrieben. Gerätenamen wie `Geo.PERSON` und `Geo.PERSON.ORT` sind austauschbare Beispiele.
 
@@ -180,6 +180,8 @@ Beim Empfang wird zusätzlich die monotone Zeit erfasst. Die frühere Originalze
 
 Für Fristen wird eine monotone Uhr verwendet. Ein deutlicher Sprung zwischen Systemzeit und monotoner Uhr setzt Öffnungsberechtigungen zurück. Nach einer neuen Sitzung gilt eine Anlaufgrenze gegen nachträglich zugestellte alte Meldungen.
 
+Der Timer prüft den Uhrbezug jedes Bewohnerkontexts vor der Telefonverarbeitung. Der anschließende Zustandstick übernimmt dieselben bereits geprüften System- und monotonen Zeitwerte; diese Prüfung ist seine interne Aufrufvoraussetzung. Ereignisverarbeitung und unmittelbare Ausgabefreigabe behalten ihre eigenen Uhrprüfungen. Vor jeder tatsächlichen Ausgabe werden die Uhren weiterhin neu gelesen.
+
 ## 5. Anwesenheit und Ausflug
 
 ### 5.1 Zustandsmodell je Person
@@ -276,6 +278,10 @@ Bei einer durch Telefonabwesenheit bestätigten Reise müssen die vollständige 
 | Unbekannt oder nicht mehr frisch | 60 Sekunden |
 
 Schnelle Bewegungsarten müssen für die verkürzte Frist höchstens `arrival_motion_max_age` alt sein, standardmäßig 30 Sekunden. Ein Fußwegnachweis bleibt bis `motion_max_age`, standardmäßig 180 Sekunden, verwendbar. Ein Home-Austritt während der Wartezeit verwirft die vorgemerkte Rückkehr. Ebenso verhindern jüngere widersprüchliche Abgänge, Geometrieänderungen oder ein verlorener Ausflugsnachweis ihre Ausführung.
+
+`zone_display_max_age` begrenzt ausschließlich die Ortsanzeige. Nach Ablauf kann `location` auf `unknown` wechseln; die zuletzt angenommenen Ein-/Austrittswerte und ihre Beobachtungszeiten in `zones` bleiben erhalten. Der Timer verändert dafür weder `members` noch Reise oder Ankunftsvormerkung. Deshalb bleibt eine Home-Ankunft mit 60 Sekunden Wartezeit auch bei 20 Sekunden Anzeigealter bestätigbar. Echte Austritte und neuere geometrisch unvereinbare Positionen widerlegen Home weiterhin; `GP_ConfirmArrival` prüft den fachlichen Eintrittswert unverändert. Für die Anzeige wird der vorhandene Ortszeitstempel verwendet. Bereits unbekannte Anzeigen benötigen keine erneute Suche; nach dem Verbergen des passenden Labels endet die Suche.
+
+Die Ankunftsbestätigung übernimmt die bereits ausgewertete Geo-Anzeige einschließlich `unknown`, eigener Home-Labels und neuerer überlappender Ortspositionen. Der gemeinsame Home-Abschluss setzt Phase, Statuswunsch und Reisegrenzen; die Anzeige folgt der jeweils tatsächlich verarbeiteten Quelle. Ein neuer Home-Eintritt oder neue lokale Telefonanwesenheit kann sie wieder aktualisieren. Bestätigung und Folgetick erhalten ohne neue Beobachtung denselben abgelaufenen Anzeigewert.
 
 Neue lokale Telefonanwesenheit darf die vorgemerkte Rückkehr vorzeitig bestätigen. Im kombinierten Profil kann sie auch einen fehlenden Home-Eintritt ersetzen. Ein unverändert gehaltener positiver Startzustand synchronisiert nur die Anwesenheit. `geofency_only` hat diese Telefonbestätigung nicht.
 
@@ -537,6 +543,12 @@ Weitere Prüfungen umfassen abgeschlossene Geo- und telefonbestätigte Reisen mi
 Die Prüfungen der Telefonverarbeitung sichern die fachlichen Abläufe im Zustands- und Messmodus ab. Direkte interne Testereignisse enthalten die Pflichtfelder des regulären Erzeugers. Eine zusätzliche Gegenprobe qualifiziert Abwesenheit im Zustands- und Messmodus, prüft unveränderte Negativwerte und meldet anschließend einen Quellenfehler. Der Fehler muss auch nach bereits bestätigter Abwesenheit erkannt werden; eine bloße Wiederverbindung mit alten Werten genügt nicht, neue Beobachtungen und eine vollständige erneuerte Frist bleiben erforderlich.
 
 ## 13. Änderungen seit der letzten Version
+
+Änderungen von Version 0.76 auf 0.77:
+
+- Anzeigeablauf von angenommenen Ortsnachweisen getrennt; kurze Anzeigealter brechen keine gültige Home-Wartezeit mehr ab.
+- Ursprüngliche Ortszeiten und Ein-/Austrittswerte auch im Checkpoint erhalten; echte Gegenbeweise widerrufen Ankünfte weiterhin.
+- Die Anzeigesuche bei unbekannter Position übersprungen und nach dem Verbergen des passenden Labels beendet.
 
 Änderungen von Version 0.75 auf 0.76:
 

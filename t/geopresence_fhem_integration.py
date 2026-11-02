@@ -1925,6 +1925,83 @@ def run(source, encoding="bytestream", help_only=False):
             # Arrival waits at production defaults, real HTTP and dummy actors.
             for motion in ("walking", "running", "cycling", "automotive", "unknown"):
                 check(command(f"deleteattr GP arrival_wait_{motion}") == "", "restore default arrival wait")
+            saved_display_age = command("{ AttrVal('GP','zone_display_max_age','') }")
+            saved_display_source = command("{ AttrVal('Geo.Test','sourceMode','') }")
+            saved_home_label = command("{ AttrVal('Z.Home','label','') }")
+            saved_work_zone = zones["Work"]
+            work_geometry = json.loads(command("{ ReadingsVal('Z.Work','gp_geometry','{}') }"))
+            zones["Work"] = (saved_work_zone[0], work_geometry["lat"], work_geometry["radius"])
+            command("set GP mode debug")
+            check(command("attr GP zone_display_max_age 20") == "", "configure a display age below the Home wait")
+            check(command("attr Geo.Test sourceMode geofency_only") == "", "isolate the Geo arrival evidence")
+            command("set Geo.Test mode active")
+            for scenario, home_label in (
+                    ("unknown", "home"), ("walking", "home"), ("home_exit", "home"), ("work_entry", "home"),
+                    ("unknown", "Zuhause"), ("walking", "Zuhause"), ("home_exit", "Zuhause"), ("work_entry", "Zuhause")):
+                command("set GP mode debug")
+                check(command("attr Z.Home label " + home_label) == "", "configure Home label " + home_label)
+                command("set GP mode active")
+                advance(40)
+                check(request("Outer", 0)[0] == 200, f"{scenario}: remote departure accepted")
+                advance(3)
+                departure = json.loads(command("get GP explain Geo.Test prod format=json"))["state"]
+                check(departure.get("trip", {}).get("armed") == 1, f"{scenario}: departure confirmed before Home")
+                advance(90)
+                refresh_actor_contacts()
+                command("set door untouched")
+                command("set garage untouched")
+                motion = "walking" if scenario == "walking" else "unknown"
+                check(request("Home", 1, motion=motion)[0] == 200, f"{scenario}: Home accepted")
+                advance(3)
+                before = json.loads(command("get GP explain Geo.Test prod format=json"))["state"]
+                check(before.get("arrival", {}).get("wait") == 60, f"{scenario}: the original Home wait is 60 seconds")
+                advance(18)
+                expired = json.loads(command("get GP explain Geo.Test prod format=json"))["state"]
+                check(expired["location"] == "unknown" and expired["zones"]["Z.Home"]["entry"] == 1,
+                      f"{scenario}: display expiry hides the location and retains Home evidence")
+                check(all(expired[key] == before[key] for key in ("zones", "members", "arrival", "trip")),
+                      f"{scenario}: display expiry leaves the accepted evidence and wait unchanged")
+                check(command("{ ReadingsVal('door','state','') }") == "untouched"
+                      and command("{ ReadingsVal('garage','state','') }") == "untouched",
+                      f"{scenario}: display expiry does not open either dummy actor")
+                if scenario in ("home_exit", "work_entry"):
+                    check(request("Home" if scenario == "home_exit" else "Work", 0 if scenario == "home_exit" else 1)[0] == 200,
+                          f"{scenario}: actual counterevidence accepted")
+                    advance(3)
+                refresh_actor_contacts()
+                remaining = before["arrival"]["due_mono"] - float(command("{ GP_Mono() }"))
+                advance(max(0, remaining) + 1)
+                completed = json.loads(command("get GP explain Geo.Test prod format=json"))["state"]
+                allowed = scenario in ("unknown", "walking")
+                check(not completed.get("arrival") and (completed["phase"] == "home" if allowed else True),
+                      f"{scenario}: original deadline confirms only an uninterrupted Home arrival")
+                if allowed:
+                    check(completed["location"] == "unknown" and command("{ ReadingsVal('Geo.Test','gp_location','') }") == "unknown",
+                          f"{scenario}, label={home_label}: confirmation never republishes the expired label")
+                expected_door = "lock unlocked" if allowed else "untouched"
+                expected_garage = "on" if scenario == "unknown" else "untouched"
+                check(command("{ ReadingsVal('door','state','') }") == expected_door
+                      and command("{ ReadingsVal('garage','state','') }") == expected_garage,
+                      f"{scenario}: only the eligible original opening commands reach dummy actors")
+                if allowed:
+                    actor_reading("feedback", "pulse_state", "confirmed")
+                    if scenario == "unknown":
+                        actor_reading("gate", "state", "on")
+                        actor_reading("upper", "state", "closed")
+                        actor_reading("lower", "state", "open")
+                    advance(1)
+                    following = json.loads(command("get GP explain Geo.Test prod format=json"))["state"]
+                    check(following["location"] == "unknown" and command("{ ReadingsVal('Geo.Test','gp_location','') }") == "unknown"
+                          and following["zones"]["Z.Home"]["time"] == before["zones"]["Z.Home"]["time"],
+                          f"{scenario}, label={home_label}: the next tick keeps the same display and original observation")
+            command("set GP mode debug")
+            check(command("attr GP zone_display_max_age " + saved_display_age if saved_display_age else "deleteattr GP zone_display_max_age") == "",
+                  "restore the display age")
+            check(command("attr Geo.Test sourceMode " + saved_display_source if saved_display_source else "deleteattr Geo.Test sourceMode") == "",
+                  "restore the source profile")
+            check(command("attr Z.Home label " + saved_home_label if saved_home_label else "deleteattr Z.Home label") == "",
+                  "restore the Home label")
+            zones["Work"] = saved_work_zone
             command("set Geo.Test mode active")
             command("attr GP debugLog 1")
             command("set GP mode active")

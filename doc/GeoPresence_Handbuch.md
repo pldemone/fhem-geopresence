@@ -1,6 +1,6 @@
 # GeoPresence – Handbuch
 
-**Version 2.38 · Stand 01.11.2026 · Architektur 0.76**
+**Version 2.39 · Stand 02.11.2026 · Architektur 0.77**
 
 GeoPresence ist eine Anwesenheits- und Ortssteuerung für FHEM. Es wertet aus, wer zu Hause ist, wer das Haus verlassen hat und wer zurückkehrt, und verbindet diese Informationen mit konfigurierbaren Automationen. So lässt sich beispielsweise beim Betreten eines Gartenbereichs ein Licht einschalten, beim Erreichen eines Arbeitsortes eine Nachricht senden oder bei einer berechtigten Heimkehr die vorhandene Tür- und Garagensteuerung ansprechen. Ziel ist, solche Aktionen passend zur Situation auszuführen und Fehlreaktionen auf einzelne unzuverlässige Meldungen zu vermeiden.
 
@@ -820,7 +820,7 @@ Interaktive Änderungen prüfen diese Beziehung vor der Übernahme. Bei Neustart
 | `arrival_wait_automotive` | 10 | Rückkehrbestätigung bei Autofahrt |
 | `arrival_wait_unknown` | 60 | Rückkehrbestätigung ohne verwertbare Bewegung |
 | `approach_timeout` | 600 | Ablauf eines optionalen Annäherungskontexts ohne Home-Rückkehr |
-| `zone_display_max_age` | 43200 | Alter sichtbarer Ortsbeobachtungen; erzeugt keinen Gruppenaustritt |
+| `zone_display_max_age` | 43200 | Alter der Ortsanzeige; erhält Ankunftsnachweise und Gruppenmitgliedschaften |
 | `actor_timeout` | 60 | Wartezeit auf Rückmeldung eines bereits gesendeten Öffnungsauftrags |
 | `trip_resume_max_age` | 172800 | Höchstalter der ursprünglichen Abwesenheitsbestätigung für Wiederherstellung eines offenen Ausflugs nach Neustart/Reload; 48 Stunden |
 | `departure_margin` | 200 | Zusätzlicher Abstand zwischen Home-Kreis und entferntem Ortskreis |
@@ -828,6 +828,10 @@ Interaktive Änderungen prüfen diese Beziehung vor der Übernahme. Bei Neustart
 Nach Ablauf von `reorder_window` verarbeitet der nächste Timerlauf alle bis dahin eingegangenen Meldungen derselben Person und desselben Produktiv- beziehungsweise Debug-Bereichs. Neue Meldungen verlängern dieses Sortierfenster nicht. Jüngere Gegenmeldungen im Bündel werden ebenfalls vor einer möglichen Öffnung ausgewertet.
 
 Die Ankunftsfrist beginnt beim Empfang des ersten gültigen Home-Eintritts eines berechtigten Ausflugs. Eine neue Austrittsmeldung bricht die Vormerkung ab; ein neuer lokaler Telefon-Ankunftsnachweis kann sie im kombinierten Profil früher bestätigen. Wiederholte Eintritte starten die Frist nicht beliebig neu. Für `geofency_only` muss ein umschließender Entfernungsnachweis zusätzlich auch an seiner Home nächstgelegenen Grenze mehr als `departure_margin` Abstand besitzen.
+
+Das Anzeigealter ist davon unabhängig: Bei `zone_display_max_age 20` kann die Ortsanzeige nach 20 Sekunden auf `unknown` wechseln, während eine gültige Home-Ankunft ihre 60 Sekunden Wartezeit durchläuft. Der Ablauf der Anzeige verändert keinen angenommenen Ein-/Austritt und erneuert keine Beobachtungszeit. Echte Austritte und widersprechende Ortsmeldungen verhindern die Ankunft weiterhin.
+
+Auch bei der Bestätigung bleibt eine bereits abgelaufene Ortsanzeige `unknown`, unabhängig vom Home-Label. Eine neue Ortsmeldung oder neue lokale Telefonanwesenheit kann die Anzeige aktualisieren; die Bestätigung allein erneuert keinen Ortsnachweis.
 
 Ein noch frischer Bewegungsnachtrag zu einem bereits angenommenen Eintritt kann dieselbe wartende Ankunft ergänzen, auch wenn inzwischen neuere Home-Meldungen ohne Bewegung eingegangen sind. Das gilt auch für die unmittelbar vorausgehende gültige Annäherung, selbst bei gleicher Beobachtungszeit wie Home. Ein nachgereichtes `walking` sperrt dann weiterhin die Garage. Neuere bekannte Bewegung wird nicht überschrieben; Zeitstempel und Beginn der Wartezeit werden nicht erneuert. Die Home-Frist und die Mindestabwesenheit richten sich weiterhin nach dem ursprünglichen Home-Eintritt. Die Ergänzung löst selbst keine Aktionen aus und öffnet keine abgeschlossene oder abgebrochene Ankunft erneut.
 

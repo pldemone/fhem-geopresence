@@ -134,9 +134,9 @@ sub fixture {
     device('door','dummy');device('contact','dummy');device('feedback','DOIF');
     device('garage','dummy');device('gate','dummy');device('upper','dummy');device('lower','dummy');
     my $c=gp_define('GP','controller'); $attr{GP}=$options{omit_webhook_port} ? {}:{webhookPort=>8090}; GP_StoreMode($defs{GP},'debug');
-    $attr{GP}{action_max_age}=$options{action_max_age} if exists $options{action_max_age};
+    $attr{GP}{$_}=$options{$_} for grep {exists $options{$_}} qw(action_max_age zone_display_max_age);
     gp_define('Geo.Test','resident GP rr_Test');
-    $attr{'Geo.Test'}={deviceId=>'DEVICE',webhookUser=>'user',sourceMode=>'geofency_phone',phoneProxies=>'p1,p2,p3',phoneSignalMode=>'measurement',allowDoor=>1,allowGarage=>1}; GP_StoreMode($defs{'Geo.Test'},'active');
+    $attr{'Geo.Test'}={deviceId=>'DEVICE',webhookUser=>'user',sourceMode=>$options{source_mode}//'geofency_phone',phoneProxies=>'p1,p2,p3',phoneSignalMode=>'measurement',allowDoor=>1,allowGarage=>1}; GP_StoreMode($defs{'Geo.Test'},'active');
     $keys{'GeoPresence_Geo.Test_auth'}='a'x32 . ':'.Digest::SHA::sha256_hex('a'x32 . ':'.'password123456789012345678');
     my @zones=([Home=>'home',0,50],[Drive=>'approach',0,250],[Outer=>'outer',0,4500],
         [Work=>'place',0.1,100],[Work2=>'place',0.1005,100],[Checkpoint=>'place',0.01,100],[Sternensteg=>'place',0.07,500]);
@@ -147,6 +147,7 @@ sub fixture {
         reading("Z.$z->[0]",'gp_geometry',JSON::PP::encode_json({lat=>$z->[2],lon=>0,radius=>$z->[3],
             time=>$now-1000,changed=>$now-1000,id=>lc($z->[0]),device=>'device',blocked=>0}),$now-1000);
     }
+    $attr{'Z.Home'}{label}=$options{home_label} if exists $options{home_label};
     gp_define('A.Door','action GP door_open'); $attr{'A.Door'}={target=>'door',command=>'lock unlocked',contact=>'contact',feedbackDevice=>'feedback'};
     gp_define('A.Garage','action GP garage_open'); $attr{'A.Garage'}={target=>'garage',command=>'on',stateDevice=>'gate',upperContact=>'upper',lowerContact=>'lower'};
     gp_define('A.Msg','action GP notify'); $attr{'A.Msg'}={message=>'%resident% arrived',channel=>0,priority=>0};
@@ -693,8 +694,17 @@ subtest 'rapid return, long absence, motion expiry and abandoned approach' => su
 };
 
 subtest 'clock discontinuity also revokes permissions without a webhook' => sub {
-    my ($c,$cfg)=fixture();my $s=new_state();advance(40);process($s,$cfg,'Work',0);
-    $now+=3600;GP_TickState($s,$cfg,$now,$mono);
+    my ($c,$cfg)=fixture();my $s=GP_State($c,'Geo.Test',0);advance(40);process($s,$cfg,'Work',0);
+    my $generation=$s->{generation};my $phone=\&GP_Phone;my $revoked_before_phone;
+    {
+        no warnings 'redefine';
+        local *GP_Phone=sub {
+            $revoked_before_phone=!$_[0]{trip} && $_[0]{generation} ne $generation;
+            return $phone->(@_);
+        };
+        $now+=3600;GeoPresence_Timer($c);
+    }
+    ok($revoked_before_phone,'clock revocation precedes phone processing');
     ok(!$s->{trip},'timer revokes permissions after wall-clock jump');
     advance(40);arrive($s,$cfg);is(scalar @{$s->{intents}},0,'arrival after clock repair has no old permission');
 };
@@ -3330,6 +3340,99 @@ subtest 'motion selects a real pending wait without consuming the trip' => sub {
     }
 };
 
+subtest 'display expiry preserves a waiting Home arrival and its original evidence' => sub {
+    for my $profile (qw(geofency_only geofency_phone)) {
+      for my $motion (qw(unknown walking)) {
+       for my $label ('home','Home','Zuhause') {
+        my ($c,$cfg,$s)=pending_fixture($motion,source_mode=>$profile,zone_display_max_age=>20,home_label=>$label);
+        my $due=$s->{arrival}{due_mono};my $observed=$s->{zones}{'Z.Home'}{time};
+        my $evidence=JSON::PP->new->canonical->encode([@$s{qw(zones members arrival trip)}]);
+        advance(20);GP_TickState($s,$cfg,$now,$mono);
+        is($s->{location},$label,"$profile, $motion, $label: display remains at its age limit");
+        advance(1);GP_TickState($s,$cfg,$now,$mono);
+        is($s->{location},'unknown','old location is hidden');
+        GP_Publish($c,'Geo.Test',$cfg,$s);
+        is(GP_Read('Geo.Test','gp_location',''),'unknown','the expired display is published');
+        is(JSON::PP->new->canonical->encode([@$s{qw(zones members arrival trip)}]),$evidence,
+            'display expiry changes no accepted location, membership, arrival or trip evidence');
+        is(scalar @{$s->{intents}},0,'display expiry creates no output');
+        advance($due-$mono-1);GP_TickState($s,$cfg,$now,$mono);GP_ConfirmArrival($s,$cfg,$now,$mono);
+        is(scalar @{$s->{intents}},0,'the original wait still applies');
+        advance(1);GP_TickState($s,$cfg,$now,$mono);GP_ConfirmArrival($s,$cfg,$now,$mono);
+        is($s->{phase},'home','the valid arrival completes at its original deadline');
+        ok(!$s->{arrival},'confirmation consumes the pending arrival');
+        is($s->{zones}{'Z.Home'}{time},$observed,'confirmation does not refresh the original observation');
+        actor_fresh();GP_Dispatch($c,'Geo.Test',$cfg,$s,0,$now,$mono);
+        GP_Publish($c,'Geo.Test',$cfg,$s);
+        is($s->{location},'unknown','confirmation cannot revive an expired Geo display');
+        is(GP_Read('Geo.Test','gp_location',''),'unknown','confirmation publishes no temporary Home label');
+        my @expected=$motion eq 'walking' ? ('door lock unlocked'):('door lock unlocked','garage on');
+        is_deeply([grep {/^(?:door|garage) /} @commands],\@expected,'only the original eligible openings are issued');
+        advance(1);GP_TickState($s,$cfg,$now,$mono);GP_ConfirmArrival($s,$cfg,$now,$mono);
+        GP_Dispatch($c,'Geo.Test',$cfg,$s,0,$now,$mono);
+        GP_Publish($c,'Geo.Test',$cfg,$s);
+        is(GP_Read('Geo.Test','gp_location',''),'unknown','the next tick preserves the same expired display');
+        is_deeply([grep {/^(?:door|garage) /} @commands],\@expected,'a later tick cannot repeat the arrival');
+       }
+      }
+    }
+};
+
+subtest 'fresh observations retain their display when Home is confirmed' => sub {
+    for my $source (qw(home overlap phone_return phone_veto)) {
+        my ($c,$cfg,$s)=pending_fixture('walking',zone_display_max_age=>20,home_label=>'Zuhause');
+        my $due=$s->{arrival}{due_mono};my $original=$s->{arrival}{event}{time};
+        advance(21);GP_TickState($s,$cfg,$now,$mono);
+        is($s->{location},'unknown',"$source: initial Geo display expired");
+        advance(34);
+        if ($source eq 'home') {process($s,$cfg,'Home',1,'unknown');}
+        elsif ($source eq 'overlap') {
+            @{$cfg->{zones}{'Z.Checkpoint'}}{qw(lat radius)}=(0.0002,20);
+            process($s,$cfg,'Checkpoint',1);
+            ok($s->{zones}{'Z.Home'}{entry},'the overlapping place does not disprove Home');
+        } else {
+            GP_Process($s,$cfg,{kind=>'phone_present',time=>$now,received=>$now,generation=>$s->{generation},
+                arrival=>$source eq 'phone_return' ? 1:0,key=>'fresh-phone-display'},$now,$mono);
+        }
+        my $expected=$source eq 'home' ? 'Zuhause':$source eq 'overlap' ? 'Checkpoint':'home';
+        is($s->{location},$expected,'the actual new observation updates the display');
+        if ($source eq 'home' || $source eq 'overlap') {
+            is($s->{arrival}{due_mono},$due,'the original wait remains unchanged');
+            is($s->{arrival}{event}{time},$original,'the original arrival observation remains unchanged');
+        }
+        advance($due-$mono);GP_TickState($s,$cfg,$now,$mono);GP_ConfirmArrival($s,$cfg,$now,$mono);
+        is($s->{phase},'home','the valid presence reaches Home status');
+        is($s->{location},$expected,'Home status preserves the latest actual display');
+        actor_fresh();GP_Dispatch($c,'Geo.Test',$cfg,$s,0,$now,$mono);GP_Publish($c,'Geo.Test',$cfg,$s);
+        is(GP_Read('Geo.Test','gp_location',''),$expected,'the latest display is published');
+        my @expected_commands=$source eq 'phone_veto' ? ():('door lock unlocked');
+        is_deeply([grep {/^(?:door|garage) /} @commands],\@expected_commands,'source and walking restrictions retain their effect');
+    }
+};
+
+subtest 'real location changes still revoke Home after its display expires' => sub {
+    for my $counterproof (qw(home_exit surrounding_exit disjoint_position)) {
+        my ($c,$cfg,$s)=pending_fixture('unknown',source_mode=>'geofency_only',zone_display_max_age=>20);
+        my $due=$s->{arrival}{due_mono};my $trip=$s->{trip}{id};
+        advance(21);GP_TickState($s,$cfg,$now,$mono);
+        ok($s->{zones}{'Z.Home'}{entry},"$counterproof: expiry alone preserves Home");
+        advance(1);
+        if ($counterproof eq 'home_exit') {process($s,$cfg,'Home',0);}
+        elsif ($counterproof eq 'surrounding_exit') {process($s,$cfg,'Drive',0);}
+        else {
+            @{$cfg->{zones}{'Z.Checkpoint'}}{qw(lat radius)}=(0.001,20);
+            process($s,$cfg,'Checkpoint',1);
+            is($s->{trip}{id},$trip,'a nearby disjoint place does not replace the trip');
+            ok($s->{arrival},'the candidate remains until the final evidence check');
+            ok(!$s->{zones}{'Z.Home'}{entry},'the newer position disproves Home');
+        }
+        advance($due-$mono);GP_TickState($s,$cfg,$now,$mono);GP_ConfirmArrival($s,$cfg,$now,$mono);
+        ok(!$s->{arrival},'the actual counterproof cancels the arrival');
+        actor_fresh();GP_Dispatch($c,'Geo.Test',$cfg,$s,0,$now,$mono);
+        is(scalar(grep {/^(?:door|garage) /} @commands),0,'no physical opening follows');
+    }
+};
+
 subtest '15 second false Home visit during an armed walk cancels and later arrival still works' => sub {
     my ($c,$cfg,$s)=pending_fixture('walking');my $trip=$s->{trip}{id};
     advance(15);process($s,$cfg,'Home',0);
@@ -3437,7 +3540,7 @@ subtest 'configuration reset, manual home, clock jump, and conflicting observati
         my ($c,$cfg,$s)=pending_fixture('automotive');
         if ($cancel eq 'reset') {GP_ResetController($c);$s=GP_State($c,'Geo.Test',0);}
         elsif ($cancel eq 'manual') {local $defs{rr_Test}{CHANGED}=['home'];GeoPresence_Notify($c,$defs{rr_Test});}
-        elsif ($cancel eq 'clock') {$now+=100;GP_TickState($s,$cfg,$now,$mono);}
+        elsif ($cancel eq 'clock') {$now+=100;GeoPresence_Timer($c);}
         else {process($s,$cfg,'Home',0);}
         ok(!$s->{arrival},"$cancel removed pending state");
         advance(60);GP_ConfirmArrival($s,$cfg,$now,$mono);GP_Dispatch($c,'Geo.Test',$cfg,$s,0,$now,$mono);
@@ -4132,7 +4235,7 @@ subtest 'expired movement and display data are checkpointed once without inventi
         GP_TickState($s,$cfg,$now,$mono); GP_Checkpoint($c,'Geo.Test',$cfg,$s);
     }),[1,1],'display expiry persisted once');
     $cp=JSON::PP::decode_json(GP_Read('Geo.Test','gp_trip_checkpoint',''));
-    is($cp->{state}{zones}{'Z.Drive'}{entry},0,'expired displayed entry saved');
+    is($cp->{state}{zones}{'Z.Drive'}{entry},1,'accepted entry retained after display expiry');
     is($cp->{state}{location},'unknown','expired location saved');
     is($cp->{state}{members}{'Z.Drive'}{entry},1,'explicit membership retained');
     ok(!exists($cp->{trip}{exits}{'location:Z.Drive'}),'display expiry did not invent an explicit exit');
@@ -4143,6 +4246,7 @@ subtest 'expired movement and display data are checkpointed once without inventi
     }),[0,0],'already expired display remained quiet');
     ($cfg,$s)=simulate_process_restart($c);
     is($s->{location},'unknown','restart retained the expired display');
+    is($s->{zones}{'Z.Drive'}{entry},1,'restart retained the accepted zone evidence');
     is($s->{members}{'Z.Drive'}{entry},1,'restart retained the explicit membership');
 };
 
