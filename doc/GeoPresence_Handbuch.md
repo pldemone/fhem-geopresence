@@ -1,6 +1,6 @@
 # GeoPresence – Handbuch
 
-**Version 2.37 · Stand 30.10.2026 · Architektur 0.75**
+**Version 2.38 · Stand 01.11.2026 · Architektur 0.76**
 
 GeoPresence ist eine Anwesenheits- und Ortssteuerung für FHEM. Es wertet aus, wer zu Hause ist, wer das Haus verlassen hat und wer zurückkehrt, und verbindet diese Informationen mit konfigurierbaren Automationen. So lässt sich beispielsweise beim Betreten eines Gartenbereichs ein Licht einschalten, beim Erreichen eines Arbeitsortes eine Nachricht senden oder bei einer berechtigten Heimkehr die vorhandene Tür- und Garagensteuerung ansprechen. Ziel ist, solche Aktionen passend zur Situation auszuführen und Fehlreaktionen auf einzelne unzuverlässige Meldungen zu vermeiden.
 
@@ -200,6 +200,8 @@ attr rr_PERSON rr_locationUnderway underway
 ```
 
 GeoPresence verwaltet die Anwesenheit dieses ROOMMATE-Geräts. Parallel arbeitende Automationen, die denselben Status oder dieselben Türaktionen auslösen, müssen vor der Produktivfreigabe bewusst abgegrenzt werden. Ein externer Wechsel auf `home` gilt als manuelle Heimkehr und widerruft die laufende Öffnungsberechtigung.
+
+Das gilt auch innerhalb einer eigenen Statusübergabe: Setzt ein Rückruf bei Person A den ROOMMATE von Person B auf `home`, verliert B ihre wartenden Freigaben sofort. Ebenso widerruft ein manuelles `home` während der eigenen Abwesenheitsübergabe die Freigaben dieser Person. Nur eine eindeutig dem eigenen Auftrag zuordenbare Home-Rückmeldung bleibt ohne Widerruf; zusätzliche oder unklare Home-Meldungen werden vorsorglich als manuelle Heimkehr behandelt. Das gilt auch dann, wenn andere ROOMMATE-Empfänger die gemeinsame Ereignisansicht löschen und später neu anlegen. Eine Umbenennung des Home-Ereignisses über `eventMap`, beispielsweise in `Zuhause`, ändert seine Widerrufswirkung auch bei wiederholter Textumformung nicht. Auch eine Home-Aktualisierung über `setreading` mit einem abgebildeten Ereignistext wie `state: Zuhause` bleibt nach einer Cachelöschung wirksam. Wird ein solcher Text erneut umgeformt, verwendet GeoPresence die konfigurierte `usr`-Rückabbildung, um seine Home-Bedeutung zu erkennen. Reine Stimmungsänderungen führen nach einem bereits zugeordneten eigenen Home-Echo zu keinem zusätzlichen Widerruf.
 
 Scheitert die Statusübergabe, zeigen das Reading `gp_roommate_error` und der Statusbericht den Fehler. GeoPresence versucht den weiterhin aktuellen gewünschten Status im nächsten Timerlauf erneut. Identische Fehler erzeugen keine wiederholte Warnung im Betriebslog; nach erfolgreicher Übergabe wird der Fehler gelöscht. Die Wiederholung aktualisiert ausschließlich den Anwesenheitsstatus und erzeugt keine neue Tür- oder Garagenaktion.
 

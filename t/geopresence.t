@@ -26,9 +26,12 @@ sub readingsEndUpdate {
 }
 sub CommandSet {
     my ($client,$command)=@_;
+    my ($target)=split / /,$command,2;
+    $defs{$target}{CL}=$client if $defs{$target};
     push @commands,$command;
     $on_command->($command) if $on_command;
     if ($command =~ /^(rr_\w+) state (\w+)$/) { reading($1,'state',$2,$now); }
+    delete $defs{$target}{CL} if $defs{$target};
     return;
 }
 sub CommandAttr {
@@ -73,7 +76,7 @@ require "$FindBin::Bin/../FHEM/98_GeoPresence.pm";
 
 sub stamp { return strftime('%Y-%m-%d %H:%M:%S',localtime($_[0])); }
 sub iso { return strftime('%Y-%m-%dT%H:%M:%SZ',gmtime($_[0])); }
-sub reading { $defs{$_[0]}{READINGS}{$_[1]}={VAL=>$_[2],TIME=>stamp($_[3])}; }
+sub reading { setReadingsVal($defs{$_[0]},$_[1],$_[2],stamp($_[3])); }
 sub device {
     my ($name,$type)=@_;
     $defs{$name}={NAME=>$name,TYPE=>$type,READINGS=>{}};
@@ -260,6 +263,14 @@ sub actor_event {
     reading($device,$key,$value,$time//$now);
     local $defs{$device}{CHANGED}=["$key: $value"];
     GeoPresence_Notify($c,$defs{$device}) if grep {$_ eq $device} split /,/,$c->{NOTIFYDEV};
+}
+sub roommate_event {
+    my ($c,$name,$status,@events)=@_;
+    reading($name,'state',$status,$now);
+    local $defs{$name}{CHANGED}=@events ? [@events]:["state: $status"];
+    $defs{$name}{CHANGEDWITHSTATE}=[];
+    GeoPresence_Notify($c,$defs{$name});
+    delete $defs{$name}{CHANGEDWITHSTATE};
 }
 sub form {
     my ($cfg,$zone,$entry,$time,%extra)=@_;
@@ -1215,17 +1226,383 @@ subtest 'credential migration failures stay disabled across session reset' => su
     }
 };
 
-subtest 'ROOMMATE failures remain visible and retry until the state is synchronized' => sub {
-    for my $exception (0,1) {
-        my ($c,$cfg)=fixture();advance(40);my $s=GP_State($c,'Geo.Test',0);$s->{phase}='home';$s->{desired_status}='home';
-        reading('rr_Test','state','absent',$now);my $original=\&CommandSet;my $fail=1;
+subtest 'ROOMMATE ignores only one attributed Home echo for the current status command' => sub {
+    for my $case (qw(normal foreign_pending foreign_planned absent missing_origin repeated combined combined_many late_home late_absent)) {
+        my ($c,$cfg,$other_cfg)=shared_actor_fixture();
+        my $s=GP_State($c,'Geo.Test',0);
+        advance(40);process($s,$cfg,'Work',0);advance(90);actor_fresh();
+        process($s,$cfg,'Home',1,'automotive');
+        complete_arrival($s,$cfg) unless $case eq 'foreign_pending';
+        my $revision=$s->{output_revision};
+        my $foreign=$case =~ /^foreign/;
+        my $publisher=$foreign ? 'Geo.Other':'Geo.Test';
+        my $publisher_cfg=$foreign ? $other_cfg:$cfg;
+        my $pub=GP_State($c,$publisher,0);
+        my $pub_revision=$pub->{output_revision};
+        my $absent=$case eq 'absent' || $case eq 'late_absent';
+        $pub->{desired_status}=$absent ? 'absent':'home';
+        reading($publisher_cfg->{roommate},'state',$absent ? 'home':'absent',$now);
+        my $original=\&CommandSet;
         {
             no warnings 'redefine';
             local *CommandSet=sub {
-                if ($fail && $_[1] eq 'rr_Test state home') {push @commands,$_[1];die "roommate unavailable\n" if $exception;return 'roommate unavailable';}
+                my ($client,$command)=@_;
+                return $original->(@_) unless $command =~ /^(rr_\w+) state (\w+)$/;
+                my ($name,$status)=($1,$2);
+                push @commands,$command;
+                $defs{$name}{CL}=$client;
+                delete $defs{$name}{CL} if $case eq 'missing_origin';
+                reading($name,'state',$status,$now);
+                local $defs{$name}{CHANGED}=$case =~ /^combined/ ? ['home','state: home']:["state: $status"];
+                push @{$defs{$name}{CHANGED}},('mood: happy') x 16,'home' if $case eq 'combined_many';
+                GeoPresence_Notify($c,$defs{$name});
+                roommate_event($c,'rr_Test','home') if $foreign || $case eq 'absent' || $case eq 'repeated';
+                if ($case =~ /^late_/) {
+                    reading($name,'state','home',$now);
+                    push @{$defs{$name}{CHANGED}},'home';
+                }
+                delete $defs{$name}{CL};
+                return;
+            };
+            GP_Publish($c,$publisher,$publisher_cfg,$pub);
+        }
+        if ($case eq 'normal') {
+            is($s->{output_revision},$revision,'own Home echo preserves the output permission');
+            is(scalar @{$s->{intents}},2,'own echo retains both valid opening plans');
+        } else {
+            cmp_ok($s->{output_revision},'>',$revision,"$case: manual or ambiguous Home revokes permission");
+            ok(!$s->{trip} && !$s->{arrival},"$case: trip and waiting arrival are cancelled");
+            is(scalar @{$s->{intents}},0,"$case: no opening plan survives");
+            is(JSON::PP::decode_json(GP_Read('Geo.Test','gp_trip_checkpoint',''))->{status},'none',
+                "$case: saved permission is revoked");
+        }
+        is($pub->{output_revision},$pub_revision,"$case: other person's own echo remains harmless") if $foreign;
+        ok(!$c->{helper}{gp}{status_request},"$case: request marker ends with the command");
+        ok(!defined $defs{$publisher_cfg->{roommate}}{CL},"$case: no command client is retained");
+        complete_arrival($s,$cfg);
+        GP_Dispatch($c,'Geo.Test',$cfg,$s,0,$now,$mono);
+        is(scalar(grep {/^(?:door|garage) /} @commands),$case eq 'normal' ? 2:0,
+            "$case: only the normal own echo retains valid physical outputs");
+    }
+};
+
+subtest 'late Home in another ROOMMATE batch revokes waiting and planned arrivals' => sub {
+    for my $planned (0,1) {
+      for my $batches (1,2) {
+        my ($c,$cfg,$other_cfg)=shared_actor_fixture();my $s=GP_State($c,'Geo.Test',0);
+        advance(40);process($s,$cfg,'Work',0);advance(90);actor_fresh();
+        process($s,$cfg,'Home',1,'automotive');complete_arrival($s,$cfg) if $planned;
+        my $revision=$s->{output_revision};
+        my $other=GP_State($c,'Geo.Other',0);my $other_revision=$other->{output_revision};
+        $other->{desired_status}='home';reading('rr_Other','state','absent',$now);
+        my $original=\&CommandSet;
+        {
+            no warnings 'redefine';
+            local *CommandSet=sub {
+                return $original->(@_) unless $_[1] eq 'rr_Other state home';
+                push @commands,$_[1];local $defs{rr_Other}{CL}=$_[0];
+                roommate_event($c,'rr_Other','home');
+                for my $batch (1..$batches) {
+                    local $defs{rr_Test}{CHANGED}=[$batch==1 ? 'mood: happy':'mood: calm'];
+                    GeoPresence_Notify($c,$defs{rr_Test});
+                    if ($batch==1) {
+                        reading('rr_Test','state','home',$now);
+                        push @{$defs{rr_Test}{CHANGED}},'home';
+                    }
+                }
+                return;
+            };
+            GP_Publish($c,'Geo.Other',$other_cfg,$other);
+        }
+        cmp_ok($s->{output_revision},'>',$revision,"planned=$planned, batches=$batches: late foreign Home revokes permission");
+        ok(!$s->{trip} && !$s->{arrival},'the affected trip and arrival are cancelled');
+        is(scalar @{$s->{intents}},0,'no planned opening remains');
+        is($other->{output_revision},$other_revision,'the publishing resident keeps its own valid context');
+        is(JSON::PP::decode_json(GP_Read('Geo.Test','gp_trip_checkpoint',''))->{status},'none','persisted permission is cleared');
+        complete_arrival($s,$cfg);GP_Dispatch($c,'Geo.Test',$cfg,$s,0,$now,$mono);
+        is(scalar(grep {/^(?:door|garage) /} @commands),0,'no delayed physical opening follows');
+      }
+    }
+};
+
+subtest 'mapped Home has the same meaning in immediate and delayed ROOMMATE events' => sub {
+    for my $case (qw(own_echo own_absent_echo own_absent own_cycle foreign)) {
+        my ($c,$cfg,$other_cfg)=shared_actor_fixture();my $s=GP_State($c,'Geo.Test',0);
+        advance(40);process($s,$cfg,'Work',0);advance(90);actor_fresh();
+        my $absence_echo=$case eq 'own_absent_echo';
+        unless ($absence_echo) {process($s,$cfg,'Home',1,'automotive');complete_arrival($s,$cfg);}
+        $attr{rr_Test}{eventMap}=$absence_echo ? 'home:Zuhause absent:home':'home:Zuhause';
+        my $revision=$s->{output_revision};
+        my $foreign=$case eq 'foreign';my $r=$foreign ? 'Geo.Other':'Geo.Test';
+        my $pub_cfg=$foreign ? $other_cfg:$cfg;my $pub=GP_State($c,$r,0);
+        my $absent=$case eq 'own_absent' || $absence_echo;
+        $pub->{desired_status}=$absent ? 'absent':'home';
+        reading($pub_cfg->{roommate},'state',$absent ? 'home':'absent',$now);
+        my $original=\&CommandSet;
+        {
+            no warnings qw(redefine once);
+            local *deviceEvents=sub {return $_[1] && defined $_[0]{CHANGEDWITHSTATE}
+                ? $_[0]{CHANGEDWITHSTATE}:$_[0]{CHANGED};};
+            local *ReplaceEventMap=sub {
+                return @{$_[1]} unless $_[2];
+                return 'Zuhause' if $_[0] eq 'rr_Test' && $_[1] eq 'home';
+                return 'home' if $absence_echo && $_[0] eq 'rr_Test' && $_[1] eq 'absent';
+                return $_[1];
+            };
+            local *CommandSet=sub {
+                my ($client,$command)=@_;
+                return $original->(@_) unless $command =~ /^(rr_\w+) state (\w+)$/;
+                my ($name,$status)=($1,$2);push @commands,$command;
+                local $defs{$name}{CL}=$client;
+                roommate_event($c,$name,$status) if $foreign;
+                reading('rr_Test','state',$foreign ? 'absent':$status,$now);
+                local $defs{rr_Test}{CHANGED}=[$foreign ? 'mood: happy':ReplaceEventMap('rr_Test',$status,1)];
+                $defs{rr_Test}{CHANGEDWITHSTATE}=["state: $status"] unless $foreign;
+                GeoPresence_Notify($c,$defs{rr_Test});
+                unless ($case eq 'own_echo' || $absence_echo) {
+                    reading('rr_Test','state','home',$now);
+                    $defs{rr_Test}{CHANGEDWITHSTATE}=[];
+                    push @{$defs{rr_Test}{CHANGED}},'Zuhause';
+                }
+                delete $defs{rr_Test}{CHANGEDWITHSTATE};
+                return;
+            };
+            GP_Publish($c,$r,$pub_cfg,$pub);
+        }
+        if ($case eq 'own_echo') {
+            is($s->{output_revision},$revision,'normal mapped own echo keeps the permission');
+            is(scalar @{$s->{intents}},2,'normal mapped echo preserves both valid plans');
+        } elsif ($absence_echo) {
+            is($s->{output_revision},$revision,'absence mapped to the text home does not revoke the trip');
+            ok($s->{trip}{armed},'the actual absence retains its qualified trip');
+        } else {
+            cmp_ok($s->{output_revision},'>',$revision,"$case: mapped late Home revokes permission");
+            ok(!$s->{trip} && !$s->{arrival},'no trip or pending arrival survives');
+            is(scalar @{$s->{intents}},0,'no output plan survives the mapped Home');
+        }
+    }
+};
+
+subtest 'mapped Home labels with Reading prefixes revoke after the event view was deleted' => sub {
+    for my $label ('state: Zuhause','arrival: Zuhause','mood: Zuhause') {
+      for my $case (qw(pending planned mood duration absent)) {
+        my ($c,$cfg)=fixture();my $s=GP_State($c,'Geo.Test',0);
+        advance(40);process($s,$cfg,'Work',0);advance(90);actor_fresh();
+        unless ($case eq 'absent') {
+            process($s,$cfg,'Home',1,'automotive');
+            complete_arrival($s,$cfg) unless $case eq 'pending';
+        }
+        $attr{rr_Test}{eventMap}="{ dev=>{'^home\$'=>'$label'}, usr=>{'^$label\$'=>'home'} }";
+        reading('rr_Test','state',$case eq 'absent' ? 'absent':'home',$now);
+        my $revision=$s->{output_revision};
+        my $event=$case eq 'mood' ? 'mood: happy'
+            : $case eq 'duration' ? 'durTimerPresence: 00:01:00'
+            : $case eq 'absent' ? 'absent':$label;
+        {
+            no warnings qw(redefine once);
+            local *ReplaceEventMap=sub {
+                return $_[1] eq 'home' ? $label:$_[1] if $_[2];
+                my ($device,$event)=@{$_[1]};
+                return ($device,'home') if $event eq $label;
+                return @{$_[1]};
+            };
+            local $defs{rr_Test}{CHANGED}=[$event];
+            delete $defs{rr_Test}{CHANGEDWITHSTATE};
+            GeoPresence_Notify($c,$defs{rr_Test});
+        }
+        if ($case eq 'pending' || $case eq 'planned') {
+            cmp_ok($s->{output_revision},'>',$revision,"$label, $case: actual Home revokes permission");
+            ok(!$s->{trip} && !$s->{arrival},'trip and waiting arrival are cancelled');
+            is(scalar @{$s->{intents}},0,'no planned opening survives');
+        } else {
+            is($s->{output_revision},$revision,"$label, $case: an unrelated event preserves permission");
+            ok($s->{trip}{armed},'ordinary absence retains its trip') if $case eq 'absent';
+        }
+        complete_arrival($s,$cfg);GP_Dispatch($c,'Geo.Test',$cfg,$s,0,$now,$mono);
+        my $expected=$case eq 'mood' || $case eq 'duration' ? 2:0;
+        is(scalar(grep {/^(?:door|garage) /} @commands),$expected,
+            'only unaffected completed arrivals can issue their existing openings');
+      }
+    }
+};
+
+subtest 'reverse event mappings retain Home after multiple prefixed translations' => sub {
+    for my $depth (2,8) {
+      for my $prefix (qw(state arrival)) {
+       for my $planned (0,1) {
+        for my $cached (0,1) {
+            my ($c,$cfg)=pending_fixture('automotive');my $s=GP_State($c,'Geo.Test',0);
+            complete_arrival($s,$cfg) if $planned;
+            my @labels=map {"$prefix: Place$_"} 1..$depth;
+            my %forward=(home=>$labels[0],map {$labels[$_-1]=>$labels[$_]} 1..$#labels);
+            my %reverse=map {$_=>'home'} @labels;
+            $reverse{$labels[-1]}='state home' if $prefix eq 'arrival';
+            my $dev=join(',',map {"'^$_\$'=>'$forward{$_}'"} sort keys %forward);
+            my $usr=join(',',map {"'^$_\$'=>'$reverse{$_}'"} sort keys %reverse);
+            $attr{rr_Test}{eventMap}="{ dev=>{$dev}, usr=>{$usr} }";
+            reading('rr_Test','state','home',$now);my $revision=$s->{output_revision};
+            {
+                no warnings qw(redefine once);
+                local *ReplaceEventMap=sub {
+                    my ($name,$value,$direction)=@_;
+                    return $forward{$value}//$value if $direction;
+                    my ($device,$event)=@$value;
+                    return ($device,split / /,$reverse{$event}) if exists $reverse{$event};
+                    return @$value;
+                };
+                local *deviceEvents=sub {return $_[0]{CHANGEDWITHSTATE}//$_[0]{CHANGED};};
+                local $defs{rr_Test}{CHANGED}=[$labels[-1],'mood: happy'];
+                $defs{rr_Test}{CHANGEDWITHSTATE}=[$labels[-1],'mood: happy'] if $cached;
+                delete $defs{rr_Test}{CHANGEDWITHSTATE} unless $cached;
+                GeoPresence_Notify($c,$defs{rr_Test});
+                delete $defs{rr_Test}{CHANGEDWITHSTATE};
+            }
+            cmp_ok($s->{output_revision},'>',$revision,
+                "depth=$depth, $prefix, planned=$planned, cached=$cached: final Home value revokes permission");
+            ok(!$s->{trip} && !$s->{arrival},'no trip or waiting arrival survives');
+            is(scalar @{$s->{intents}},0,'no opening plan survives');
+            complete_arrival($s,$cfg);GP_Dispatch($c,'Geo.Test',$cfg,$s,0,$now,$mono);
+            is(scalar(grep {/^(?:door|garage) /} @commands),0,'no old physical output is issued');
+        }
+       }
+      }
+    }
+};
+
+subtest 'Home revocation survives repeated mapping and deleted state event views' => sub {
+    for my $case (qw(direct direct_uncached direct_deleted own_absent own_absent_deleted
+                     foreign foreign_deleted own_cycle own_cycle_deleted mood_only mood_only_deleted)) {
+        (my $base=$case)=~s/_deleted$//;
+        my $deleted=$case =~ /_deleted$/;
+        my ($c,$cfg,$other_cfg)=shared_actor_fixture();my $s=GP_State($c,'Geo.Test',0);
+        advance(40);process($s,$cfg,'Work',0);advance(90);actor_fresh();
+        unless ($base eq 'own_absent') {
+            process($s,$cfg,'Home',1,'automotive');
+            complete_arrival($s,$cfg) if $base eq 'own_cycle' || $base eq 'mood_only';
+        }
+        $attr{rr_Test}{eventMap}='/home:at home/';
+        my $revision=$s->{output_revision};
+        my $foreign=$base eq 'foreign';my $r=$foreign ? 'Geo.Other':'Geo.Test';
+        my $pub_cfg=$foreign ? $other_cfg:$cfg;my $pub=GP_State($c,$r,0);
+        my $original=\&CommandSet;
+        {
+            no warnings qw(redefine once);
+            local *ReplaceEventMap=sub {
+                my ($name,$event,$direction)=@_;
+                return @$event unless $direction;
+                $event =~ s/\bhome\b/at home/ if $name eq 'rr_Test';
+                return $event;
+            };
+            local *deviceEvents=sub {return $_[1] && defined $_[0]{CHANGEDWITHSTATE}
+                ? $_[0]{CHANGEDWITHSTATE}:$_[0]{CHANGED};};
+            if ($case =~ /^direct/) {
+                reading('rr_Test','state','home',$now);
+                local $defs{rr_Test}{CHANGED}=['lastState: absent','at at home','mood: happy'];
+                $defs{rr_Test}{CHANGEDWITHSTATE}=$base eq 'direct' ? ['state: home']:[];
+                delete $defs{rr_Test}{CHANGEDWITHSTATE} if $deleted;
+                GeoPresence_Notify($c,$defs{rr_Test});
+                delete $defs{rr_Test}{CHANGEDWITHSTATE};
+            } else {
+                $pub->{desired_status}=$base eq 'own_absent' ? 'absent':'home';
+                reading($pub_cfg->{roommate},'state',$base eq 'own_absent' ? 'home':'absent',$now);
+                local *CommandSet=sub {
+                    my ($client,$command)=@_;
+                    return $original->(@_) unless $command =~ /^(rr_\w+) state (\w+)$/;
+                    my ($name,$status)=($1,$2);push @commands,$command;
+                    $defs{$name}{CL}=$client;
+                    reading($name,'state',$status,$now);
+                    local $defs{$name}{CHANGED}=['lastState: '.($status eq 'home' ? 'absent':'home'),ReplaceEventMap($name,$status,1)];
+                    $defs{$name}{CHANGEDWITHSTATE}=["state: $status"];
+                    GeoPresence_Notify($c,$defs{$name});
+                    delete $defs{$name}{CHANGEDWITHSTATE} if $deleted;
+                    if ($foreign) {
+                        local $defs{rr_Test}{CHANGED}=['mood: happy'];
+                        delete $defs{rr_Test}{CHANGEDWITHSTATE};
+                        GeoPresence_Notify($c,$defs{rr_Test});
+                        delete $defs{rr_Test}{CHANGEDWITHSTATE} if $deleted;
+                        reading('rr_Test','state','home',$now);
+                        $defs{rr_Test}{CHANGEDWITHSTATE}=[];
+                        push @{$defs{rr_Test}{CHANGED}},'lastState: absent','home';
+                        for (1..5) {$_=ReplaceEventMap('rr_Test',$_,1) for @{$defs{rr_Test}{CHANGED}};}
+                        delete $defs{rr_Test}{CHANGEDWITHSTATE};
+                    } else {
+                        if ($base eq 'mood_only') {push @{$defs{$name}{CHANGED}},'mood: happy';}
+                        else {
+                            reading($name,'state','home',$now);
+                            $defs{$name}{CHANGEDWITHSTATE}=[];
+                            push @{$defs{$name}{CHANGED}},'lastState: at home','absent' if $base eq 'own_cycle';
+                            push @{$defs{$name}{CHANGED}},'lastState: absent','home';
+                        }
+                        for (1..5) {$_=ReplaceEventMap($name,$_,1) for @{$defs{$name}{CHANGED}};}
+                    }
+                    delete $defs{$name}{CHANGEDWITHSTATE};
+                    delete $defs{$name}{CL};
+                    return;
+                };
+                GP_Publish($c,$r,$pub_cfg,$pub);
+            }
+        }
+        if ($base eq 'mood_only') {
+            is($s->{output_revision},$revision,'later mood changes preserve the already attributed Home echo');
+            is(scalar @{$s->{intents}},2,'reformatting an old Home text creates no new manual arrival');
+        } else {
+            cmp_ok($s->{output_revision},'>',$revision,"$case: Home revokes permission despite repeated mapping");
+            ok(!$s->{trip} && !$s->{arrival},'no trip or waiting arrival survives');
+            is(scalar @{$s->{intents}},0,'no old output plan survives');
+        }
+        complete_arrival($s,$cfg);GP_Dispatch($c,'Geo.Test',$cfg,$s,0,$now,$mono);
+        is(scalar(grep {/^(?:door|garage) /} @commands),$base eq 'mood_only' ? 2:0,
+            'only the original valid own echo can retain opening commands');
+        ok(!exists $defs{rr_Test}{CHANGEDWITHSTATE},'finished event views are not restored onto the device');
+    }
+};
+
+subtest 'nested own ROOMMATE status commands retain both residents and restore the Reading writer' => sub {
+    my ($c,$cfg,$other_cfg)=shared_actor_fixture();advance(40);
+    my $s=GP_State($c,'Geo.Test',0);my $other=GP_State($c,'Geo.Other',0);
+    process($s,$cfg,'Work',0);process($other,$other_cfg,'Work',0);advance(90);actor_fresh();
+    process($s,$cfg,'Home',1,'automotive');complete_arrival($s,$cfg);
+    process($other,$other_cfg,'Home',1,'automotive');complete_arrival($other,$other_cfg);
+    reading('rr_Test','state','absent',$now);reading('rr_Other','state','absent',$now);
+    my ($revision,$other_revision)=($s->{output_revision},$other->{output_revision});
+    my $writer=\&setReadingsVal;
+    {
+        no warnings 'redefine';
+        local *CommandSet=sub {
+            my ($client,$command)=@_;
+            my ($name)=$command =~ /^(rr_\w+) state home$/ or die "Unexpected command $command";
+            push @commands,$command;$defs{$name}{CL}=$client;
+            GP_Publish($c,'Geo.Other',$other_cfg,$other) if $name eq 'rr_Test';
+            roommate_event($c,$name,'home');delete $defs{$name}{CL};
+            return;
+        };
+        GP_Publish($c,'Geo.Test',$cfg,$s);
+    }
+    is($s->{output_revision},$revision,'outer status command keeps its output permission');
+    is($other->{output_revision},$other_revision,'nested status command keeps its output permission');
+    is(scalar @{$s->{intents}},2,'outer resident retains both valid opening plans');
+    is(scalar @{$other->{intents}},2,'nested resident retains both valid opening plans');
+    is(\&setReadingsVal,$writer,'nested status calls restore the original Reading writer');
+    ok(!$c->{helper}{gp}{status_request},'no temporary status context survives');
+};
+
+subtest 'ROOMMATE failures remain visible and retry until the state is synchronized' => sub {
+    for my $exception (0,1) {
+        my ($c,$cfg)=fixture();advance(40);my $s=GP_State($c,'Geo.Test',0);$s->{phase}='home';$s->{desired_status}='home';
+        reading('rr_Test','state','absent',$now);my $original=\&CommandSet;my $writer=\&setReadingsVal;my $fail=1;
+        {
+            no warnings 'redefine';
+            local *CommandSet=sub {
+                if ($fail && $_[1] eq 'rr_Test state home') {
+                    $defs{rr_Test}{CL}=$_[0];push @commands,$_[1];
+                    die "roommate unavailable\n" if $exception;return 'roommate unavailable';
+                }
                 return $original->(@_);
             };
             GP_Publish($c,'Geo.Test',$cfg,$s);GP_Publish($c,'Geo.Test',$cfg,$s);
+            is(\&setReadingsVal,$writer,'the original Reading writer is restored after failure or exception');
+            ok(!defined $defs{rr_Test}{CL},'failure does not retain the temporary command client');
+            ok(!$c->{helper}{gp}{status_request},'failure does not retain an own-echo exception');
             is($s->{desired_status},'home','failed status stays pending');
             like(GP_Read('Geo.Test','gp_roommate_error',''),qr/roommate unavailable/,'Reading exposes the status failure');
             is(scalar(grep {$_->[2]=~/Could not update ROOMMATE/} @logs),1,'identical repeated failure is logged once');
@@ -4115,6 +4492,27 @@ subtest 'manual Home during the door callback revokes the remaining garage plan'
     ok(!$c->{helper}{gp}{actors}{garage},'cancelled garage plan creates no reservation');
     actor_event($c,'feedback','pulse_state','confirmed');GP_ActorFeedback($c,$now,$mono);
     is($s->{door_result},'confirmed','the already issued door request still receives feedback');
+};
+
+subtest 'ROOMMATE callbacks revoke extracted plans while actor feedback stays observable' => sub {
+    my ($c,$cfg,$other_cfg)=shared_actor_fixture();my $s=GP_State($c,'Geo.Test',0);
+    advance(40);process($s,$cfg,'Work',0);advance(90);actor_fresh();
+    process($s,$cfg,'Home',1,'automotive');complete_arrival($s,$cfg);
+    my $other=GP_State($c,'Geo.Other',0);$other->{desired_status}='home';
+    reading('rr_Other','state','absent',$now);
+    $on_command=sub {
+        if ($_[0] eq 'door lock unlocked') {GP_Publish($c,'Geo.Other',$other_cfg,$other);}
+        elsif ($_[0] eq 'rr_Other state home') {
+            roommate_event($c,'rr_Test','home');
+            actor_event($c,'feedback','pulse_state','confirmed');
+        }
+    };
+    GP_Dispatch($c,'Geo.Test',$cfg,$s,0,$now,$mono);$on_command=undef;
+    is_deeply(\@commands,['door lock unlocked','rr_Other state home'],
+        'manual Home inside another status command stops the extracted garage plan');
+    ok(!$c->{helper}{gp}{actors}{garage},'revoked garage plan creates no actor reservation');
+    GP_ActorFeedback($c,$now,$mono);
+    is($s->{door_result},'confirmed','door completion is retained during the nested status command');
 };
 
 subtest 'every opening uses current clocks after a synchronous callback' => sub {

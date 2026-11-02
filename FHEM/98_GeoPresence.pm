@@ -3692,8 +3692,32 @@ sub GP_Publish {
             || ($status eq 'absent' && $current !~ /\A(?:absent|gone)\z/);
         my $error;
         if ($set) {
-            local $c->{helper}{gp}{own_status}=1;
-            $error=eval {GP_Profile($c,'roommate_command',$rr,sub {CommandSet(undef,"$rr state $status")})};
+            my $request={device=>$defs{$rr},status=>$status};
+            local $c->{helper}{gp}{status_request}=$request;
+            # FHEM exposes the command client as CL during synchronous events.
+            # Restore it even when an adapter throws before CommandSet cleans up.
+            local $request->{device}{CL};
+            # Observe Home at the Reading writer while this adapter runs. Other
+            # receivers may delete caches or rewrite events before Notify sees them.
+            my $write_reading=\&setReadingsVal;
+            no warnings 'prototype';
+            local *setReadingsVal=sub {
+                if (($_[1]//'') eq 'state' && ($_[2]//'') eq 'home'
+                    && ($_[0]{TYPE}//'') eq 'ROOMMATE'
+                    && ($c->{helper}{gp}{status_request}//0)==$request) {
+                    my $device=$_[0];
+                    if ($device==$request->{device} && $request->{status} eq 'home'
+                        && ($device->{CL}//0)==$request && !$request->{home_written}) {
+                        $request->{home_written}=1;
+                    } else {
+                        GP_ManualHome($c,$device);
+                        $request->{manual_home}{$device}=1;
+                    }
+                }
+                # Tail delegation preserves the writer's context, result and exception.
+                goto &$write_reading;
+            };
+            $error=eval {GP_Profile($c,'roommate_command',$rr,sub {CommandSet($request,"$rr state $status")})};
             $error=$@ if $@;
         }
         if ($error) {
@@ -3978,6 +4002,27 @@ sub GP_TimerStep {
     }
 }
 
+# GP_ManualHome: Revoke travel and output permissions after an external Home event.
+sub GP_ManualHome {
+    my ($c,$device)=@_;
+    for my $r (GP_Residents($c)) {
+        next unless $defs{$r}{ROOMMATE} eq $device->{NAME};
+        # ROOMMATE bindings are unique.
+        last unless GP_EffectiveMode($c,$r,0) eq 'active';
+        my $s=GP_State($c,$r,0);
+        delete $s->{trip}; GP_CancelArrival($s,GP_Now(),'manual home');
+        delete $s->{last_trip}{exits} if $s->{last_trip};
+        $s->{members}={};
+        $s->{phase}='home'; $s->{boundary}=GP_Now(); GP_RevokeOutputs($s);
+        $s->{position_time}=$s->{boundary}; $s->{desired_status}='home';
+        GP_ResetNegative($s,$s->{boundary});
+        GP_Trace($s,GP_Now(),'manual home; no opening');
+        GP_ClearCheckpoint($r,'Manual Home state completed the trip');
+        last;
+    }
+    return;
+}
+
 # GeoPresence_Notify: Maintain configuration, revocations, and feedback from FHEM events.
 sub GeoPresence_Notify {
     my ($c,$device)=@_;
@@ -4081,23 +4126,50 @@ sub GeoPresence_Notify {
             $actor->{completion}//=$result if defined($result);
         }
     }
-    return if $c->{helper}{gp}{own_status};
-    # ROOMMATE duration updates occur every minute. They cannot be a manual
-    # arrival and need neither a resident scan nor a state allocation.
-    return unless grep {/\A(?:state: )?home\z/} @$events;
-    for my $r (GP_Residents($c)) {
-        next unless $defs{$r}{ROOMMATE} eq $device->{NAME};
-        next unless GP_EffectiveMode($c,$r,0) eq 'active';
-        my $s=GP_State($c,$r,0);
-        delete $s->{trip}; GP_CancelArrival($s,GP_Now(),'manual home');
-        delete $s->{last_trip}{exits} if $s->{last_trip};
-        $s->{members}={};
-        $s->{phase}='home'; $s->{boundary}=GP_Now(); GP_RevokeOutputs($s);
-        $s->{position_time}=$s->{boundary}; $s->{desired_status}='home';
-        GP_ResetNegative($s,$s->{boundary});
-        GP_Trace($s,GP_Now(),'manual home; no opening');
-        GP_ClearCheckpoint($r,'Manual Home state completed the trip');
+    return unless ($device->{TYPE}//'') eq 'ROOMMATE';
+    my $request=$c->{helper}{gp}{status_request};
+    return if $request && $request->{manual_home} && $request->{manual_home}{$device};
+    my $batch=$device->{CHANGED}//$events;
+    # Echo attribution needs only zero, one or multiple Home events.
+    my $home_events=0;
+    for my $event (@$events) {
+        next unless $event =~ /\A(?:state: )?home\z/;
+        last if ++$home_events==2;
     }
+    my $home_state=GP_Read($device->{NAME},'state','') eq 'home';
+    # With no normalized view, a mapped 'home' may actually mean absence.
+    $home_events=0 if $home_events && !$home_state && $batch==$events
+        && GP_Attr($device->{NAME},'eventMap','');
+    # ROOMMATE emits lastState with a state transition. setreading can instead
+    # emit only the mapped Home value, which may itself have a Reading prefix.
+    my $home_evidence=$home_events;
+    if (!$home_evidence && $home_state) {
+        for my $event (@$batch) {
+            next unless $event =~ /\AlastState: /;
+            $home_evidence=1;
+            last;
+        }
+    }
+    if (!$home_evidence && $home_state && GP_Attr($device->{NAME},'eventMap','')) {
+        my $mapped_home=ReplaceEventMap($device->{NAME},'home',1);
+        for my $event (@$batch) {
+            $home_evidence=$event eq $mapped_home || $event !~ /\A[\w.-]+: /;
+            if (!$home_evidence) {
+                # Decode the final value with FHEM's user mapping, as notify does.
+                # Repeated trigger mapping need not leave the first Home alias.
+                my (undef,@plain)=ReplaceEventMap($device->{NAME},[$device->{NAME},$event],0);
+                $home_evidence=join(' ',@plain) =~ /\A(?:state:? )?home\z/;
+            }
+            last if $home_evidence;
+        }
+    }
+    return unless $home_evidence;
+    if ($request && $request->{device}==$device && $request->{status} eq 'home'
+        && $request->{home_written} && !$request->{home_seen}++) {
+        return if $home_events<=1;
+    }
+    GP_ManualHome($c,$device);
+    $request->{manual_home}{$device}=1 if $request;
     return;
 }
 
@@ -5522,6 +5594,7 @@ get Geo.PERSON explain debug</pre>
   <a id="GeoPresence-readings"></a>
   <h4>Readings and logs</h4>
   <p><code>gp_roommate_error</code> reports a failed ROOMMATE status update. The current desired status is retried on the next timer pass, unless a newer status or context change supersedes it. The error clears when the update is accepted or ROOMMATE already has the requested status. Repeated identical failures produce one operational warning, followed by one recovery message. These retries never create opening permissions.</p>
+  <p>A manual ROOMMATE Home event revokes that resident's pending arrival and output permissions, including inside another resident's status callback. During a status command, actual Home writes are attributed to the device, expected status and command context; foreign or additional Home writes revoke permissions immediately. Exactly one attributable own echo is ignored. Other receivers may delete and recreate the shared event view or rewrite eventMap text repeatedly without hiding the Home write. Outside the status command, normalized Home events and the actual Home reading with ROOMMATE state events identify manual arrivals. The configured Home event value also covers setreading updates after cache deletion when that value has a reading prefix, such as state: Zuhause. For repeatedly transformed prefixed values, FHEM's configured usr mapping translates the final event back to its Home meaning. Later mood changes preserve an already attributed own Home echo. Feedback for already dispatched actuators continues to be observed.</p>
   <p>Production resident readings prefixed with gp_ show snapshots such as phase, location, trip and door/garage results. Locations store production geometry in gp_geometry. These readings are diagnostic and do not restore executable permissions. Debug uses get explain with debug, get debugTrace and the separate diagnostic file instead of updating readings.</p>
   <p>The normal FHEM log contains English production area transitions, phone presence changes, opening requests and feedback, switch requests and messages handed to pushMsg. A message handoff is not a delivery receipt and door pulse confirmation is not proof that the door is physically open. Configured aliases, labels and message text are kept verbatim. The standard verbose attribute controls this normal output; detailed structured diagnostics go exclusively to logFile according to debugLog, even at verbose 5.</p>
   <p>Timer statistics and diagnostic files are never used to restore permissions. Logging failures do not change webhook acceptance or decision state. The timer reuses prepared configuration and static validation until relevant configuration changes; current source health and transport errors remain live. Unchanged idle ticks report zero device scans and configuration builds. The next tick is scheduled one second after completion; statistics distinguish callback work from delays caused elsewhere in FHEM.</p>

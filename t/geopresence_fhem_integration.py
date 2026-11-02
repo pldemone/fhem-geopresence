@@ -700,6 +700,216 @@ def check_lifecycle(command, request, advance, web_port, check):
                 "GeoPresence_Timer($defs{GP});; return 'fixture restored' }")
 
 
+def check_roommate_echoes(command, check):
+    original_offset = float(command("{ $main::GP_fixture_offset }"))
+    try:
+        for line in ("define rr_Status ROOMMATE", "attr rr_Status rr_locationUnderway underway",
+                     "define Geo.Status GeoPresence resident GP rr_Status",
+                     "attr Geo.Status sourceMode phone_only", "attr Geo.Status phoneProxies p1,p2",
+                     "set Geo.Status mode active", "set Geo.Test mode active", "set GP mode active"):
+            response = command(line)
+            check(response == "", "prepare status callback fixture: " + line + ": " + response)
+        check(command("get GP validate").startswith("OK:"), "status callback fixture validates")
+        for line in ("define rr_Observer ROOMMATE", "attr rr_Observer disable 1",
+                     "attr rr_Observer rr_presenceDevices rr_Test"):
+            check(command(line) == "", "prepare real ROOMMATE event receiver: " + line)
+        command("{ no warnings 'redefine';; *GP_PrepareStatusArrival=sub { "
+                "GP_ResetController($defs{GP});; GeoPresence_Timer($defs{GP});; "
+                "$main::GP_fixture_offset+=40;; "
+                "my $c=$defs{GP};; my $cfg=GP_Config($c,'Geo.Test');; my $s=GP_State($c,'Geo.Test',0);; "
+                "CommandSet(undef,'rr_Test state absent');; "
+                "GP_Process($s,$cfg,{kind=>'geo',zone=>'Z.Work',entry=>0,time=>GP_Now(),received=>GP_Now(),key=>'status-departure'},GP_Now(),GP_Mono());; "
+                "$main::GP_fixture_offset+=90;; "
+                "GP_Process($s,$cfg,{kind=>'geo',zone=>'Z.Home',entry=>1,motion=>'automotive',time=>GP_Now(),received=>GP_Now(),key=>'status-arrival'},GP_Now(),GP_Mono());; "
+                "if ($_[0]) { $main::GP_fixture_offset+=1;; GP_ConfirmArrival($s,$cfg,GP_Now(),GP_Mono()) };; "
+                "return ($c,$cfg,$s) };; return 'prepared' }")
+
+        event_mappings = [
+                (None, "home"),
+                ("home:Zuhause", "Zuhause"),
+                ("/home:at home/", "at.home"),
+                ("{ dev=>{'^home$'=>'state: Zuhause'}, usr=>{'^state: Zuhause$'=>'home'} }", "state:.Zuhause"),
+                ("{ dev=>{'^home$'=>'arrival: Zuhause'}, usr=>{'^arrival: Zuhause$'=>'home'} }", "arrival:.Zuhause")]
+        for depth, prefix, cycle in ((2, "state", False), (8, "arrival", False), (2, "state", True)):
+            labels = [f"{prefix}: Place{step}" for step in range(1, depth + 1)]
+            forward = [("home", labels[0]), *zip(labels[:-1], labels[1:])]
+            if cycle:
+                forward.append((labels[-1], labels[0]))
+            dev = ",".join(f"'^{source}$'=>'{target}'" for source, target in forward)
+            usr = ",".join(f"'^{label}$'=>'home'" for label in labels)
+            event_mappings.append((f"{{ dev=>{{{dev}}}, usr=>{{{usr}}} }}", labels[0].replace(" ", ".")))
+        mood_updates = ";;".join(f"set rr_Test mood {mood}" for mood in ("happy", "calm") * 4 + ("happy",))
+        for event_map, home_pattern in event_mappings:
+            command("set GP mode debug")
+            command("set Geo.Test mode debug")
+            check(command("attr rr_Test eventMap " + event_map if event_map else "deleteattr rr_Test eventMap") == "",
+                  "configure ROOMMATE event mapping")
+            command("set Geo.Test mode active")
+            command("set GP mode active")
+            normal = json.loads(command(
+                "{ my ($c,$cfg,$s)=GP_PrepareStatusArrival(1);; my $revision=$s->{output_revision};; "
+                "CommandSet(undef,'rr_Test state absent');; $s->{desired_status}='home';; my $writer=\\&setReadingsVal;; GP_Publish($c,'Geo.Test',$cfg,$s);; "
+                "return JSON::PP::encode_json({unchanged=>$s->{output_revision}==$revision?1:0,plans=>scalar @{$s->{intents}},"
+                "status=>ReadingsVal('rr_Test','state',''),marker=>$c->{helper}{gp}{status_request}?1:0,client=>defined($defs{rr_Test}{CL})?1:0,"
+                "writer_restored=>\\&setReadingsVal==$writer?1:0}) }")
+            )
+            check(normal == {"unchanged": 1, "plans": 2, "status": "home", "marker": 0, "client": 0, "writer_restored": 1},
+                  f"eventMap={event_map}: own Home echo preserves plans and leaves no temporary command context")
+
+            for scenario in ("foreign_pending", "foreign_planned", "same_absent", "same_home_cycle",
+                             "foreign_nested_pending", "foreign_nested_planned", "foreign_two_batches"):
+                for order in ("00", "99"):
+                    foreign = scenario.startswith("foreign")
+                    nested = "nested" in scenario or scenario == "foreign_two_batches"
+                    publisher = "Geo.Status" if foreign else "Geo.Test"
+                    target = "rr_Status" if foreign else "rr_Test"
+                    desired = "absent" if scenario == "same_absent" else "home"
+                    callback = "set rr_Test state home"
+                    if scenario == "same_home_cycle":
+                        callback = "set rr_Test state absent;;set rr_Test state home"
+                    elif nested:
+                        callback = "set rr_Test mood happy"
+                        if scenario == "foreign_two_batches":
+                            callback += ";;set rr_Test mood calm"
+                    nested_notify = (
+                        "CommandDefine(undef,'Status.Nested notify rr_Test:mood:.happy set rr_Test state home');; "
+                        f"$defs{{'Status.Nested'}}{{NTFY_ORDER}}='{order}-Status.Nested';; " if nested else "")
+                    result = json.loads(command(
+                        f"{{ my ($c,$cfg,$s)=GP_PrepareStatusArrival({0 if scenario.endswith('pending') else 1});; "
+                        "my $revision=$s->{output_revision};; "
+                        f"setReadingsVal($defs{{'{target}'}},'state','{'home' if desired == 'absent' else 'absent'}',FmtDateTime(GP_Now()));; "
+                        f"CommandDefine(undef,'Status.Callback notify {target}:state:.{desired} {callback}');; "
+                        "CommandAttr(undef,'Status.Callback addStateEvent 1');; "
+                        f"$defs{{'Status.Callback'}}{{NTFY_ORDER}}='{order}-Status.Callback';; "
+                        + nested_notify + "createNtfyHash();; "
+                        f"my $pub=GP_State($c,'{publisher}',0);; $pub->{{desired_status}}='{desired}';; "
+                        f"GP_Publish($c,'{publisher}',GP_Config($c,'{publisher}'),$pub);; "
+                        "CommandDelete(undef,'Status.Callback');; "
+                        "CommandDelete(undef,'Status.Nested') if $defs{'Status.Nested'};; "
+                        "return JSON::PP::encode_json({revoked=>$s->{output_revision}>$revision?1:0,"
+                        "trip=>$s->{trip}?1:0,arrival=>$s->{arrival}?1:0,plans=>scalar @{$s->{intents}},"
+                        "checkpoint=>JSON::PP::decode_json(ReadingsVal('Geo.Test','gp_trip_checkpoint','{}'))->{status}}) }")
+                    )
+                    check(result == {"revoked": 1, "trip": 0, "arrival": 0, "plans": 0, "checkpoint": "none"},
+                          f"{scenario}, notify order {order}, eventMap={event_map}: nested Home revokes permissions: {result}")
+
+            for cached in (False, True):
+                for planned in (0, 1):
+                    for setter in ("CommandSet", "CommandSetReading"):
+                        event = "state:.home" if cached else home_pattern
+                        result = json.loads(command(
+                            f"{{ my ($c,$cfg,$s)=GP_PrepareStatusArrival({planned});; my $revision=$s->{{output_revision}};; "
+                            f"CommandDefine(undef,'Status.Callback notify rr_Test:{event} {mood_updates}');; "
+                            f"CommandAttr(undef,'Status.Callback addStateEvent {int(cached)}');; "
+                            "$defs{'Status.Callback'}{NTFY_ORDER}='00-Status.Callback';; createNtfyHash();; "
+                            f"{setter}(undef,'rr_Test state home');; CommandDelete(undef,'Status.Callback');; "
+                            "return JSON::PP::encode_json({revoked=>$s->{output_revision}>$revision?1:0,"
+                            "trip=>$s->{trip}?1:0,arrival=>$s->{arrival}?1:0,plans=>scalar @{$s->{intents}}}) }")
+                        )
+                        check(result == {"revoked": 1, "trip": 0, "arrival": 0, "plans": 0},
+                              f"eventMap={event_map}, cached={cached}, planned={planned}, {setter}: mood remapping cannot hide manual Home")
+
+            benign = json.loads(command(
+                "{ my ($c,$cfg,$s)=GP_PrepareStatusArrival(1);; my $revision=$s->{output_revision};; "
+                "CommandDefine(undef,'Status.Callback notify rr_Test:state:.home set rr_Test mood happy;;set rr_Test mood calm;;set rr_Test mood happy');; "
+                "CommandAttr(undef,'Status.Callback addStateEvent 1');; "
+                "$defs{'Status.Callback'}{NTFY_ORDER}='99-Status.Callback';; createNtfyHash();; "
+                "$s->{desired_status}='home';; GP_Publish($c,'Geo.Test',$cfg,$s);; CommandDelete(undef,'Status.Callback');; "
+                "return JSON::PP::encode_json({unchanged=>$s->{output_revision}==$revision?1:0,plans=>scalar @{$s->{intents}}}) }")
+            )
+            check(benign == {"unchanged": 1, "plans": 2},
+                  f"eventMap={event_map}: later mood changes retain the already attributed own Home echo")
+
+            command("attr rr_Observer disable 0")
+            for order in ("00", "70"):
+                command(f"{{ $defs{{rr_Observer}}{{NTFY_ORDER}}='{order}-rr_Observer';; createNtfyHash();; return 'receiver ordered' }}")
+                for planned in (0, 1):
+                    for setter in ("CommandSet", "CommandSetReading"):
+                        result = json.loads(command(
+                            f"{{ my ($c,$cfg,$s)=GP_PrepareStatusArrival({planned});; my $revision=$s->{{output_revision}};; "
+                            f"{setter}(undef,'rr_Test state home');; "
+                            "return JSON::PP::encode_json({revoked=>$s->{output_revision}>$revision?1:0,"
+                            "trip=>$s->{trip}?1:0,arrival=>$s->{arrival}?1:0,plans=>scalar @{$s->{intents}}}) }")
+                        )
+                        check(result == {"revoked": 1, "trip": 0, "arrival": 0, "plans": 0},
+                              f"eventMap={event_map}, receiver={order}, planned={planned}, {setter}: cache deletion cannot hide Home")
+
+                own = json.loads(command(
+                    "{ my ($c,$cfg,$s)=GP_PrepareStatusArrival(1);; my $revision=$s->{output_revision};; "
+                    "$s->{desired_status}='home';; GP_Publish($c,'Geo.Test',$cfg,$s);; "
+                    "return JSON::PP::encode_json({unchanged=>$s->{output_revision}==$revision?1:0,plans=>scalar @{$s->{intents}}}) }")
+                )
+                check(own == {"unchanged": 1, "plans": 2},
+                      f"eventMap={event_map}, receiver={order}: cache deletion preserves the actual own Home echo")
+
+            late = json.loads(command(
+                "{ my ($c,$cfg,$s)=GP_PrepareStatusArrival(0);; my $revision=$s->{output_revision};; "
+                "setReadingsVal($defs{rr_Test},'state','home',FmtDateTime(GP_Now()));; "
+                "CommandDefine(undef,'Status.Callback notify rr_Test:absent set rr_Test state home');; "
+                "$defs{'Status.Callback'}{NTFY_ORDER}='99-Status.Callback';; createNtfyHash();; "
+                "$s->{desired_status}='absent';; GP_Publish($c,'Geo.Test',$cfg,$s);; CommandDelete(undef,'Status.Callback');; "
+                "return JSON::PP::encode_json({revoked=>$s->{output_revision}>$revision?1:0,trip=>$s->{trip}?1:0,arrival=>$s->{arrival}?1:0}) }")
+            )
+            check(late == {"revoked": 1, "trip": 0, "arrival": 0},
+                  f"eventMap={event_map}: late Home revokes after a real receiver deleted the prior state view")
+
+            foreign = json.loads(command(
+                "{ my ($c,$cfg,$s)=GP_PrepareStatusArrival(0);; my $revision=$s->{output_revision};; "
+                "CommandSet(undef,'rr_Status state absent');; "
+                "CommandDefine(undef,'Status.Callback notify rr_Status:home set rr_Test mood happy');; "
+                "CommandDefine(undef,'Status.Nested notify rr_Test:mood:.happy set rr_Test state home');; "
+                "$defs{'Status.Nested'}{NTFY_ORDER}='99-Status.Nested';; createNtfyHash();; "
+                "my $other=GP_State($c,'Geo.Status',0);; $other->{desired_status}='home';; "
+                "GP_Publish($c,'Geo.Status',GP_Config($c,'Geo.Status'),$other);; "
+                "CommandDelete(undef,'Status.Callback');; CommandDelete(undef,'Status.Nested');; "
+                "return JSON::PP::encode_json({revoked=>$s->{output_revision}>$revision?1:0,trip=>$s->{trip}?1:0,arrival=>$s->{arrival}?1:0}) }")
+            )
+            check(foreign == {"revoked": 1, "trip": 0, "arrival": 0},
+                  f"eventMap={event_map}: nested foreign Home revokes after receiver cache deletion")
+            command("attr rr_Observer disable 1")
+
+        result = json.loads(command(
+            "{ my ($c,$cfg,$s)=GP_PrepareStatusArrival(1);; my $revision=$s->{output_revision};; "
+            "CommandSet(undef,'rr_Test state absent');; $s->{desired_status}='home';; "
+            "my $original=$modules{ROOMMATE}{SetFn};; my $nested=0;; "
+            "no warnings 'redefine';; local *GP_NestedStatusSet=sub { "
+            "if (!$nested) { $nested=1;; CommandSet(undef,'rr_Test state home') };; "
+            "no strict 'refs';; return &{$original}(@_) };; "
+            "{ local $modules{ROOMMATE}{SetFn}='GP_NestedStatusSet';; GP_Publish($c,'Geo.Test',$cfg,$s) };; "
+            "return JSON::PP::encode_json({revoked=>$s->{output_revision}>$revision?1:0,plans=>scalar @{$s->{intents}}}) }")
+        )
+        check(result == {"revoked": 1, "plans": 0},
+              "an identical nested Home before the own adapter update is not accepted as the own echo")
+
+        command("set GP mode debug")
+        command("set Geo.Test mode debug")
+        check(command("attr rr_Test eventMap home:Zuhause absent:home") == "",
+              "configure distinct Home and absence event names")
+        command("set Geo.Test mode active")
+        command("set GP mode active")
+        absence = json.loads(command(
+            "{ GP_ResetController($defs{GP});; GeoPresence_Timer($defs{GP});; $main::GP_fixture_offset+=40;; "
+            "my $c=$defs{GP};; my $cfg=GP_Config($c,'Geo.Test');; my $s=GP_State($c,'Geo.Test',0);; "
+            "setReadingsVal($defs{rr_Test},'state','home',FmtDateTime(GP_Now()));; "
+            "GP_Process($s,$cfg,{kind=>'geo',zone=>'Z.Work',entry=>0,time=>GP_Now(),received=>GP_Now(),key=>'mapped-absence'},GP_Now(),GP_Mono());; "
+            "my $revision=$s->{output_revision};; GP_Publish($c,'Geo.Test',$cfg,$s);; "
+            "return JSON::PP::encode_json({unchanged=>$s->{output_revision}==$revision?1:0,armed=>($s->{trip}{armed}//0),"
+            "status=>ReadingsVal('rr_Test','state','')}) }")
+        )
+        check(absence == {"unchanged": 1, "armed": 1, "status": "absent"},
+              "an absence event named home does not revoke a trip when the actual Home event has another name")
+    finally:
+        command("{ CommandDelete(undef,$_) for grep {$defs{$_}} ('Status.Callback','Status.Nested');; return 'callbacks removed' }")
+        command("set GP mode debug")
+        command("set Geo.Test mode debug")
+        command("deleteattr rr_Test eventMap")
+        command("delete Geo.Status")
+        command("delete rr_Status")
+        command("delete rr_Observer")
+        command(f"{{ $main::GP_fixture_offset={original_offset};; GP_ResetController($defs{{GP}});; "
+                "GeoPresence_Timer($defs{GP});; return 'fixture restored' }")
+
+
 def run(source, encoding="bytestream", help_only=False):
     repo = Path(__file__).resolve().parents[1]
     with tempfile.TemporaryDirectory(prefix="geopresence-test-") as directory:
@@ -905,6 +1115,7 @@ def run(source, encoding="bytestream", help_only=False):
             command("{ no warnings 'redefine';; $main::GP_fixture_offset=0;; *GP_Now=sub { ($main::GP_fixture_fixed_wall // Time::HiRes::time())+$main::GP_fixture_offset };; *GP_Mono=sub { Time::HiRes::clock_gettime(Time::HiRes::CLOCK_MONOTONIC())+$main::GP_fixture_offset };; return 'clock set' }")
             check_http_quotas(command, http_request, request, auth_headers, password, check)
             check_lifecycle(command, request, advance, web_port, check)
+            check_roommate_echoes(command, check)
             check_auth_key_names(command, http_request, auth_headers, password, check)
             check(command("attr GP verbose 4") == "", "normal controller verbosity accepted")
             check(command("attr GP logFile ./log/geopresence-%Y-%m.log") == "", "separate monthly diagnostic log configured")
