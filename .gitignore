@@ -28,3 +28,4 @@ geopresence-test-*.json
 # Python bytecode.
 __pycache__/
 *.py[cod]
+/AGENTS.md
