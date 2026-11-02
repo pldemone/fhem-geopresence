@@ -4071,6 +4071,56 @@ subtest 'fresh contexts do not reuse trip IDs when clocks and startup counters r
         'long device names do not exceed the existing checkpoint ID limit');
 };
 
+subtest 'clock revocations keep each context and its later trip IDs bounded' => sub {
+    for my $debug (0,1) {
+      for my $legacy (0,1) {
+        my ($c,$cfg)=fixture();my $s=GP_State($c,'Geo.Test',$debug);
+        $s->{generation}.=':clock' x 40 if $legacy;
+        my %contexts=($s->{generation}=>1);my %trips;
+        my ($bounded,$unique,$trip_bounded)=(1,1,1);
+        for (1..64) {
+            $now+=60;$mono+=1;GP_CheckClock($s,$cfg,$now,$mono);
+            $bounded=0 unless $s->{generation} =~ /\A[0-9a-f]{64}\z/;
+            $unique=0 if $contexts{$s->{generation}}++;
+            my $trip=GP_StartTrip($s,ev('Home',0,$now),'local');
+            $trip_bounded=0 if length($trip->{id})>256;
+            $unique=0 if $trips{$trip->{id}}++;
+        }
+        ok($bounded,"debug=$debug, legacy=$legacy: every clock reset produces a bounded context");
+        ok($unique,'revoked contexts and later trip IDs are never reused');
+        ok($trip_bounded,'later trip IDs remain within the existing checkpoint limit');
+        is($s->{output_revision},64,'every clock reset still revokes output permissions');
+        ok(!@{$s->{intents}} && !$s->{arrival},'clock resets preserve no output or pending arrival');
+      }
+    }
+};
+
+subtest 'new trips remain restorable after repeated clock corrections' => sub {
+    for my $corrections (32,64) {
+        my ($c,$cfg,$s)=saved_trip_fixture('remote');my $old_id=$s->{trip}{id};
+        for (1..$corrections) {$now+=60;$mono+=1;GP_CheckClock($s,$cfg,$now,$mono);}
+        ok(!$s->{trip},'the old trip is revoked');
+        GP_Publish($c,'Geo.Test',$cfg,$s);
+        is(JSON::PP::decode_json(GP_Read('Geo.Test','gp_trip_checkpoint',''))->{status},'none',
+            'the revoked trip cannot remain a qualified checkpoint');
+        advance(40);process($s,$cfg,'Work',1);GP_Publish($c,'Geo.Test',$cfg,$s);
+        my $saved=JSON::PP::decode_json(GP_Read('Geo.Test','gp_trip_checkpoint',''));
+        is($saved->{status},'qualified',"$corrections corrections: a new departure is saved");
+        isnt($saved->{trip}{id},$old_id,'the new trip has a different identity');
+        cmp_ok(length($saved->{trip}{id}),'<=',256,'the saved trip fits the unchanged reader limit');
+        my $id=$saved->{trip}{id};my $away=$saved->{trip}{away_time};
+        ($cfg,$s)=simulate_process_restart($c);
+        is($s->{resume}{status},'restored','the new trip is restored after restart');
+        is(($s->{trip}//{})->{id},$id,'restoration keeps the saved trip ID');
+        is(($s->{trip}//{})->{away_time},$away,'restoration keeps the original absence evidence');
+        ok(!$s->{arrival} && !@{$s->{intents}},'restart creates no pending arrival or output');
+        is(scalar @commands,0,'restart alone issues no device command');
+        advance(40);arrive($s,$cfg,'walking');actor_fresh();GP_Dispatch($c,'Geo.Test',$cfg,$s,0,$now,$mono);
+        is_deeply([grep {/^(?:door|garage) /} @commands],['door lock unlocked'],
+            'only a new qualified return can open, and walking still excludes the garage');
+    }
+};
+
 subtest 'a restored legacy ID is retained while subsequent trips use the new session' => sub {
     for my $version (1,2) {
         my ($c,$cfg,$s)=saved_trip_fixture('remote');

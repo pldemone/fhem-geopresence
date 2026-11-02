@@ -1,6 +1,6 @@
 # GeoPresence – Architektur
 
-**Version 0.77 · Stand 02.11.2026 · Handbuch 2.39**
+**Version 0.78 · Stand 02.11.2026 · Handbuch 2.40**
 
 Diese Beschreibung spezifiziert den aktuellen Aufbau von `FHEM/98_GeoPresence.pm`. Einrichtung und Bedienung stehen im [Handbuch](GeoPresence_Handbuch.md); Prüfabläufe und Testprogramm sind in der [Testanleitung](GeoPresence_Testanleitung.md) beschrieben. Gerätenamen wie `Geo.PERSON` und `Geo.PERSON.ORT` sind austauschbare Beispiele.
 
@@ -466,7 +466,9 @@ Ein gültiger Ausflug behält seine Kennung und seinen Ortsverlauf, startet im n
 
 Bei einem wiederhergestellten telefonbestätigten Ausflug liefert `saved_at` eine konservative zusätzliche Rückkehrgrenze. Sie wird auf die neue monotone Uhr abgebildet; ursprünglicher Abwesenheitsbeginn und volle Mindestfristen bleiben zusätzlich wirksam. Alte Ereignisdatensätze und Ankunftstimer werden dafür nicht übernommen. Neue Rückkehrbeobachtungen müssen ohnehin nach dem neuen Sitzungsbeginn liegen. Eine erst nach der anfänglichen Wiederherstellungsprüfung verfügbare gültige Vorstart-Anwesenheit darf die ältere übernommene Reise weiterhin widerrufen, aber keine Ankunftsaktion ausführen.
 
-`GP_NewState` bildet jede neue Kontextkennung einmalig als Hash aus dem bisherigen Kontextbezug, einem Zufallswert, Prozesskennung sowie absoluter und monotoner Startzeit. Die Kennung hat auch bei langen Gerätenamen eine feste Länge. Neue Reise-IDs bestehen weiterhin aus der Kontextkennung und einem lokalen Zähler; zurückgesetzte Start- und Reisezähler allein erzeugen damit nach einem Prozessneustart keine alten IDs mehr. Produktion und Debug sowie wiederholte Debug-Resets erhalten jeweils eigene Kennungen, auch bei gleichen Uhrzeiten. Eine wiederhergestellte Reise behält dagegen ihre gespeicherte ID; erst spätere neue Reisen verwenden die neue Kennung. Die Berechnung erfolgt nur bei der Zustandsanlage, ohne zusätzliche Persistenz oder Änderung des Checkpoint-Formats.
+`GP_NewState` bildet jede neue Kontextkennung einmalig als Hash aus dem bisherigen Kontextbezug, einem Zufallswert, Prozesskennung sowie absoluter und monotoner Startzeit. Die Kennung besteht auch bei langen Gerätenamen aus 64 hexadezimalen Zeichen. Neue Reise-IDs bestehen weiterhin aus der Kontextkennung und einem lokalen Zähler; zurückgesetzte Start- und Reisezähler allein erzeugen damit nach einem Prozessneustart keine alten IDs mehr. Produktion und Debug sowie wiederholte Debug-Resets erhalten jeweils eigene Kennungen, auch bei gleichen Uhrzeiten. Eine wiederhergestellte Reise behält dagegen ihre gespeicherte ID; erst spätere neue Reisen verwenden die neue Kennung.
+
+Bei einem Uhrwiderruf wird die bisherige Kontextkennung zusammen mit dem Widerrufsanlass erneut mit SHA-256 gehasht. Dadurch erhält der widerrufene Kontext eine andere Kennung mit weiterhin 64 Zeichen. Das gilt auch für bereits verlängerte Kennungen eines älteren Laufzeitstands. Die Grenze von 256 Zeichen für Reise-IDs im Checkpoint-Leser bleibt erhalten; wiederholte Uhrkorrekturen lassen neue Kennungen nicht über diese Grenze wachsen. Der vorhandene Zufallsbezug wird über die bisherige Kennung weiterverwendet. Die Berechnung erfolgt nur bei Zustandsanlage oder Uhrwiderruf, ohne zusätzliche Persistenz oder Änderung des Checkpoint-Formats.
 
 Eine abgeschlossene oder widerrufene Reise schreibt einen nicht qualifizierten Checkpoint. Das gilt auch bei blockierten Ausgaben oder vorübergehend gestörtem Listener. Die Entwertung wird vor produktiven Aktoraufrufen geschrieben, sodass synchrones Speichern oder Reload innerhalb eines Gerätecalls keine bereits verbrauchte Reise wiederbelebt. Modus- und relevante Konfigurationsänderungen entwerten den Stand ausdrücklich; Debug und Lernen erzeugen keine produktiven Checkpoints. Laufende Aktorrückmeldungen können bei Reload weiterhin passiv beobachtet werden, während ein Prozessneustart daraus keine neuen Befehle erzeugt.
 
@@ -543,6 +545,11 @@ Weitere Prüfungen umfassen abgeschlossene Geo- und telefonbestätigte Reisen mi
 Die Prüfungen der Telefonverarbeitung sichern die fachlichen Abläufe im Zustands- und Messmodus ab. Direkte interne Testereignisse enthalten die Pflichtfelder des regulären Erzeugers. Eine zusätzliche Gegenprobe qualifiziert Abwesenheit im Zustands- und Messmodus, prüft unveränderte Negativwerte und meldet anschließend einen Quellenfehler. Der Fehler muss auch nach bereits bestätigter Abwesenheit erkannt werden; eine bloße Wiederverbindung mit alten Werten genügt nicht, neue Beobachtungen und eine vollständige erneuerte Frist bleiben erforderlich.
 
 ## 13. Änderungen seit der letzten Version
+
+Änderungen von Version 0.77 auf 0.78:
+
+- Kontextkennungen beim Uhrwiderruf mit fester Länge neu gebildet; neue Reisen bleiben auch nach wiederholten Uhrkorrekturen innerhalb der bestehenden Checkpoint-Grenze.
+- Gespeicherte gültige Reise-IDs, ursprüngliche Abwesenheitsnachweise und die Entwertung alter Ausgabepläne bleiben erhalten.
 
 Änderungen von Version 0.76 auf 0.77:
 

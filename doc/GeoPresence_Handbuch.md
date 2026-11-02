@@ -1,6 +1,6 @@
 # GeoPresence – Handbuch
 
-**Version 2.39 · Stand 02.11.2026 · Architektur 0.77**
+**Version 2.40 · Stand 02.11.2026 · Architektur 0.78**
 
 GeoPresence ist eine Anwesenheits- und Ortssteuerung für FHEM. Es wertet aus, wer zu Hause ist, wer das Haus verlassen hat und wer zurückkehrt, und verbindet diese Informationen mit konfigurierbaren Automationen. So lässt sich beispielsweise beim Betreten eines Gartenbereichs ein Licht einschalten, beim Erreichen eines Arbeitsortes eine Nachricht senden oder bei einer berechtigten Heimkehr die vorhandene Tür- und Garagensteuerung ansprechen. Ziel ist, solche Aktionen passend zur Situation auszuführen und Fehlreaktionen auf einzelne unzuverlässige Meldungen zu vermeiden.
 
@@ -752,6 +752,8 @@ GeoPresence behält dafür aktuelle Verbrauchsstände und Cooldowns statt einer 
 Nach Neustart, rereadcfg oder Modulreload prüft GeoPresence den gespeicherten Stand. Identität, Kennwortbindung, Quellenprofil, relevante Konfiguration und Geometrie müssen passen; eine spätere lokale Anwesenheit oder ein späteres ROOMMATE `home` widerspricht dem Ausflug. Die ursprüngliche Abwesenheitsbestätigung darf standardmäßig höchstens 48 Stunden alt sein. `trip_resume_max_age` am Controller legt diese Grenze in Sekunden fest; Speichern oder wiederholtes Neustarten erneuert den Nachweis nicht.
 
 Ein fortgesetzter Ausflug behält seine Reise-ID. Neue Ausflüge verwenden die neue Sitzungskennung mit einem zufälligen Anteil und einem laufenden Zähler. So führt ein nach dem Neustart zurückgesetzter Zähler nicht zur erneuten Vergabe der alten Reise-ID. Das gilt auch für neue Simulationen; vorhandene gültige Checkpoints bleiben lesbar.
+
+Ein erkannter größerer Uhrsprung widerruft die aktuelle Reise und ihre Öffnungsfreigaben. Die Sitzungskennung wird dabei mit fester Länge neu gebildet. Auch nach vielen Uhrkorrekturen können spätere, neu bestätigte Ausflüge deshalb innerhalb der bestehenden Kennungsgrenze gespeichert und wiederhergestellt werden.
 
 Wird eine gesunde gehaltene Anwesenheitsmeldung erst nach der Übernahme des Ausflugs nachgeliefert, kann sie dessen ältere Berechtigung noch widerrufen, auch wenn ihre Beobachtung vor dem Neustart lag. Sie holt keine historische Öffnung nach und setzt keine jüngere bekannte Position zurück.
 

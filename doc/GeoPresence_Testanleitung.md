@@ -1,6 +1,6 @@
 # GeoPresence – Testanleitung
 
-**Version 4.35 · Stand 02.11.2026 · Handbuch 2.39 · Architektur 0.77**
+**Version 4.36 · Stand 02.11.2026 · Handbuch 2.40 · Architektur 0.78**
 
 Diese Anleitung beschreibt die Prüfung einer eingerichteten GeoPresence-Anlage. Die Testanwendung simuliert Alltagswege und prüft deren neue Diagnosezeilen; gezielte App-Tests prüfen eigene Orts- und Gruppenregeln. Einrichtung, Begriffe und Parameter stehen im [Handbuch](GeoPresence_Handbuch.md).
 
@@ -376,6 +376,8 @@ Die Wiederherstellung betrifft ausschließlich produktive, bestätigte Ausflüge
 Im Diagnosefile heißt die erfolgreiche Übernahme `qualified unfinished trip restored; waiting for a new return`, Quelle restart. `gp_resume_status=rejected` beziehungsweise Restart recovery: Rejected nennt einen konkreten Grund, etwa abweichende Konfiguration, spätere Heimkehr oder einen abgelaufenen Abwesenheitsnachweis. Der Standard für die Wiederaufnahme beträgt 48 Stunden ab ursprünglicher Abwesenheitsbestätigung; die Ankunftsfristen selbst werden dadurch nicht verändert.
 
 Ohne neue Fachdaten bleiben Inhalt, `saved_at` und Reading-Zeitstempel von `gp_trip_checkpoint` auch nach Diagnoseeinträgen, identischen Webhook-Wiederholungen oder erfolgreicher Wiederherstellung unverändert. Neue Orts- oder Bewegungsnachweise, tatsächliche Datenabläufe und verbrauchte beziehungsweise widerrufene Berechtigungen müssen den gespeicherten Stand dagegen aktualisieren. `saved_at` zeigt den Speicherzeitpunkt und erneuert nicht den ursprünglichen Abwesenheitsnachweis.
+
+Die automatisierten Kennungsprüfungen widerrufen produktive und Debug-Kontexte wiederholt durch Uhrkorrekturen. Auch bereits verlängerte alte Laufzeitkennungen müssen nach jedem Widerruf wieder 64 Zeichen lang sein; widerrufene Kennungen werden nicht erneut vergeben. Nach 32 beziehungsweise 64 Widerrufen wird ein neuer Ausflug bestätigt, gespeichert und nach einem simulierten Prozessneustart übernommen. Reise-ID und ursprünglicher Abwesenheitsnachweis bleiben dabei erhalten. Der Start allein erzeugt keine Ausgabe; erst eine neue berechtigte Rückkehr darf öffnen. Die bestehende Lesergrenze von 256 Zeichen und die Übernahme gültiger alter Reise-IDs bleiben unverändert.
 
 Ein gültiger alter Checkpoint der Version 1 wird beim Update einmal in Version 2 übertragen. Dabei bleiben der ursprüngliche Ausflug, aktuelle Verbrauchsstände und benötigte Cooldowns erhalten; nach diesem einmaligen Formatwechsel gilt wieder die unveränderte Speicherung aus dem vorigen Absatz. Auch mit `cooldown 0` darf dieselbe bereits verbrauchte Ortsaktion nach der Übernahme oder einem weiteren Neustart nicht erneut ausgeführt werden. Erst ein neuer gültiger Besuch beziehungsweise Ausflug kann sie nach ihrem Regelvertrag erneut erlauben.
 

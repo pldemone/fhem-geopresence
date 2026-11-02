@@ -2265,7 +2265,9 @@ sub GP_CheckClock {
         delete @{$s}{qw(trip arrival approach automotive motion motion_time position_time desired_status resume_event_floor)};
         $s->{phone}=GP_NewPhone(GP_UsesSource($cfg->{sourceMode},'phone'));
         $s->{zones}={}; $s->{members}={}; $s->{phase}='unknown'; $s->{boundary}=0; $s->{start}=$now;
-        GP_RevokeOutputs($s); $s->{generation}.=':clock';
+        GP_RevokeOutputs($s);
+        # Rehash the namespace so repeated clock resets keep later trip IDs bounded.
+        $s->{generation}=sha256_hex($s->{generation}.':clock');
         GP_Trace($s,$now,'clock discontinuity; permissions revoked');
     }
     $s->{wall}=$now; $s->{mono}=$mono;
