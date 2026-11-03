@@ -1,6 +1,6 @@
 # GeoPresence – Handbuch
 
-**Version 2.40 · Stand 02.11.2026 · Architektur 0.78**
+**Version 2.41 · Stand 02.11.2026 · Architektur 0.79**
 
 GeoPresence ist eine Anwesenheits- und Ortssteuerung für FHEM. Es wertet aus, wer zu Hause ist, wer das Haus verlassen hat und wer zurückkehrt, und verbindet diese Informationen mit konfigurierbaren Automationen. So lässt sich beispielsweise beim Betreten eines Gartenbereichs ein Licht einschalten, beim Erreichen eines Arbeitsortes eine Nachricht senden oder bei einer berechtigten Heimkehr die vorhandene Tür- und Garagensteuerung ansprechen. Ziel ist, solche Aktionen passend zur Situation auszuführen und Fehlreaktionen auf einzelne unzuverlässige Meldungen zu vermeiden.
 
@@ -747,7 +747,9 @@ Ein Neustart während deiner Abwesenheit kann den bereits bestätigten Ausflug f
 
 Der gespeicherte Stand wird bei Änderungen am Ausflug aktualisiert. Identische Webhook-Wiederholungen, reine Diagnoseeinträge und unveränderte Timerläufe schreiben ihn nicht erneut; auch ein Neustart allein erneuert im aktuellen Format seinen Speicherzeitpunkt nicht. Neue gültige Bewegungsdaten, entfallene Nachweise und verbrauchte Berechtigungen werden weiterhin gespeichert.
 
-GeoPresence behält dafür aktuelle Verbrauchsstände und Cooldowns statt einer wachsenden Liste alter Besuche. Beim Update wird ein gültiger alter Checkpoint einmal in das kompakte Format Version 2 übernommen. Der ursprüngliche Ausflug und bereits verbrauchte Aktionen bleiben erhalten; die Umstellung holt keine Befehle nach und erneuert den Abwesenheitsnachweis nicht. Ein bereits verworfener oder ungültiger alter Stand wird dadurch nicht wieder gültig.
+GeoPresence behält dafür aktuelle Verbrauchsstände und Cooldowns statt einer wachsenden Liste alter Besuche. Beim Update werden gültige Checkpoints der Versionen 1 und 2 einmal in das Format Version 3 übernommen. Der ursprüngliche Ausflug und bereits verbrauchte Aktionen bleiben erhalten; die Umstellung holt keine Befehle nach und erneuert den Abwesenheitsnachweis nicht. Ein bereits verworfener oder ungültiger alter Stand wird dadurch nicht wieder gültig.
+
+Der Checkpoint hält zusätzlich fest, wie viel der Cooldown-Sperrzeit beim Speichern tatsächlich verstrichen war. Eine dort noch offene Restzeit läuft nach dem Neustart weiter; Zeit seit diesem Speicherstand und während des Stillstands wird vorsichtshalber nicht angerechnet. Waren beispielsweise 290 von 300 Sekunden abgelaufen, bleibt die Aktion nach dem Neustart noch zehn Sekunden gesperrt. Bereits beim Speichern abgelaufene Sperren beginnen nicht erneut. Ältere Formate liefern als Ausgangspunkt den Abstand zwischen ihrem Speicherzeitpunkt und der letzten Aktion; frühere Uhrkorrekturen lassen sich daraus nicht nachträglich ermitteln.
 
 Nach Neustart, rereadcfg oder Modulreload prüft GeoPresence den gespeicherten Stand. Identität, Kennwortbindung, Quellenprofil, relevante Konfiguration und Geometrie müssen passen; eine spätere lokale Anwesenheit oder ein späteres ROOMMATE `home` widerspricht dem Ausflug. Die ursprüngliche Abwesenheitsbestätigung darf standardmäßig höchstens 48 Stunden alt sein. `trip_resume_max_age` am Controller legt diese Grenze in Sekunden fest; Speichern oder wiederholtes Neustarten erneuert den Nachweis nicht.
 
@@ -872,6 +874,8 @@ Im Messmodus muss jeder Sensor wiederholt aktuelle Messungen liefern; deren Gül
 | `arrivalFilter` | `any` oder `vehicle`; Standard `any` | Zusätzlicher Filter nur für arrival |
 | `action` | Ein vorhandenes GeoPresence-Aktionsgerät | Auszuführender Auftrag |
 | `cooldown` | 300; ganze Sekunden 0–86400 | Mindestabstand von Nachrichten-/Schaltplänen derselben Aktion je Person |
+
+Die Sperrzeit läuft anhand der monotonen Uhr. Kleine Vor- oder Rückwärtskorrekturen der Systemzeit verkürzen oder verlängern sie nicht. Ein unterdrückter Kandidat startet die Sperre nicht erneut. Für die Wiederherstellung nach Neustart gilt die gespeicherte Restzeit aus [[#8.4 Neustart während eines Ausflugs|Abschnitt 8.4]].
 
 `cooldown 0` hebt den Schutz gegen Wiederholung desselben Besuchs nicht auf. Eine Richtungsregel mit `afterExit` wird für denselben Ausflug und gewählten Ort beziehungsweise dieselbe Gruppe nicht wiederholt. Öffnungsaufträge haben unabhängig davon ihren eigenen Schutz je Ausflug und Aktor.
 

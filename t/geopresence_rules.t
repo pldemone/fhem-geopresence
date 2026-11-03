@@ -265,6 +265,50 @@ subtest 'cooldown stays shared across visit and trip slots without consuming sup
     is(scalar(grep {$_->{kind} eq 'switch_on'} @{$s->{intents}}),0,'consumed trip rule does not repeat after cooldown');
 };
 
+subtest 'ordinary action cooldowns follow elapsed time through small wall-clock corrections' => sub {
+    for my $action (qw(A.Message A.Light)) {
+        for my $correction (-20,20) {
+            my ($c)=rules_fixture();
+            def('R.Cooldown','rule GP');
+            $attr{'R.Cooldown'}={residents=>'Geo.Test',trigger=>'enter',locations=>'Z.Work,Z.Work2',
+                action=>$action,cooldown=>300};
+            my $cfg=GP_Config($c,'Geo.Test',1); my $s=GP_State($c,'Geo.Test',1);
+            my $generation=$s->{generation};
+            event($s,$cfg,'Work',1);
+            my ($wall,$planned)=($now,$mono);
+            is(scalar(grep {$_ eq 'R.Cooldown'} @{plans($s)}),1,"$action first visit planned");
+            advance(290); $now+=$correction;
+            event($s,$cfg,'Work2',1);
+            is($s->{generation},$generation,"$correction second correction stays within clock tolerance");
+            is(scalar(grep {$_ eq 'R.Cooldown'} @{plans($s)}),0,'new visit stays blocked after 290 elapsed seconds');
+            is($s->{action_last}{$action},$wall,'suppression keeps the original absolute plan time');
+            is($s->{action_last_mono}{$action},$planned,'suppression does not restart the cooldown');
+            advance(10); event($s,$cfg,'Work2',1);
+            is(scalar(grep {$_ eq 'R.Cooldown'} @{plans($s)}),1,'unconsumed visit is allowed at exactly 300 elapsed seconds');
+            advance(301); event($s,$cfg,'Work2',1);
+            is(scalar(grep {$_ eq 'R.Cooldown'} @{plans($s)}),0,'elapsed cooldown cannot replay the same visit');
+        }
+    }
+};
+
+subtest 'imported legacy cooldowns retain zero-cooldown visit protection' => sub {
+    for my $cooldown (0,300) {
+        my ($c)=rules_fixture();
+        def('R.Cooldown','rule GP');
+        $attr{'R.Cooldown'}={residents=>'Geo.Test',trigger=>'enter',locations=>'Z.Work',
+            action=>'A.Light',cooldown=>$cooldown};
+        my $cfg=GP_Config($c,'Geo.Test',1); my $s=GP_State($c,'Geo.Test',1);
+        $s->{action_last}{'A.Light'}=$now+20; delete $s->{action_last_mono};
+        GP_RestoreActionClocks($s,$now,$mono);
+        event($s,$cfg,'Work',1);
+        is(scalar(grep {$_ eq 'R.Cooldown'} @{plans($s)}),$cooldown ? 0:1,
+            'a future legacy wall time blocks only a positive cooldown');
+        advance(300); $now-=20; event($s,$cfg,'Work',1);
+        is(scalar(grep {$_ eq 'R.Cooldown'} @{plans($s)}),$cooldown ? 1:0,
+            'legacy mapping follows monotonic time and retains zero-cooldown consumption');
+    }
+};
+
 subtest 'same-time, missing and revoked history cannot satisfy afterExit' => sub {
     my ($c,$cfg,$s)=rules_fixture();
     event($s,$cfg,'Helper',0);is_deeply(plans($s),[],'no prior history');

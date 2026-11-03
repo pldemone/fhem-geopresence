@@ -1701,7 +1701,7 @@ sub GP_NewState {
     return {start=>$now, generation=>$generation, phase=>'unknown', zones=>{}, seen=>{}, seen_order=>[],
         boundary=>0, seq=>0, phone=>GP_NewPhone(GP_UsesSource($source_mode,'phone')),
         last_decision=>'initialized', last_reason=>'new session; no qualified trip restored',
-        mono=>$mono, wall=>$now, output_revision=>0, action_visits=>{}, action_last=>{}, trace=>[], intents=>[]};
+        mono=>$mono, wall=>$now, output_revision=>0, action_visits=>{}, action_last=>{}, action_last_mono=>{}, trace=>[], intents=>[]};
 }
 
 # GP_RevokeOutputs: Invalidate existing intent revisions and clear pending output plans.
@@ -2022,6 +2022,7 @@ sub GP_CompactConsumption {
     delete $state->{notify_order};
     $trip->{actions}={}; $state->{action_visits}={};
     $state->{action_last}={map {$_=>$last->{$_}} grep {exists $last->{$_}} keys %{$slots->{last}}};
+    delete $state->{action_last_mono};
     for my $key (keys %{$slots->{trip}}) {
         my $opening=GP_IsOpening($slots->{trip}{$key});
         my $old;
@@ -2038,6 +2039,16 @@ sub GP_CompactConsumption {
         my ($action,$trigger,$selector)=split /\|/,$key,3;
         $state->{action_visits}{$key}=$visit if $seen->{join('|',$action,$trigger,$visit,$selector)};
     }
+}
+
+# GP_RestoreActionClocks: Map saved cooldown ages or legacy plan times onto the current monotonic clock.
+sub GP_RestoreActionClocks {
+    my ($s,$wall,$mono,$elapsed)=@_;
+    $s->{action_last_mono}={map {
+        my $age=$elapsed ? $elapsed->{$_} : $wall-$s->{action_last}{$_};
+        $age=0 if $age<0;
+        $_=>$mono-$age
+    } keys %{$s->{action_last}//{}}};
 }
 
 # GP_Rules: Plan matching actions after permission, consumption, and cooldown checks.
@@ -2075,10 +2086,15 @@ sub GP_Rules {
         if (defined($consumed->{$key}) && $consumed->{$key}==$visit) {
             $skip->($opening ? 'action already consumed in this trip':"$label already consumed"); next;
         }
-        if (!$opening && defined($s->{action_last}{$rule->{action}})
-            && $now-$s->{action_last}{$rule->{action}}<$rule->{cooldown}) { $skip->("$label cooldown"); next; }
+        unless ($opening) {
+            my $last=$s->{action_last_mono}{$rule->{action}};
+            if (defined($last) && $rule->{cooldown}>0 && $mono-$last<$rule->{cooldown}) {
+                $skip->("$label cooldown"); next;
+            }
+            $s->{action_last}{$rule->{action}}=$now;
+            $s->{action_last_mono}{$rule->{action}}=$mono;
+        }
         $consumed->{$key}=$visit;
-        $s->{action_last}{$rule->{action}}=$now unless $opening;
         $s->{checkpoint_dirty}=1;
         my %history=length($after) ? (after_exit=>$after,exit_time=>$exit):();
         $history{trip}=$s->{trip}{id} if $trip_bound;
@@ -2894,7 +2910,7 @@ sub GP_WriteHTTP {
 sub GP_ClearCheckpoint {
     my ($r,$reason)=@_;
     my $d=$defs{$r} or return;
-    my $value=$GP_CHECKPOINT_JSON->encode({version=>2,status=>'none',reason=>$reason});
+    my $value=$GP_CHECKPOINT_JSON->encode({version=>3,status=>'none',reason=>$reason});
     return if GP_Read($r,'gp_trip_checkpoint','') eq $value;
     setReadingsVal($d,'gp_trip_checkpoint',$value,POSIX::strftime('%Y-%m-%d %H:%M:%S',localtime(GP_Now())));
 }
@@ -2936,10 +2952,15 @@ sub GP_Checkpoint {
         && (!$qualified || !$s->{checkpoint_dirty})
         && ($s->{checkpoint_value}//'') eq GP_Read($r,'gp_trip_checkpoint','');
     if ($qualified) {
-        my $checkpoint={version=>2,status=>'qualified',saved_at=>GP_Now(),
+        my ($now,$mono)=(GP_Now(),GP_Mono());
+        GP_RestoreActionClocks($s,$now,$mono) unless exists $s->{action_last_mono};
+        # Durations survive a restart; raw monotonic clock values do not.
+        my $elapsed={map {$_=>$mono-$s->{action_last_mono}{$_}}
+            keys %{$s->{action_last}}};
+        my $checkpoint={version=>3,status=>'qualified',saved_at=>$now,
             revision=>GP_ResumeRevision($c,$r,$cfg),
             trip=>{map {$_=>$t->{$_}} grep {exists $t->{$_}} @GP_CHECKPOINT_TRIP_FIELDS},
-            state=>{map {$_=>$s->{$_}} grep {exists $s->{$_}}
+            state=>{action_elapsed=>$elapsed,map {$_=>$s->{$_}} grep {exists $s->{$_}}
                 (@GP_CHECKPOINT_STATE_FIELDS,qw(action_visits action_last))}};
         my $value=eval {$GP_CHECKPOINT_JSON->encode($checkpoint)};
         if (defined($value) && length($value)<=65536) {
@@ -2961,7 +2982,7 @@ sub GP_ResumeTrip {
     my $raw=GP_Read($r,'gp_trip_checkpoint','');
     $s->{resume}={status=>'none',reason=>'No saved qualified trip'};
     return unless length($raw);
-    my ($checkpoint,$trip,$state,$legacy);
+    my ($checkpoint,$trip,$state,$legacy,$timed);
     my ($now,$mono)=(GP_Now(),GP_Mono());
     my $error;
     {
@@ -2970,9 +2991,10 @@ sub GP_ResumeTrip {
             die "checkpoint too large\n" if length($raw)>65536;
             $checkpoint=$GP_CHECKPOINT_JSON->decode($raw);
             die "invalid checkpoint structure\n" unless ref($checkpoint) eq 'HASH'
-                && !ref($checkpoint->{version}) && ($checkpoint->{version}//'') =~ /\A[12]\z/
+                && !ref($checkpoint->{version}) && ($checkpoint->{version}//'') =~ /\A[123]\z/
                 && !ref($checkpoint->{status}) && ($checkpoint->{status}//'') =~ /\A(?:qualified|none)\z/;
             $legacy=$checkpoint->{version}==1;
+            $timed=$checkpoint->{version}==3;
             if ($checkpoint->{status} eq 'qualified') {
                 die "resident is not active\n" unless GP_EffectiveMode($c,$r,0) eq 'active';
                 die "configuration or identity changed\n" unless $cfg->{geometry_ready}
@@ -2987,7 +3009,8 @@ sub GP_ResumeTrip {
                 # Accept persisted travel fields only; runtime queues and timers are not restorable.
                 my %trip_keys=map {$_=>1} @GP_CHECKPOINT_TRIP_FIELDS;
                 my %state_keys=map {$_=>1} (@GP_CHECKPOINT_STATE_FIELDS,
-                    $legacy ? qw(notify_seen notify_order notify_last) : qw(action_visits action_last));
+                    $legacy ? qw(notify_seen notify_order notify_last) : qw(action_visits action_last),
+                    $timed ? ('action_elapsed'):());
                 die "unsupported checkpoint fields\n" if grep {!$trip_keys{$_}} keys %$trip;
                 die "unsupported checkpoint fields\n" if grep {!$state_keys{$_}} keys %$state;
                 die "invalid departure reason\n" if exists($trip->{away_reason})
@@ -3016,6 +3039,7 @@ sub GP_ResumeTrip {
                 }
                 die "missing consumption state\n" if !$legacy && (ref($trip->{actions}) ne 'HASH'
                     || ref($state->{action_visits}) ne 'HASH' || ref($state->{action_last}) ne 'HASH');
+                die "missing cooldown timing\n" if $timed && ref($state->{action_elapsed}) ne 'HASH';
                 for my $ref (keys %{$trip->{exits}//{}}) {
                     my $time=$trip->{exits}{$ref};
                     die "invalid prior exit\n" unless ($ref =~ /\Alocation:(.+)\z/ && $cfg->{zones}{$1}
@@ -3032,10 +3056,17 @@ sub GP_ResumeTrip {
                             && $v->{time}<=$checkpoint->{saved_at}+$cfg->{future_tolerance};
                     }
                 }
-                for my $key (qw(zone_visits group_visits),$legacy ? qw(notify_seen notify_last) : qw(action_visits action_last)) {
+                for my $key (qw(zone_visits group_visits),$legacy ? qw(notify_seen notify_last) : qw(action_visits action_last),
+                    $timed ? ('action_elapsed'):()) {
                     die "invalid saved counters\n" if exists($state->{$key}) && ref($state->{$key}) ne 'HASH';
                     for my $v (values %{$state->{$key}//{}}) {
-                        die "invalid saved counter\n" unless GP_Number($v) && $v>=0;
+                        # JSON decoding may stringify small elapsed durations with an exponent.
+                        my $numeric=$key eq 'action_elapsed'
+                            ? defined($v) && !ref($v)
+                                && $v =~ /\A-?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?\z/
+                                && POSIX::isfinite($v)
+                            : GP_Number($v);
+                        die "invalid saved counter\n" unless $numeric && $v>=0;
                     }
                 }
                 for my $spec ([zone_visits=>'zones'],[group_visits=>'groups']) {
@@ -3065,6 +3096,11 @@ sub GP_ResumeTrip {
                         && $v<=(($state->{$slot->[0]}//{})->{$slot->[1]}//0);
                 }
                 die "invalid action cooldown\n" if grep {!exists $slots->{last}{$_}} keys %{$state->{action_last}//{}};
+                if ($timed) {
+                    die "inconsistent cooldown timing\n" if
+                        (grep {!exists $state->{action_elapsed}{$_}} keys %{$state->{action_last}})
+                        || scalar(keys %{$state->{action_elapsed}})!=scalar(keys %{$state->{action_last}});
+                }
                 # Later local presence overrides the saved absence, even if the checkpoint is valid.
                 my $rrtime=GP_ReadingTime($cfg->{roommate},'state');
                 die "a later ROOMMATE Home state superseded the departure\n" if defined($rrtime)
@@ -3091,7 +3127,11 @@ sub GP_ResumeTrip {
     return unless $checkpoint->{status} eq 'qualified';
     # Monotonic origins belong to the NEW process. Carry absolute evidence
     # times across reboot; never reuse a pending dwell timer or old queue.
+    my $elapsed=delete $state->{action_elapsed};
     $s->{$_}=$state->{$_} for keys %$state;
+    # Resume only elapsed time confirmed at the save. Offline wall-clock changes
+    # cannot shorten a cooldown; older formats can supply only the saved wall age.
+    GP_RestoreActionClocks($s,$checkpoint->{saved_at},$mono,$elapsed);
     $s->{zones}{$_}{role}=$cfg->{zones}{$_}{role} for keys %{$s->{zones}};
     $s->{trip}=$trip;
     $s->{trip}{away_mono}=$mono-($now-$trip->{away_time});
@@ -3102,7 +3142,7 @@ sub GP_ResumeTrip {
         qualified_mono=>$mono-($now-$checkpoint->{saved_at})}
         if ($trip->{away_reason}//'') eq $GP_PHONE_DEPARTURE_REASON;
     $s->{phase}='away';
-    $s->{checkpoint_dirty}=$legacy ? 1:0;
+    $s->{checkpoint_dirty}=$timed ? 0:1;
     $s->{checkpoint_trip}=$trip->{id};
     $s->{checkpoint_value}=$raw;
     $s->{resume_event_floor}=$s->{start};
@@ -4970,8 +5010,9 @@ set Geo.PERSON mode debug</pre>
   <p>Production activation validates configuration and checks for conflicting legacy arrival paths. Set the ROOMMATE's rr_locationUnderway to underway, remove old rr_geofenceUUIDs and disable the old arrival handlers before activation. Resident and private-location configuration requires that resident to be effectively debug or disabled; shared changes require pausing all affected residents. Controller configuration requires controller debug or disabled. Changes revoke the affected journeys. Diagnostic settings debugLog, logFile and standard verbose can be changed during production without resetting trips or learning.</p>
   <h5>Persistence</h5>
   <p>FHEM rename updates GeoPresence's internal controller and parent bindings, including saved definitions. A controller rename closes its old HTTP clients and rebinds the listener under the new owner. A resident rename moves its stored password verifier and retains its request quota. Affected trips and pending commands are revoked; already dispatched actuator feedback remains observed. Public rule and external-device attribute references require explicit correction after validation. Use save after correcting the configuration. If credential migration fails, gp_auth_error keeps authentication blocked across reloads; repair the key store and set webhookPassword again. Affected Geo residents are disabled.</p>
-  <p>Use FHEM's normal save mechanism for definitions, attributes and production readings. A deviceId confirmed with learnConfirm is an ordinary configuration attribute; learnConfirm does not call save. Production geometry is stored in gp_geometry. A qualified unfinished production trip is stored as one versioned gp_trip_checkpoint reading. Version 2 stores current consumption and cooldowns instead of old visit histories; valid version 1 data is imported once without replaying actions or renewing departure evidence. After restart, rereadcfg or module reload it can resume if identity, configuration, geometry and the trip_resume_max_age limit still match and no later Home or indoor presence contradicts it. A NEW return is required; startup alone never opens, and old arrival timers, queued commands, unconfirmed departures and debug trips never resume. The checkpoint is consumed before dispatching opening commands. gp_resume_status/gp_resume_reason and explain describe restoration or rejection.</p>
-  <p>A restored trip keeps its saved ID. Each new runtime context adds a fresh random session component; new trip IDs use that context and a local counter, so restarting the counters alone cannot recreate an old ID. This also applies to new debug contexts. Existing version 1 and 2 checkpoints remain readable.</p>
+  <p>Use FHEM's normal save mechanism for definitions, attributes and production readings. A deviceId confirmed with learnConfirm is an ordinary configuration attribute; learnConfirm does not call save. Production geometry is stored in gp_geometry. A qualified unfinished production trip is stored as one versioned gp_trip_checkpoint reading. Version 3 stores current consumption, original absolute plan times and elapsed cooldown durations. Valid version 1 and 2 data is imported once without replaying actions or renewing departure evidence. After restart, rereadcfg or module reload it can resume if identity, configuration, geometry and the trip_resume_max_age limit still match and no later Home or indoor presence contradicts it. A NEW return is required; startup alone never opens, and old arrival timers, queued commands, unconfirmed departures and debug trips never resume. The checkpoint is consumed before dispatching opening commands. gp_resume_status/gp_resume_reason and explain describe restoration or rejection.</p>
+  <p>A restored cooldown resumes the remainder recorded at the last checkpoint. Time since that save, including downtime, is conservatively not credited because intervening clock corrections cannot be verified. A cooldown already expired at the save remains expired. Older formats derive their initial elapsed duration from the saved checkpoint time and the last plan time; earlier clock corrections cannot be reconstructed.</p>
+  <p>A restored trip keeps its saved ID. Each new runtime context adds a fresh random session component; new trip IDs use that context and a local counter, so restarting the counters alone cannot recreate an old ID. This also applies to new debug contexts. Checkpoint versions 1, 2 and 3 remain readable.</p>
   <p>Checkpoints use the ordinary FHEM state file; no additional database or automatic configuration save is used. A clean shutdown writes the state file; after an abrupt crash only the last successfully written state is available, so observations missed during downtime cannot be reconstructed. Test requests never promote debug geometry or permissions. Learning results for a configured phone remain available in the current process after learnConfirm or timeout; a restart, new learning session, phone identity change or resident deletion discards them. An unconfirmed phone candidate is also discarded by cancellation, relevant configuration/password changes or module reload.</p>
 
   <p>Productive resident readings <code>gp_arrival_pending</code>, <code>gp_arrival_motion</code>, <code>gp_arrival_wait</code> and <code>gp_arrival_deadline</code> show the provisional return (deadline in Unix seconds). Debug exposes the same information under <code>state.arrival</code> in <code>get System.GeoPresence explain Geo.PERSON debug format=json</code>. English diagnostics include <code>arrival pending</code>, <code>arrival cancelled</code> and <code>arrival confirmed</code>, with motion, wait and confirmation source. These details are written only to the separate diagnostic file.</p>
@@ -5585,7 +5626,7 @@ get Geo.PERSON explain debug</pre>
       <p><b>Applies to:</b> Rule<br>
       <b>Default:</b> <code>300</code> seconds<br>
       <b>Range:</b> integer 0&ndash;86400</p>
-      <p>Minimum interval for notification/switch plans using the same action within a resident's state. This is not a global door/garage lockout.</p>
+      <p>Minimum interval for notification/switch plans using the same action within a resident's state, measured by the monotonic clock. Wall-clock corrections do not change this interval, and suppressed candidates do not restart it. A restored qualified trip resumes the cooldown remainder recorded at its last checkpoint. This is not a global door/garage lockout.</p>
       <p>Duplicate events and repeated entries in the same visit remain suppressed even with 0; switch_on needs a new exit and entry for another visit.</p>
       <p><b>Example:</b></p>
       <pre style="white-space: pre-wrap; overflow-wrap: anywhere;">attr Geo.Rule.PERSONGarden cooldown 300</pre>

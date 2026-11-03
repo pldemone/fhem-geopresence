@@ -4122,11 +4122,12 @@ subtest 'new trips remain restorable after repeated clock corrections' => sub {
 };
 
 subtest 'a restored legacy ID is retained while subsequent trips use the new session' => sub {
-    for my $version (1,2) {
+    for my $version (1,2,3) {
         my ($c,$cfg,$s)=saved_trip_fixture('remote');
         my $cp=JSON::PP::decode_json(GP_Read('Geo.Test','gp_trip_checkpoint',''));
         my $id=$cp->{trip}{id}='1:prod:Geo.Test:0:1';
         $cp->{version}=$version;
+        delete $cp->{state}{action_elapsed} if $version<3;
         if ($version==1) {
             delete $cp->{state}{action_visits};
             $cp->{state}{notify_seen}={'A.Msg|enter|1|group:Work'=>1};
@@ -4149,7 +4150,7 @@ subtest 'a restored legacy ID is retained while subsequent trips use the new ses
         is_deeply($s->{trip}{actions},{},'new trip starts with its own unconsumed actions');
         my $new=JSON::PP::decode_json(GP_Read('Geo.Test','gp_trip_checkpoint',''));
         is($new->{trip}{id},$s->{trip}{id},'new checkpoint contains the new trip ID');
-        is($new->{version},2,'ID change needs no new checkpoint format');
+        is($new->{version},3,'new trip uses the current checkpoint format');
     }
 };
 
@@ -4223,6 +4224,97 @@ subtest 'accepted travel observations persist memberships, exits and visit consu
     is($s->{group_visits}{Work},2,'latest visit recovered after restart');
     is($s->{action_last}{'A.Msg'},$cp->{state}{action_last}{'A.Msg'},'cooldown recovered after restart');
     is(scalar @messages,1,'restart did not repeat the notification');
+};
+
+subtest 'checkpointed cooldowns retain elapsed time across clock corrections and repeated restarts' => sub {
+    for my $correction (-20,20) {
+        my ($c,$cfg,$s)=saved_trip_fixture('remote');
+        my $planned=$s->{action_last}{'A.Msg'};
+        advance(290); $now+=$correction; process($s,$cfg,'Work',0);
+        GP_Checkpoint($c,'Geo.Test',$cfg,$s);
+        my $cp=JSON::PP::decode_json(GP_Read('Geo.Test','gp_trip_checkpoint',''));
+        is($cp->{state}{action_last}{'A.Msg'},$planned,'saving retains the original absolute plan time');
+        is($cp->{state}{action_elapsed}{'A.Msg'},290,"$correction second correction does not change saved elapsed time");
+        ok(!exists($cp->{state}{action_last_mono}),'raw monotonic clock values are not persisted');
+        is_deeply(checkpoint_work(sub {($cfg,$s)=simulate_process_restart($c)}),[0,0],
+            'restoring a current checkpoint does not rewrite it');
+        is($s->{resume}{status},'restored','corrected-clock checkpoint restores the trip');
+        is($mono-$s->{action_last_mono}{'A.Msg'},290,'unverified downtime does not shorten the remaining cooldown');
+        ok(!exists($s->{action_elapsed}),'portable elapsed map is not retained as a second runtime clock');
+        advance(5); process($s,$cfg,'Work',1);
+        is(scalar @{$s->{intents}},0,'new visit is suppressed with five seconds remaining');
+        GP_Checkpoint($c,'Geo.Test',$cfg,$s);
+        $cp=JSON::PP::decode_json(GP_Read('Geo.Test','gp_trip_checkpoint',''));
+        is($cp->{state}{action_elapsed}{'A.Msg'},295,'a later save records progress without renewing the original plan');
+        is($cp->{state}{action_last}{'A.Msg'},$planned,'suppressed visit leaves absolute plan time unchanged');
+        ($cfg,$s)=simulate_process_restart($c);
+        advance(1); process($s,$cfg,'Work',0);
+        is($mono-$s->{action_last_mono}{'A.Msg'},296,'another restart retains the last saved remainder');
+        advance(4); process($s,$cfg,'Work',1);
+        is(scalar @{$s->{intents}},1,'new visit runs after exactly 300 confirmed seconds');
+        is($s->{action_last}{'A.Msg'},$now,'only an accepted new plan updates the absolute timestamp');
+    }
+};
+
+subtest 'very short saved cooldown durations survive JSON conversion and restart' => sub {
+    for my $duration (0.00001,0.000099,0.0001) {
+        my ($c,$cfg,$s)=saved_trip_fixture('remote');
+        my ($id,$away,$planned)=($s->{trip}{id},$s->{trip}{away_time},$s->{action_last}{'A.Msg'});
+        advance($duration); process($s,$cfg,'Work',0); GP_Checkpoint($c,'Geo.Test',$cfg,$s);
+        my $raw=GP_Read('Geo.Test','gp_trip_checkpoint','');
+        like($raw,qr/"action_elapsed":\{"A\.Msg":\d+(?:\.\d+)?[eE]-\d+\}/,
+            'writer emitted a small duration in exponent notation') if $duration<0.0001;
+        my $cp=JSON::PP::decode_json($raw); my $elapsed=$cp->{state}{action_elapsed}{'A.Msg'};
+        cmp_ok(abs($elapsed-$duration),'<',0.000000001,'writer preserves the elapsed fraction');
+        ($cfg,$s)=simulate_process_restart($c);
+        is($s->{resume}{status},'restored',"$duration second duration is accepted after JSON decoding");
+        next unless $s->{resume}{status} eq 'restored';
+        is($s->{trip}{id},$id,'restoration retains the original trip');
+        is($s->{trip}{away_time},$away,'restoration does not renew the absence evidence');
+        is($s->{action_last}{'A.Msg'},$planned,'original absolute plan time is retained');
+        cmp_ok(abs(($mono-$s->{action_last_mono}{'A.Msg'})-$elapsed),'<',0.000000001,
+            'restoration retains the small elapsed duration on the new clock');
+        is(GP_Read('Geo.Test','gp_trip_checkpoint',''),$raw,'restoration does not rewrite the valid checkpoint');
+        ok(!@{$s->{intents}} && !@commands && !@messages,'restart creates no output');
+        advance(1); process($s,$cfg,'Work',1);
+        is(scalar @{$s->{intents}},0,'new visit still observes the remaining cooldown');
+    }
+};
+
+subtest 'older cooldown checkpoints upgrade once using elapsed time at the save' => sub {
+    for my $version (1,2) {
+        my ($c,$cfg,$s)=saved_trip_fixture('remote');
+        advance(290); process($s,$cfg,'Work',0); GP_Checkpoint($c,'Geo.Test',$cfg,$s);
+        my $cp=JSON::PP::decode_json(GP_Read('Geo.Test','gp_trip_checkpoint',''));
+        my $last=$cp->{state}{action_last};
+        $cp->{version}=$version; delete $cp->{state}{action_elapsed};
+        if ($version==1) {
+            delete $cp->{state}{action_visits};
+            $cp->{state}{notify_last}=delete $cp->{state}{action_last};
+            $cp->{state}{notify_seen}={'A.Msg|enter|1|group:Work'=>1};
+            $cp->{state}{notify_order}=['A.Msg|enter|1|group:Work'];
+        }
+        reading('Geo.Test','gp_trip_checkpoint',JSON::PP::encode_json($cp),$now);
+        is_deeply(checkpoint_work(sub {($cfg,$s)=simulate_process_restart($c)}),[1,1],
+            "version $version checkpoint is rewritten once");
+        is($s->{resume}{status},'restored','older checkpoint restores the original trip');
+        my $new=JSON::PP::decode_json(GP_Read('Geo.Test','gp_trip_checkpoint',''));
+        is($new->{version},3,'portable cooldown timing is stored after migration');
+        is($new->{state}{action_elapsed}{'A.Msg'},290,'migration uses the saved wall age without crediting downtime');
+        is_deeply($new->{state}{action_last},$last,'original absolute plan times are retained');
+        advance(1); process($s,$cfg,'Work',1);
+        is(scalar @{$s->{intents}},0,'older checkpoint does not bypass the remaining cooldown');
+        advance(1); process($s,$cfg,'Work',0); advance(8); process($s,$cfg,'Work',1);
+        is(scalar @{$s->{intents}},1,'imported cooldown expires on the new monotonic clock');
+    }
+};
+
+subtest 'a cooldown already expired at the save stays expired after restart' => sub {
+    my ($c,$cfg,$s)=saved_trip_fixture('remote');
+    advance(301); process($s,$cfg,'Work',0); GP_Checkpoint($c,'Geo.Test',$cfg,$s);
+    ($cfg,$s)=simulate_process_restart($c);
+    advance(1); process($s,$cfg,'Work',1);
+    is(scalar @{$s->{intents}},1,'new visit does not restart an expired cooldown');
 };
 
 subtest 'opening consumption is saved while duplicate rules leave it unchanged' => sub {
@@ -4346,7 +4438,7 @@ subtest 'thousands of visits retain one consumption slot and a small recoverable
     }
     GP_Checkpoint($c,'Geo.Test',$cfg,$s);
     my $raw=GP_Read('Geo.Test','gp_trip_checkpoint',''); my $cp=JSON::PP::decode_json($raw);
-    is($cp->{version},2,'compact checkpoint format written');
+    is($cp->{version},3,'compact checkpoint format written');
     is($cp->{status},'qualified','long-running ordinary activity did not discard the trip');
     is_deeply($s->{action_visits},{'A.Msg|enter|group:Work'=>2101},'one slot replaces all 2101 consumed visits');
     is_deeply($s->{action_last},{'A.Msg'=>$now},'one cooldown per action');
@@ -4386,7 +4478,7 @@ sub legacy_consumption_checkpoint {
     my $cp=JSON::PP::decode_json(GP_Read('Geo.Test','gp_trip_checkpoint','')); $cp->{version}=1;
     my $state=$cp->{state}; my $id=$cp->{trip}{id}; my $current=$past+1;
     $state->{zone_visits}{'Z.Work'}=$current; $state->{group_visits}{Work}=$current;
-    delete @{$state}{qw(action_visits action_last)};
+    delete @{$state}{qw(action_visits action_last action_elapsed)};
     $state->{notify_seen}={map {('A.Msg|enter|'.$_.'|group:Work')=>1} 1..$current};
     $state->{notify_seen}{'A.Msg|exit|'.$id.'|location:Z.Sternensteg'}=1;
     $state->{notify_seen}{'A.Msg|arrival|'.$id.'|arrival'}=1;
@@ -4402,13 +4494,14 @@ subtest 'version 1 recovery imports current visits, trip consumption and cooldow
     reading('Geo.Test','gp_trip_checkpoint',JSON::PP::encode_json($cp),$now);
     is_deeply(checkpoint_work(sub {($cfg,$s)=simulate_process_restart($c)}),[1,1],'legacy recovery rewrites only the compact checkpoint once');
     my $new=JSON::PP::decode_json(GP_Read('Geo.Test','gp_trip_checkpoint',''));
-    is($new->{version},2,'legacy format upgraded');
+    is($new->{version},3,'legacy format upgraded');
     is($new->{trip}{id},$id,'original trip identity retained');
     is($new->{trip}{away_time},$away,'original departure time retained');
     is_deeply($new->{trip}{actions},{'door_open|door'=>1,'garage_open|garage'=>1,
         'A.Msg|exit|location:Z.Sternensteg'=>1,'A.Msg|arrival|arrival'=>1},'only current trip consumption imported');
     is_deeply($new->{state}{action_visits},{'A.Msg|enter|group:Work'=>301},'only the current consumed visit imported');
     is_deeply($new->{state}{action_last},{'A.Msg'=>$cp->{state}{notify_last}{'A.Msg'}},'needed cooldown retained, obsolete action dropped');
+    is($new->{state}{action_elapsed}{'A.Msg'},0,'legacy timing does not credit unverified downtime');
     ok(!exists($s->{notify_seen}) && !exists($s->{notify_order}) && !exists($s->{notify_last}),'old runtime fields removed');
     advance(1); $s->{intents}=[];
     GP_Rules($s,$cfg,'enter',{zone=>'Z.Work',group=>'Work',selector=>'group:Work',time=>$now,received=>$now},$now,$mono);
@@ -4423,6 +4516,7 @@ subtest 'version 1 recovery imports current visits, trip consumption and cooldow
 subtest 'module reload compacts a live oversized legacy history before writing it' => sub {
     my ($c,$cfg,$s)=consumption_fixture(); my $id=$s->{trip}{id}; my $away=$s->{trip}{away_time};
     my $cp=legacy_consumption_checkpoint(1997);
+    $cp->{state}{notify_last}{'A.Msg'}=$now+20;
     cmp_ok(length(JSON::PP::encode_json($cp)),'>',65536,'equivalent old history exceeded the checkpoint limit');
     delete @{$s}{qw(action_visits action_last)};
     $s->{$_}=$cp->{state}{$_} for keys %{$cp->{state}};
@@ -4431,9 +4525,12 @@ subtest 'module reload compacts a live oversized legacy history before writing i
     $s=GP_State($c,'Geo.Test',0); $cfg=GP_Config($c,'Geo.Test');
     my $raw=GP_Read('Geo.Test','gp_trip_checkpoint',''); my $new=JSON::PP::decode_json($raw);
     is($new->{status},'qualified','live trip saved despite the old oversized history');
-    is($new->{version},2,'live state converted before checkpoint encoding');
+    is($new->{version},3,'live state converted before checkpoint encoding');
     is($s->{trip}{id},$id,'live trip survived reload');
     is($s->{trip}{away_time},$away,'reload did not renew departure evidence');
+    is($new->{state}{action_last}{'A.Msg'},$cp->{state}{notify_last}{'A.Msg'},'future absolute legacy plan time retained');
+    is($new->{state}{action_elapsed}{'A.Msg'},0,'legacy import clamps the future wall age before saving');
+    is($mono-$s->{action_last_mono}{'A.Msg'},0,'restored legacy cooldown starts from the imported monotonic origin');
     is_deeply($s->{action_visits},{'A.Msg|enter|group:Work'=>1998},'only the latest visit retained');
     is(scalar(keys %{$s->{trip}{actions}}),4,'opening, route and arrival consumption retained');
     cmp_ok(length($raw),'<',4096,'history replaced by a checkpoint below 4 KiB');
@@ -4444,7 +4541,7 @@ subtest 'module reload compacts a live oversized legacy history before writing i
 };
 
 subtest 'malformed or incomplete compact consumption cannot restore a permission' => sub {
-    for my $case (qw(missing_visits missing_cooldown missing_actions unknown_visit future_visit fractional_visit unknown_action action_value unknown_cooldown legacy_field)) {
+    for my $case (qw(missing_visits missing_cooldown missing_actions unknown_visit future_visit fractional_visit unknown_action action_value unknown_cooldown missing_elapsed missing_action_age extra_action_age mismatched_action_age negative_age negative_fractional_age nonnumeric_age infinite_age nan_age boolean_age null_age reference_age runtime_clock legacy_field)) {
         my ($c,$cfg,$s)=saved_trip_fixture('remote');
         my $cp=JSON::PP::decode_json(GP_Read('Geo.Test','gp_trip_checkpoint',''));
         if ($case eq 'missing_visits') {delete $cp->{state}{action_visits};}
@@ -4456,6 +4553,19 @@ subtest 'malformed or incomplete compact consumption cannot restore a permission
         elsif ($case eq 'unknown_action') {$cp->{trip}{actions}{'door_open|unknown'}=1;}
         elsif ($case eq 'action_value') {$cp->{trip}{actions}{'door_open|door'}=2;}
         elsif ($case eq 'unknown_cooldown') {$cp->{state}{action_last}{Unknown}=$now;}
+        elsif ($case eq 'missing_elapsed') {delete $cp->{state}{action_elapsed};}
+        elsif ($case eq 'missing_action_age') {delete $cp->{state}{action_elapsed}{'A.Msg'};}
+        elsif ($case eq 'extra_action_age') {$cp->{state}{action_elapsed}{Unknown}=0;}
+        elsif ($case eq 'mismatched_action_age') {$cp->{state}{action_elapsed}={Unknown=>0};}
+        elsif ($case eq 'negative_age') {$cp->{state}{action_elapsed}{'A.Msg'}=-1;}
+        elsif ($case eq 'negative_fractional_age') {$cp->{state}{action_elapsed}{'A.Msg'}=-0.00001;}
+        elsif ($case eq 'nonnumeric_age') {$cp->{state}{action_elapsed}{'A.Msg'}='invalid';}
+        elsif ($case eq 'infinite_age') {$cp->{state}{action_elapsed}{'A.Msg'}='1e9999';}
+        elsif ($case eq 'nan_age') {$cp->{state}{action_elapsed}{'A.Msg'}='NaN';}
+        elsif ($case eq 'boolean_age') {$cp->{state}{action_elapsed}{'A.Msg'}=JSON::PP::true();}
+        elsif ($case eq 'null_age') {$cp->{state}{action_elapsed}{'A.Msg'}=undef;}
+        elsif ($case eq 'reference_age') {$cp->{state}{action_elapsed}{'A.Msg'}=[];}
+        elsif ($case eq 'runtime_clock') {$cp->{state}{action_last_mono}={'A.Msg'=>$mono};}
         else {$cp->{state}{notify_seen}={};}
         reading('Geo.Test','gp_trip_checkpoint',JSON::PP::encode_json($cp),$now);
         ($cfg,$s)=simulate_process_restart($c);

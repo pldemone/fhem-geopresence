@@ -3550,10 +3550,14 @@ def run(source, encoding="bytestream", help_only=False):
             checkpoint_before_retry = command("{ ReadingsVal('Geo.Recovery','gp_trip_checkpoint','') }")
             checkpoint_timestamp = command("{ ReadingsTimestamp('Geo.Recovery','gp_trip_checkpoint','') }")
             compact = json.loads(checkpoint_before_retry)
-            check(compact["version"] == 2 and compact["state"]["action_visits"] == {
+            check(compact["version"] == 3 and compact["state"]["action_visits"] == {
                 "A.RecoveryLight|enter|location:Geo.Recovery.Work": 1}, "real checkpoint stores one current consumption slot")
             check(not {"notify_seen", "notify_order", "notify_last"} & compact["state"].keys(),
                   "real checkpoint contains no legacy action history")
+            check(compact["state"]["action_elapsed"].keys() == compact["state"]["action_last"].keys()
+                  and compact["state"]["action_elapsed"]["A.RecoveryLight"] >= 0
+                  and "action_last_mono" not in compact["state"],
+                  "real checkpoint stores portable elapsed cooldowns without raw monotonic clocks")
             check(recovery_request("Work", 1, observed=departure_observed)[0] == 200, "identical departure retry accepted by real HTTP listener")
             time.sleep(2.2)
             command("{ GeoPresence_Timer($defs{GP});; return 'retry processed' }")
@@ -3569,18 +3573,33 @@ def run(source, encoding="bytestream", help_only=False):
             legacy["state"]["notify_order"] = list(legacy["state"]["notify_seen"])
             legacy["state"]["notify_last"] = legacy["state"].pop("action_last")
             legacy["state"].pop("action_visits")
-            check(command(f"setstate Geo.Recovery {checkpoint_timestamp} gp_trip_checkpoint "
-                          + json.dumps(legacy, separators=(",", ":"))) == "", "prepare an ordinary version 1 checkpoint")
-            command("{ delete $defs{GP}{helper}{gp}{prod}{'Geo.Recovery'};; return 'old process state discarded' }")
-            check(command("reload 98_GeoPresence.pm") == "", "real reload imports the legacy checkpoint")
-            command("{ GeoPresence_Timer($defs{GP});; return 'legacy recovery processed' }")
+            legacy["state"].pop("action_elapsed")
+            # setstate ignores readings with an unchanged timestamp. Install the
+            # old data and reload synchronously so a timer cannot repair the
+            # prepared checkpoint between commands.
+            legacy_payload = base64.b64encode(json.dumps(legacy, separators=(",", ":")).encode()).decode()
+            prepared = json.loads(command(
+                "{ setReadingsVal($defs{'Geo.Recovery'},'gp_trip_checkpoint',"
+                f"MIME::Base64::decode_base64('{legacy_payload}'),'{checkpoint_timestamp}');; "
+                "my $version=JSON::PP::decode_json(GP_Read('Geo.Recovery','gp_trip_checkpoint',''))->{version};; "
+                "delete $defs{GP}{helper}{gp}{prod}{'Geo.Recovery'};; "
+                "my $error=CommandReload(undef,'98_GeoPresence.pm');; die $error if defined($error) && length($error);; "
+                "GeoPresence_Timer($defs{GP});; return JSON::PP->new->encode({version=>$version,"
+                "resume=>GP_State($defs{GP},'Geo.Recovery',0)->{resume}{status}}) }"))
+            check(prepared["version"] == 1, "prepare an ordinary version 1 checkpoint")
+            check(prepared["resume"] == "restored", "real reload imports the legacy checkpoint")
             migrated = json.loads(command("{ ReadingsVal('Geo.Recovery','gp_trip_checkpoint','{}') }"))
-            check(migrated["version"] == 2 and migrated["trip"]["id"] == compact["trip"]["id"]
+            check(migrated["version"] == 3 and migrated["trip"]["id"] == compact["trip"]["id"]
                   and migrated["trip"]["away_time"] == compact["trip"]["away_time"],
                   "legacy import preserves the original qualified trip")
             check(migrated["state"]["action_visits"] == compact["state"]["action_visits"]
                   and migrated["state"]["action_last"] == compact["state"]["action_last"],
                   "legacy import preserves current consumption and cooldown")
+            restored_elapsed = migrated["state"]["action_elapsed"]["A.RecoveryLight"]
+            saved_elapsed = max(0, legacy["saved_at"] - legacy["state"]["notify_last"]["A.RecoveryLight"])
+            check(restored_elapsed + .00001 >= saved_elapsed,
+                  f"legacy import retains elapsed cooldown time at the saved checkpoint "
+                  f"(saved={saved_elapsed!r}, restored={restored_elapsed!r})")
             new_work_time = datetime.datetime.fromtimestamp(float(command("{ GP_Now() }")) + .25, datetime.timezone.utc).isoformat()
             check(recovery_request("Work", 1, observed=new_work_time)[0] == 200, "new observation of the recovered current visit accepted")
             time.sleep(2.2)
@@ -3625,6 +3644,14 @@ def run(source, encoding="bytestream", help_only=False):
                     check(command("{ ReadingsVal('Geo.Recovery','gp_trip_checkpoint','') }") == checkpoint_before_retry
                           and command("{ ReadingsTimestamp('Geo.Recovery','gp_trip_checkpoint','') }") == checkpoint_timestamp,
                           "real process restart retained the unchanged checkpoint and its saved_at")
+                    saved_cooldown = json.loads(checkpoint_before_retry)["state"]
+                    age = float(command("{ GP_Mono()-GP_State($defs{GP},'Geo.Recovery',0)->{action_last_mono}{'A.RecoveryLight'} }"))
+                    check(saved_cooldown["action_elapsed"]["A.RecoveryLight"] - .00001 <= age <
+                          saved_cooldown["action_elapsed"]["A.RecoveryLight"] + 30,
+                          "real process restart rebuilds the saved cooldown on the new monotonic clock")
+                    check(abs(float(command("{ GP_State($defs{GP},'Geo.Recovery',0)->{action_last}{'A.RecoveryLight'} }")) -
+                              saved_cooldown["action_last"]["A.RecoveryLight"]) < .00001,
+                          "real process restart retains the original absolute plan time")
                 command("set recoveryDoor untouched")
                 command("set recoveryGarage untouched")
                 check(command("{ ReadingsVal('recoveryDoor','state','') }") == "untouched", "startup has not opened the dummy door")

@@ -142,7 +142,7 @@ subtest 'ordinary version 1 checkpoints retain their previous configuration bind
     GP_Checkpoint($c,'Geo.A',$cfg,$s);
     my $checkpoint=JSON::PP::decode_json(GP_Read('Geo.A','gp_trip_checkpoint',''));
     $checkpoint->{version}=1;
-    delete @{$checkpoint->{state}}{qw(action_visits action_last)};
+    delete @{$checkpoint->{state}}{qw(action_visits action_last action_elapsed)};
     @{$checkpoint->{state}}{qw(notify_seen notify_order notify_last)}=({},[],{});
     $defs{'Geo.A'}{READINGS}{gp_trip_checkpoint}{VAL}=JSON::PP::encode_json($checkpoint);
     # Simulate process loss without reserializing a live journey during reload.
