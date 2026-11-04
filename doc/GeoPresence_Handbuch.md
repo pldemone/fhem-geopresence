@@ -1,6 +1,6 @@
 # GeoPresence – Handbuch
 
-**Version 2.41 · Stand 02.11.2026 · Architektur 0.79**
+**Version 2.42 · Stand 03.11.2026 · Architektur 0.80**
 
 GeoPresence ist eine Anwesenheits- und Ortssteuerung für FHEM. Es wertet aus, wer zu Hause ist, wer das Haus verlassen hat und wer zurückkehrt, und verbindet diese Informationen mit konfigurierbaren Automationen. So lässt sich beispielsweise beim Betreten eines Gartenbereichs ein Licht einschalten, beim Erreichen eines Arbeitsortes eine Nachricht senden oder bei einer berechtigten Heimkehr die vorhandene Tür- und Garagensteuerung ansprechen. Ziel ist, solche Aktionen passend zur Situation auszuführen und Fehlreaktionen auf einzelne unzuverlässige Meldungen zu vermeiden.
 
@@ -122,7 +122,7 @@ Der **Gerätestatus** der Person in FHEMWEB und `list` zeigt den wirksamen Betri
 
 ### 2.1 Voraussetzungen
 
-Du benötigst eine funktionierende FHEM-Installation, Zugriff auf deren Modulverzeichnis und Kommandozeile sowie für Geo-Betrieb Geofency auf dem iPhone. Das Modul verwendet die Perl-Bibliotheken JSON::PP, Digest::SHA, MIME::Base64, Encode, Time::Local, Time::HiRes, POSIX und IO::Socket::INET. FHEM muss diese laden können. Für automatische Tests wird Python ab Version 3.9 auf dem FHEM-Host benötigt; zusätzliche Python-Pakete sind nicht erforderlich.
+Du benötigst eine funktionierende FHEM-Installation, Zugriff auf deren Modulverzeichnis und Kommandozeile sowie für Geo-Betrieb Geofency auf dem iPhone. Das Modul verwendet die Perl-Bibliotheken JSON::PP, Digest::SHA, MIME::Base64, Encode, Time::Local, Time::HiRes, POSIX, Sub::Util und IO::Socket::INET. FHEM muss diese laden können. Für automatische Tests wird Python ab Version 3.9 auf dem FHEM-Host benötigt; zusätzliche Python-Pakete sind nicht erforderlich.
 
 Lege `98_GeoPresence.pm` im Verzeichnis `FHEM` deiner Installation ab. Kopiere bei Bedarf `tools/geopresence_test.py` auf denselben Host. Das Modul wird beim ersten `define` geladen; nach Austausch einer bereits geladenen Moduldatei wird `reload 98_GeoPresence.pm` verwendet.
 
@@ -560,6 +560,8 @@ Bei der Garage bedeutet **geschlossen**: Zustand `off`, oberer Kontakt `open`, u
 
 `positionSignalMode measurement` verlangt dagegen für jeden Positionswert eine Messung nach Beginn der Controller-Sitzung. Verwende diesen Modus bei Quellen, die regelmäßige Messungen oder eine Aktualisierung beim Start garantieren. Die Rückmeldung über einen **gesendeten Auftrag** benötigt in beiden Modi einen neuen passenden Abschluss; alte `confirmed`-Werte werden nicht wiederverwendet.
 
+Bei normalen FHEM-Reading-Updates erfasst GeoPresence die eindeutige Aktualisierungszeit. Das erhält die richtige Reihenfolge auch während der bei der Herbstumstellung doppelt vorkommenden lokalen Stunde. Ein nur als lokaler Zeittext geladener oder ausdrücklich zurückdatierter Abschluss kann dagegen mehrdeutig sein; er bestätigt dann keinen neuen Auftrag. Eine neue eindeutige Rückmeldung ist erforderlich. Gehaltene Kontaktzustände bleiben im Zustandsmodus nutzbar, wenn ihre möglichen Zeitpunkte vollständig in der Vergangenheit liegen und die übrigen Gesundheitsprüfungen bestehen.
+
 **FHEM, Türbeispiel mit vorher durch echte Gerätenamen zu ersetzenden Zielgeräten:**
 
 ```text
@@ -753,6 +755,10 @@ Der Checkpoint hält zusätzlich fest, wie viel der Cooldown-Sperrzeit beim Spei
 
 Nach Neustart, rereadcfg oder Modulreload prüft GeoPresence den gespeicherten Stand. Identität, Kennwortbindung, Quellenprofil, relevante Konfiguration und Geometrie müssen passen; eine spätere lokale Anwesenheit oder ein späteres ROOMMATE `home` widerspricht dem Ausflug. Die ursprüngliche Abwesenheitsbestätigung darf standardmäßig höchstens 48 Stunden alt sein. `trip_resume_max_age` am Controller legt diese Grenze in Sekunden fest; Speichern oder wiederholtes Neustarten erneuert den Nachweis nicht.
 
+Ein gespeicherter lokaler Zeittext enthält keinen UTC-Offset. Kann er bei der Herbstumstellung zwei Zeitpunkte bezeichnen, wird bei der Wiederherstellung auch der spätere mögliche Zeitpunkt berücksichtigt. Eine möglicherweise nach dem Abgang liegende Anwesenheit verhindert deshalb die Fortsetzung. Lagen beide möglichen Zeitpunkte davor, widerspricht dieser Wert der späteren Reise nicht. Im Diagnosebericht zeigt ein Hinweis auf eine mehrdeutige Quellenzeit an, dass für neue Ankunftsnachweise eine eindeutige Aktualisierung benötigt wird.
+
+Ein aktueller ROOMMATE-Heimzustand oder gesunder positiver Telefonwert mit einem unbrauchbaren oder zukünftigen Zeitstempel verhindert die Wiederherstellung ebenfalls. Eine solche Zeit wird nicht als Beleg für eine noch offene Reise übersprungen.
+
 Ein fortgesetzter Ausflug behält seine Reise-ID. Neue Ausflüge verwenden die neue Sitzungskennung mit einem zufälligen Anteil und einem laufenden Zähler. So führt ein nach dem Neustart zurückgesetzter Zähler nicht zur erneuten Vergabe der alten Reise-ID. Das gilt auch für neue Simulationen; vorhandene gültige Checkpoints bleiben lesbar.
 
 Ein erkannter größerer Uhrsprung widerruft die aktuelle Reise und ihre Öffnungsfreigaben. Die Sitzungskennung wird dabei mit fester Länge neu gebildet. Auch nach vielen Uhrkorrekturen können spätere, neu bestätigte Ausflüge deshalb innerhalb der bestehenden Kennungsgrenze gespeichert und wiederhergestellt werden.
@@ -861,6 +867,12 @@ Die Gültigkeit eines Befehls wird direkt vor seiner Ausgabe mit den aktuellen U
 
 Im Messmodus muss jeder Sensor wiederholt aktuelle Messungen liefern; deren Gültigkeitszeit beträgt zweimal das längere konfigurierte Scanintervall plus 30 Sekunden. Im Zustandsmodus bleibt ein Wert bis zur Änderung oder erkennbaren Störung gültig. Einen vollständig stummen, vom Sensor nicht gemeldeten Ausfall kann GeoPresence damit nicht erkennen.
 
+Neue normale Reading-Updates behalten ihre tatsächliche Aktualisierungszeit, auch wenn die lokale Uhrzeit bei der Herbstumstellung zurückläuft. Polling erneuert diese Zeit nicht. Ein nur gespeicherter mehrdeutiger positiver Wert kann im Zustandsmodus den Anwesenheitsstatus anzeigen, liefert aber keine frische Heimkehr. Im Messmodus ist dafür eine neue eindeutige Messung nötig. Verspätete oder ausdrücklich zurückdatierte Werte werden durch ihren Empfang nicht zu neuen Messungen.
+
+Eine später nachgelieferte mehrdeutige Anwesenheit kann trotzdem einen alten Ausflug und dessen wartende Öffnung widerrufen. Dafür wird auch ihr spätester möglicher Zeitpunkt berücksichtigt, selbst wenn ein anderer Sensor gleichzeitig eine frische eindeutige Meldung liefert. Eine jüngere bekannte Position wird dabei nicht durch eine ältere mögliche Anwesenheitszeit ersetzt.
+
+Ein Zeitbereich wird nicht allein wegen seiner früheren Möglichkeit verworfen, wenn zugleich eine spätere Anwesenheit möglich bleibt. Ohne laufende Reise kann gehaltene Anwesenheit den Heimstatus setzen, wenn schon ihre früheste Zeit mindestens so neu wie die gespeicherte Position ist. Eine jüngere Position bleibt erhalten. Dieser reine Statuswechsel erzeugt keine Ankunftsaktion; unveränderte Quellen werden beim nächsten Poll nicht erneut als neue Meldung behandelt.
+
 ### 9.3 Regeln und Aktionen
 
 | Regelattribut | Standard / Parameter | Wirkung |
@@ -943,7 +955,8 @@ Während echter Handytests und der Testanwendung kein `debugAdvance` verwenden: 
 | Aktor meldet uncertain | Abschlussrückmeldung fehlt oder passt nicht zum Auftrag; Aktortreiber prüfen, keinen automatischen Folgeimpuls erwarten |
 | Person ist nach Neustart disabled | `mode` am Controller und an der Person sowie deren `modeReason` prüfen. Gespeicherte active/debug/disabled werden wiederhergestellt; ein zuvor laufendes Lernen endet dagegen deaktiviert. Ohne gespeicherten Modus gilt disabled. |
 | Rückkehr nach Neustart öffnet nicht | Restart recovery in explain beziehungsweise gp_resume_status/gp_resume_reason prüfen. Ein gültiger qualifizierter Checkpoint, aktive Modi und eine neue gültige Rückkehr sind erforderlich. Nach Konfigurationsänderung, späterer Heimkehr oder Ablauf der 48-Stunden-Grenze ist der alte Stand nicht mehr gültig. |
-| Nach Reload oder Moduswechsel fehlt die Berechtigung | Neue Reise beginnen; alte Nachweise werden absichtlich nicht wiederhergestellt |
+| Nach Reload fehlt die Berechtigung | `gp_resume_status` und `gp_resume_reason` sowie Abschnitt 8.4 prüfen. Nur ein passender bestätigter offener Ausflug kann fortgesetzt werden; bei Ablehnung ist ein neuer Abwesenheitsnachweis nötig |
+| Nach einem Moduswechsel fehlt die Berechtigung | Eine neue Reise bestätigen; der Moduswechsel hat den bisherigen Ausflug und seinen Checkpoint verworfen |
 | Ausführliche Diagnose fehlt | logStatus prüfen, Verzeichnisrechte korrigieren, debugLog auto oder 1 setzen |
 | Webhook meldet `429 Rate limit` | Anfragerate der betroffenen Person verringern und das laufende 60-Sekunden-Fenster abwarten. Debug-, Lern- und normale Anfragen derselben Person zählen zusammen; andere Personen haben eigene Kontingente. |
 | `gp_roommate_error` ist nicht leer | ROOMMATE und dessen Geräteaufruf prüfen. Der aktuelle Status wird erneut versucht; nach Annahme oder bereits erreichtem Zielzustand verschwindet der Fehler. |

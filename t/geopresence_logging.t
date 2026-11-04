@@ -36,6 +36,7 @@ my $number=0;
 my ($c,$s,$cfg);
 my $r='Geo.Test';
 sub fixture {
+    GP_SourceSubscriptions($_,{}) for grep {($_->{TYPE}//'') eq 'GeoPresence' && ($_->{SUBTYPE}//'') eq 'controller'} values %defs;
     ++$number;
     %defs=(); %attr=(); @normal=(); @sets=(); @messages=();
     $set_error=undef; $push_error=0; $init_done=1; $unicodeEncoding=1;

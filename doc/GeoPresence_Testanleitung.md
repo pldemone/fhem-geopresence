@@ -1,6 +1,6 @@
 # GeoPresence – Testanleitung
 
-**Version 4.37 · Stand 02.11.2026 · Handbuch 2.41 · Architektur 0.79**
+**Version 4.38 · Stand 03.11.2026 · Handbuch 2.42 · Architektur 0.80**
 
 Diese Anleitung beschreibt die Prüfung einer eingerichteten GeoPresence-Anlage. Die Testanwendung simuliert Alltagswege und prüft deren neue Diagnosezeilen; gezielte App-Tests prüfen eigene Orts- und Gruppenregeln. Einrichtung, Begriffe und Parameter stehen im [Handbuch](GeoPresence_Handbuch.md).
 
@@ -360,6 +360,18 @@ Erst nach erfolgreicher Übernahme den gewünschten Bewohner auf active setzen; 
 Geofency behält dieselbe URL. Für die erste echte Abnahme einen neuen Ausflug mit den erforderlichen Abwesenheitsnachweisen verwenden. Normales Log, `explain` und bei Bedarf `debugLog 1` belegen den produktiven Ablauf. Erst wenn tatsächlicher Aktorauftrag und Rückmeldung dem gewünschten Verhalten entsprechen, den vollständigen FHEM-Stand speichern; dabei werden die Geometrie-Readings regulär in FHEMs Zustandsdatei gesichert.
 
 ## 8. Wiederherstellung nach Neustart prüfen
+
+Die automatisierten Quellenzeitprüfungen verwenden private Zeitbezüge in einer temporären FHEM-Installation. Die Systemuhr der Anlage wird dafür nicht geändert. Neue Telefonmeldungen im Zustands- und Messmodus müssen auch dann ihre tatsächliche Reihenfolge behalten, wenn der lokale Zeittext bei der Herbstumstellung zurückläuft. Eine neue Aktorrückmeldung in der zweiten Stunde muss ihren zugehörigen Auftrag bestätigen können. Ausdrücklich zurückdatierte oder mehrdeutige Meldungen dürfen dadurch keine frischen Mess- oder Abschlussnachweise erhalten.
+
+Ergänzende Softwareprüfungen untersuchen die nicht vorhandene Frühjahrsstunde, eine Umstellung um eine halbe Stunde, unveränderte Readings, gefilterte Nicht-Schreibzugriffe und die Freigabe der Beobachtung nach Entfernung des letzten Controllers. Die Wiederherstellung muss einen möglicherweise späteren Heim- oder Telefonnachweis berücksichtigen; ein vollständig vor dem Abgang liegender Zeitbereich darf eine spätere Reise nicht widerrufen. Ein gehaltener mehrdeutiger positiver Telefonzustand darf ausschließlich den Status synchronisieren. Eine unabhängige frische Quelle muss ihre eigene eindeutige Zeit behalten.
+
+Nachgelieferte mehrdeutige Anwesenheit muss eine passende laufende Reise samt Home-Vormerkung und Ausgabeplänen widerrufen können. Gegenproben prüfen einen überlappenden Zeitbereich, Zeiten beiderseits des Sitzungsbeginns, eine gleichzeitig eindeutige Quelle in beiden Quellenreihenfolgen sowie eine spätere unabhängige Reise. Aktuelle Heimwerte mit unbrauchbaren oder zukünftigen Zeiten dürfen keine Wiederherstellung erlauben. Telefon- und unbeschäftigte Aktorquellen müssen ihre Quellenzeiten ohne zusätzliche Notify-Aufrufe behalten; tatsächlich ausstehende Rückmeldungen und ROOMMATE-Ereignisse bleiben abonniert.
+
+Die Quellenannahme wird zusätzlich mit einem Zeitbereich geprüft, der die zuletzt angenommene Negativmeldung überlappt. Seine mögliche spätere Anwesenheit muss den Widerruf erreichen. Weitere Fälle prüfen unveränderte Wiederholungen, eindeutig ältere Quellen, erhaltene Ordnungsgrenzen, eine später regulär qualifizierte Abwesenheit und die Wiederherstellung der Quelle nach einem Fehler. Ohne Reise prüfen Zustands- und ROOMMATE-Ausgaben ältere, gleiche und jüngere Positionszeiten im reinen Telefonbetrieb und im kombinierten Profil. Die native FHEM-Probe verwendet dafür eine vorübergehende Testperson am vorhandenen Controller; ein zweiter Controller wird nicht benötigt.
+
+Die zentrale Quellenverwaltung wird außerdem mit veralteten Controller-Aufrufen, gleichnamigen Ersatzgeräten und einer darüberliegenden fremden Funktionsbindung geprüft. Laufende Aktoraufträge dürfen die vorbereitete Katalogtabelle nicht verändern; ihre nur vorübergehend benötigten Quellen müssen nach dem Abschluss wieder entfallen. Eine frühere Regel ohne passende Geo-Person darf eine spätere passende Regel derselben Aktion nicht ausschließen; auch weitere Regeln einer bereits erfassten Aktion werden vollständig validiert.
+
+Verzögerte Telefonverarbeitung und eine kleine rückwärts gerichtete Systemzeitkorrektur dürfen weder den ersten Empfang ersetzen noch Messalter und Aktionsbudget verlängern. Dies gilt auch für einen ausdrücklich mitgegebenen eindeutigen Zeittext.
 
 Die Wiederherstellung betrifft ausschließlich produktive, bestätigte Ausflüge. Die Geofency-Buttons Betreten/Verlassen senden `isTest=true` und können dafür keinen produktiven Checkpoint erzeugen. Ein normaler Debug-Lauf bleibt ebenfalls flüchtig. Verwende zur praktischen Abnahme einen tatsächlichen Ausflug einer aktiven Person und beobachte die Readings beziehungsweise explain. Ein Moduswechsel zur Vorbereitung würde die vorhandene Reise widerrufen.
 

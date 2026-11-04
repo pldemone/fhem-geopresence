@@ -24,9 +24,10 @@ use JSON::PP ();
 use Digest::SHA qw(sha256_hex);
 use MIME::Base64 qw(decode_base64);
 use Encode qw(decode encode FB_CROAK);
-use Time::Local qw(timegm timelocal);
+use Time::Local qw(timegm);
 use Time::HiRes ();
 use POSIX ();
+use Sub::Util ();
 use IO::Socket::INET ();
 use Errno qw(EAGAIN EWOULDBLOCK EINTR);
 
@@ -77,6 +78,7 @@ my @GP_CHECKPOINT_TRIP_FIELDS = qw(id start home_exit scope armed away_time away
 my @GP_CHECKPOINT_STATE_FIELDS = qw(location position_time boundary zones members zone_visits group_visits motion motion_time automotive);
 my $GP_PHONE_DEPARTURE_REASON = 'Home exit and qualified phone absence';
 my %GP_AUTH;
+our (%GP_SOURCE_WATCH,$GP_SOURCE_OWNER,$GP_SOURCE_NATIVE,$GP_SOURCE_WRAPPER);
 
 # GP_UsesSource: Check whether a resident profile enables the requested source.
 sub GP_UsesSource {
@@ -259,6 +261,7 @@ sub GeoPresence_Initialize {
     # FHEM calls Initialize on reload; old callbacks may still be queued.
     for my $d (values %defs) {
         next unless ($d->{TYPE} // '') eq 'GeoPresence' && ($d->{SUBTYPE} // '') eq 'controller';
+        delete $d->{helper}{gp_source_readings};
         GP_InvalidateDevices($d);
         GP_ResetController($d,'resume');
     }
@@ -637,15 +640,20 @@ sub GP_Catalog {
     my ($c)=@_;
     return $c->{helper}{gp_config} if $c->{helper}{gp_config};
     my $inventory=GP_Inventory($c);
-    my $catalog={%{GP_Dependencies($c)},actions=>{},rules=>{},locations=>{},users=>{},common_errors=>[],
+    my $catalog={%{GP_Dependencies($c)},actions=>{},rules=>{},locations=>{},users=>{},source_readings=>{},common_errors=>[],
         rule_errors=>{},target_errors=>{},config=>{},views=>{},errors=>{}};
     push @{$catalog->{common_errors}},"$_: invalid GeoPresence device name"
         for grep {!GP_Name($_)} @{$inventory->{devices}};
-    my (%devices,%users,%roommates,%signatures);
+    my (%devices,%users,%roommates,%signatures,%source_actions);
     for my $r (@{$inventory->{residents}}) {
         my $rr=$defs{$r}{ROOMMATE}//'';
+        my $mode=GP_Attr($r,'sourceMode','geofency_phone');
+        for my $ref ([$rr,'state'],map {[$_,'presence']}
+            GP_UsesSource($mode,'phone') ? GP_List(GP_Attr($r,'phoneProxies','')):()) {
+            $catalog->{source_readings}{join("\0",@$ref)}=$ref if length($ref->[0]);
+        }
         push @{$catalog->{common_errors}},"Duplicate ROOMMATE for $r" if $roommates{$rr}++;
-        next unless GP_UsesSource(GP_Attr($r,'sourceMode','geofency_phone'),'geo');
+        next unless GP_UsesSource($mode,'geo');
         for my $spec ([deviceId=>\%devices],[webhookUser=>\%users]) {
             my $v=lc GP_Attr($r,$spec->[0],'');
             push @{$catalog->{common_errors}},"Duplicate $spec->[0] for $r" if length($v) && $spec->[1]{$v}++;
@@ -674,11 +682,17 @@ sub GP_Catalog {
         my $a=GP_Attr($n,'action','');
         my $action=$catalog->{actions}{$a}//{type=>'',params=>{}};
         next unless GP_Attr($n,'enabled',1);
+        my $collect_sources=!exists($source_actions{$a}) && GP_IsOpening($action->{type});
         my @errors; my %seen;
         push @errors,"$n: residents required" unless @res;
         for my $r (@res) {
+            my $owner=GP_Field($r,'CONTROLLER','');
+            if ($collect_sources && $owner eq $c->{NAME}
+                && GP_UsesSource(GP_Attr($r,'sourceMode','geofency_phone'),'geo')) {
+                $source_actions{$a}=$action; $collect_sources=0;
+            }
             push @errors,"$n: unknown resident $r" unless GP_Field($r,'TYPE','') eq 'GeoPresence' && GP_Field($r,'SUBTYPE','') eq 'resident'
-                && GP_Field($r,'CONTROLLER','') eq $c->{NAME};
+                && $owner eq $c->{NAME};
             push @errors,"$n: duplicate resident $r" if $seen{$r}++;
         }
         $catalog->{rule_errors}{$n}=\@errors;
@@ -687,6 +701,12 @@ sub GP_Catalog {
             arrivalFilter=>GP_Attr($n,'arrivalFilter','any'),cooldown=>0+GP_Attr($n,'cooldown',300),
             action=>$a,type=>$action->{type},params=>$action->{params}};
         push @{$catalog->{rules}{$_}},$rule for sort keys %seen;
+    }
+    for my $action (values %source_actions) {
+        for my $ref (GP_ActorFeedbackSources({kind=>$action->{type},params=>$action->{params}}),
+            $action->{type} eq 'door_open' ? ([$action->{params}{contact},'state']):()) {
+            $catalog->{source_readings}{join("\0",@$ref)}=$ref if length($ref->[0]//'');
+        }
     }
     my $transport_error=GP_HTTPConfigError($c);
     push @{$catalog->{common_errors}},$transport_error if $transport_error;
@@ -698,7 +718,9 @@ sub GP_Catalog {
     # Retain the published bindings while a shared cache is cold. A change to
     # another resident must not revoke this resident's in-flight plans.
     $c->{helper}{gp_output_dependencies}=$catalog->{dependents};
-    return $c->{helper}{gp_config}=$catalog;
+    $c->{helper}{gp_config}=$catalog;
+    GP_UpdateNotifyDevices($c) if $c->{helper}{gp};
+    return $catalog;
 }
 
 # GP_InvalidateConfig: Invalidate prepared configuration or a selected resident view.
@@ -964,6 +986,7 @@ sub GeoPresence_Undef {
     if (($hash->{SUBTYPE} // '') eq 'controller') {
         RemoveInternalTimer($hash, 'GeoPresence_Timer');
         GP_StopHTTP($hash);
+        GP_SourceSubscriptions($hash,{});
         for my $path (keys %{$data{FWEXT} // {}}) {
             delete $data{FWEXT}{$path} if ($data{FWEXT}{$path}{GP_OWNER} // '') eq $hash->{NAME};
         }
@@ -1627,13 +1650,93 @@ sub GP_ParseTime {
     return ($t+0+$frac, sprintf('%d',$t).$fraction);
 }
 
-# GP_ReadingTime: Convert a FHEM Reading's local timestamp into epoch seconds.
-sub GP_ReadingTime {
+# GP_SourceRecord: Build one source snapshot with exact update time or all matching local-time interpretations.
+sub GP_SourceRecord {
+    my ($value,$stamp,$epoch,$sequence)=@_;
+    my $v={value=>$value//'',stamp=>$stamp//'',sequence=>$sequence//0};
+    if (defined($epoch) && GP_Number($epoch) && POSIX::isfinite($epoch)
+        && POSIX::strftime('%Y-%m-%d %H:%M:%S',localtime($epoch)) eq $v->{stamp}) {
+        @{$v}{qw(time earliest latest)}=($epoch,$epoch,$epoch);
+    } elsif ($v->{stamp} =~ /\A(\d{4})-(\d\d)-(\d\d) (\d\d):(\d\d):(\d\d)\z/) {
+        my @parts=($6,$5,$4,$3,$2-1,$1-1900,0,0);
+        my %times;
+        for my $dst (0,1) {
+            my $time=eval {POSIX::mktime(@parts,$dst)};
+            next unless defined($time) && !$@
+                && POSIX::strftime('%Y-%m-%d %H:%M:%S',localtime($time)) eq $v->{stamp};
+            $times{$time}=1;
+        }
+        my @times=sort {$a<=>$b} keys %times;
+        @{$v}{qw(earliest latest)}=($times[0],$times[-1]) if @times;
+        $v->{time}=$times[0] if @times==1;
+    }
+    if (defined $sequence) {
+        @{$v}{qw(received received_mono)}=(GP_Now(),GP_Mono());
+        $v->{mono}=$v->{received_mono}-($v->{received}-$v->{time}) if defined $v->{time};
+    }
+    return $v;
+}
+
+# GP_SourceReading: Reuse the time interpretation until the actual reading value or timestamp changes.
+sub GP_SourceReading {
     my ($device,$reading)=@_;
-    my $s=GP_Reading($device,$reading)->{TIME}//'';
-    return unless $s =~ /\A(\d{4})-(\d\d)-(\d\d) (\d\d):(\d\d):(\d\d)\z/;
-    my $t=eval {timelocal($6,$5,$4,$3,$2-1,$1)};
-    return $@ ? undef : $t;
+    my $d=$defs{$device} or return {};
+    my $raw=($d->{READINGS}//{})->{$reading}//{};
+    my ($value,$stamp)=($raw->{VAL}//'',$raw->{TIME}//'');
+    my $v=($d->{helper}{gp_source_times}//{})->{$reading};
+    return $v if $v && $v->{value} eq $value && $v->{stamp} eq $stamp;
+    return $d->{helper}{gp_source_times}{$reading}=GP_SourceRecord($value,$stamp);
+}
+
+# GP_SourceBulkUpdate: Observe real writes while FHEM still exposes the numeric update timestamp.
+sub GP_SourceBulkUpdate {
+    my ($device,$reading,undef,undef,$explicit)=@_;
+    my $watch=$GP_SOURCE_WATCH{$device->{NAME}};
+    return $GP_SOURCE_NATIVE->(@_) unless $watch && $watch->{device}==$device && $watch->{readings}{$reading};
+    my $epoch=$explicit ? undef : $device->{'.updateTime'};
+    my $set=\&setReadingsVal;
+    # Capture actual writes only; filtered updates leave the previous snapshot intact.
+    local *setReadingsVal=Sub::Util::set_prototype(prototype($set),sub {
+        my ($d,$name,$value,$stamp)=@_;
+        if ($d==$device && $name eq $reading) {
+            my $previous=($d->{helper}{gp_source_times}//{})->{$name};
+            $d->{helper}{gp_source_times}{$name}=GP_SourceRecord($value,$stamp,$epoch,
+                ($previous->{sequence}//0)+1);
+        }
+        goto &$set;
+    });
+    return $GP_SOURCE_NATIVE->(@_);
+}
+
+# GP_SourceSubscriptions: Replace the controller's source set and release its unused core binding.
+sub GP_SourceSubscriptions {
+    my ($c,$wanted)=@_;
+    # Only the current controller can replace the set. Its owner can still
+    # release it after removal from defs; stale callbacks cannot claim a new set.
+    return unless ($defs{$c->{NAME}}//0)==$c
+        || (($GP_SOURCE_OWNER//0)==$c && !keys %$wanted);
+    # This loop only reads definitions, so the set can be rebuilt in place.
+    %GP_SOURCE_WATCH=();
+    for my $ref (values %$wanted) {
+        my ($name,$reading)=@$ref;
+        my $d=$defs{$name} or next;
+        my $watch=$GP_SOURCE_WATCH{$name}//={device=>$d,readings=>{}};
+        $watch->{readings}{$reading}=1;
+    }
+    $GP_SOURCE_OWNER=keys(%GP_SOURCE_WATCH) ? $c:undef;
+    if ($GP_SOURCE_OWNER) {
+        unless ($GP_SOURCE_NATIVE) {
+            return unless defined &readingsBulkUpdate;
+            $GP_SOURCE_NATIVE=\&readingsBulkUpdate;
+            # The stable dispatcher also reaches the current implementation after reload.
+            $GP_SOURCE_WRAPPER=Sub::Util::set_prototype(prototype($GP_SOURCE_NATIVE),sub {return GP_SourceBulkUpdate(@_)});
+            *readingsBulkUpdate=$GP_SOURCE_WRAPPER;
+        }
+    } elsif ($GP_SOURCE_NATIVE && \&readingsBulkUpdate==$GP_SOURCE_WRAPPER) {
+        *readingsBulkUpdate=$GP_SOURCE_NATIVE;
+        undef $GP_SOURCE_NATIVE;
+        undef $GP_SOURCE_WRAPPER;
+    }
 }
 
 # GP_FormFieldLabel: Describe a form field for diagnostics without including its value.
@@ -2361,7 +2464,7 @@ sub GP_ProcessPhone {
     }
     return unless $e->{kind} eq 'phone_present' || $e->{kind} eq 'phone_snapshot';
     my $snapshot=$e->{kind} eq 'phone_snapshot';
-    my $fresh=!$snapshot && GP_Fresh($cfg,$e,$now);
+    my $fresh=!$snapshot && !$e->{ambiguous} && GP_Fresh($cfg,$e,$now);
     my $current=!$snapshot && GP_AfterStart($s,$cfg,$e);
     my $trip=$s->{trip}//$s->{last_trip};
     my $departure=GP_DepartureTime($trip);
@@ -2375,8 +2478,10 @@ sub GP_ProcessPhone {
         && ($trip->{away_time}//$s->{start})<$s->{start} && defined($departure) && $e->{time}>=$departure;
     # Valid presence can disprove departure after its action budget expired.
     # A fresh actual return retains the normal arrival path and its permissions.
+    # Keep possible returns from other sources even when status has an exact time.
     my $revoke=$trip && defined($departure) && $e->{time}<=$now
-        && ($restored || $contradicts || ($current && ($e->{time}<$departure
+        && ((defined($e->{uncertain_until}) && $e->{uncertain_until}>=$departure)
+            || $restored || $contradicts || ($current && ($e->{time}<$departure
             ? $veto
             : (!$trip->{armed} || !$fresh || !GP_AwayLongEnough($cfg,$trip,$e,$mono)
                 || (!$e->{arrival} && ($e->{time}>=$position || $veto))))));
@@ -2394,12 +2499,13 @@ sub GP_ProcessPhone {
             : !$e->{arrival} ? 'continuous local presence; departure revoked':'local phone presence; departure revoked');
         return;
     }
-    if ($snapshot) {
-        return GP_Trace($s,$now,'startup phone snapshot superseded') if defined($s->{position_time}) || $s->{trip};
-        $s->{phase}='home'; $s->{location}='home'; $s->{desired_status}='home';
-        $s->{position_time}=$s->{start};
-        GP_ResetNegative($s,$s->{start});
-        return GP_Trace($s,$now,'held phone snapshot; status only');
+    if ($snapshot || $e->{ambiguous}) {
+        return GP_Trace($s,$now,'held phone presence superseded') if $s->{trip}
+            || (defined($s->{position_time}) && ($snapshot || $e->{time}<$s->{position_time}));
+        $s->{position_time}=$snapshot ? $s->{start}:$e->{time};
+        $s->{location}='home';
+        GP_Home($s,$cfg,$s->{position_time});
+        return GP_Trace($s,$now,$snapshot ? 'held phone snapshot; status only':'ambiguous phone presence; status only');
     }
     return GP_Trace($s,$now,'event too old or future') unless $fresh && $e->{time}<=$now;
     return GP_Trace($s,$now,'event precedes session boundary') unless $current;
@@ -2547,7 +2653,7 @@ sub GP_Process {
 
 # GP_PhoneSamples: Read PRESENCE sources with their timestamps and health information.
 sub GP_PhoneSamples {
-    my ($cfg,$now)=@_;
+    my ($cfg)=@_;
     return {} unless GP_UsesSource($cfg->{sourceMode},'phone');
     my %samples;
     for my $p (@{$cfg->{proxies}}) {
@@ -2558,24 +2664,27 @@ sub GP_PhoneSamples {
         my $present=$d->{INTERVAL_PRESENT}//$interval;
         $interval=$present if GP_Number($present) && $present>$interval;
         my $state=GP_Read($p,'state','unknown');
-        my $value=GP_Read($p,'presence','unknown');
-        my $t=GP_ReadingTime($p,'presence');
+        my $source=GP_SourceReading($p,'presence');
+        my $value=$source->{value}//'unknown';
         my $healthy=$state =~ /\A(?:present|absent)\z/ && $state eq $value && !GP_Attr($p,'disable',0)
             && !(($d->{helper}//{})->{DISABLED})
             && ($d->{STATE}//'') !~ /\A(?:disconnected|disabled|error|timeout)\z/i;
-        $samples{$p}={value=>$value,time=>$t,ttl=>2*$interval+30,healthy=>$healthy?1:0};
+        $samples{$p}={value=>$value,time=>$source->{time}//$source->{earliest},
+            latest_time=>$source->{latest},ambiguous=>defined($source->{earliest}) && !defined($source->{time})?1:0,
+            received=>$source->{received},received_mono=>$source->{received_mono},mono=>$source->{mono},
+            ttl=>2*$interval+30,healthy=>$healthy?1:0};
     }
     return \%samples;
 }
 
 # GP_PhoneEvidence: Classify samples into presence, full absence, and return-time evidence.
 sub GP_PhoneEvidence {
-    my ($s,$cfg,$samples,$now)=@_;
+    my ($s,$cfg,$samples,$now,$mono)=@_;
     my $p=$s->{phone};
     my $state_mode=($cfg->{phoneSignalMode}//'state') eq 'state';
-    my ($latest,$observed,$arrival_time);
+    my ($latest,$observed,$arrival_source);
     my $departure=GP_DepartureTime($s->{trip});
-    my $new_positive;
+    my ($new_positive,$certain_source,$uncertain_until);
     my $negative=0;
     # Track each source separately so a newer positive cannot hide an older, newly
     # received contradiction from another source.
@@ -2583,31 +2692,51 @@ sub GP_PhoneEvidence {
         my $v=$samples->{$name}//{};
         my $t=$v->{time};
         unless ($v->{healthy} && defined($t) && $t<=$now
-            && ($state_mode || ($t>$s->{start} && $now-$t<=($v->{ttl}//0)))
+            && ($state_mode || (!$v->{ambiguous} && $t>$s->{start}
+                && (defined($v->{mono}) ? $mono-$v->{mono}:$now-$t)<=($v->{ttl}//0)))
             && ($v->{value}//'') =~ /\A(?:present|absent)\z/) {
             # Reconnection alone cannot restore an invalidated old sample.
             $p->{invalidated}{$name}=$now;
             next;
         }
         next if defined($p->{invalidated}{$name}) && $t<=$p->{invalidated}{$name};
-        next if $t<($p->{samples}{$name}//0);
+        my $previous=$p->{samples}{$name};
+        my $boundary=$previous ? $previous->{boundary}:0;
+        my $upper=$v->{latest_time}//$t;
+        my $present=$v->{value} eq 'present';
+        # A possible later positive can revoke permission without moving the
+        # accepted source boundary backwards. Absence keeps its original order.
+        next if ($present ? $upper:$t)<$boundary;
+        my $changed=!$previous || $t!=$previous->{time} || $upper!=$previous->{latest_time}
+            || $v->{value} ne $previous->{value};
         delete $p->{invalidated}{$name};
-        if ($v->{value} eq 'present') {
-            $latest=$t if !defined($latest) || $t>$latest;
-            if ($t>($p->{samples}{$name}//0)) {
+        if ($present) {
+            $latest=$v if !$latest || $t>$latest->{time};
+            $certain_source=$v if !$v->{ambiguous} && (!$certain_source || $t>$certain_source->{time});
+            if ($changed) {
                 $new_positive=$t if !defined($new_positive) || $t<$new_positive;
-                $arrival_time=$t if defined($departure) && $t>=$departure
-                    && (!defined($arrival_time) || $t<$arrival_time);
+                if ($v->{ambiguous}) {
+                    # One upper bound preserves possible contradictions without copying sources.
+                    $uncertain_until=$v->{latest_time}
+                        if !defined($uncertain_until) || $v->{latest_time}>$uncertain_until;
+                } else {
+                    $arrival_source=$v if defined($departure) && $t>=$departure
+                        && (!$arrival_source || $t<$arrival_source->{time});
+                }
             }
         } else {
             $negative++;
             $observed=$t if !defined($observed) || ($state_mode ? $t>$observed:$t<$observed);
         }
-        $p->{samples}{$name}=$t;
+        if ($changed) {
+            $p->{samples}{$name}={time=>$t,latest_time=>$upper,value=>$v->{value},
+                boundary=>$t>$boundary ? $t:$boundary};
+        }
     }
     # A positive wins; absence requires every configured source. Return only
-    # the times needed by continuity, without copying or sorting sample lists.
-    return ($latest,$new_positive,$negative==@{$cfg->{proxies}} ? $observed:undef,$arrival_time);
+    # the times and original source needed by continuity, without copying or sorting lists.
+    return ($latest ? $latest->{time}:undef,$new_positive,
+        $negative==@{$cfg->{proxies}} ? $observed:undef,$arrival_source//$certain_source//$latest,$uncertain_until);
 }
 
 # GP_Phone: Advance phone continuity and return any resulting presence or absence observation.
@@ -2619,7 +2748,7 @@ sub GP_Phone {
     return unless GP_UsesSource($cfg->{sourceMode},'phone');
     my $p=$s->{phone};
     my $state_mode=($cfg->{phoneSignalMode}//'state') eq 'state';
-    my ($latest,$new_positive,$observed,$arrival_time)=GP_PhoneEvidence($s,$cfg,$samples,$now);
+    my ($latest,$new_positive,$observed,$source,$uncertain_until)=GP_PhoneEvidence($s,$cfg,$samples,$now,$mono);
     if (defined($latest)) {
         if (defined($new_positive)) {
             # Invalidate the records themselves, not a global generation: an
@@ -2641,13 +2770,15 @@ sub GP_Phone {
         return unless defined($new_positive);
         # An active trip keeps its first relevant return for freshness and budgets.
         # Later status changes use the latest source, independent of completed trips.
-        my $time=$arrival_time//$latest;
+        my $time=$source->{time};
         my $snapshot=$state_mode && $time<=$s->{start};
         my $proof=($s->{last_trip}//{})->{phone_qualification};
-        return unless $snapshot || $s->{phase} ne 'home' || $s->{trip}
+        return unless $snapshot || defined($uncertain_until) || $s->{phase} ne 'home' || $s->{trip}
             || ($proof && $new_positive<$proof->{qualified_at});
         my $event={kind=>$snapshot ? 'phone_snapshot':'phone_present',time=>$time,
-            received=>$now,received_mono=>$mono,generation=>$s->{generation}};
+            received=>$source->{received}//$now,received_mono=>$source->{received_mono}//$mono,generation=>$s->{generation}};
+        $event->{ambiguous}=1 if $source->{ambiguous};
+        $event->{uncertain_until}=$uncertain_until if defined $uncertain_until;
         $event->{positive_time}=$new_positive if $new_positive<$time;
         @{$event}{qw(arrival key)}=($arrival,'phone:'.$time.':'.$old_state) unless $snapshot;
         return $event;
@@ -2670,7 +2801,7 @@ sub GP_Phone {
                     next if $time<=$pending->{$name};
                     delete $pending->{$name};
                     $p->{negative_renewed_at}=$time if !defined($p->{negative_renewed_at}) || $time>$p->{negative_renewed_at};
-                    my $source_mono=$mono-($now-$time);
+                    my $source_mono=$samples->{$name}{mono}//($mono-($now-$time));
                     $p->{negative_renewed_mono}=$source_mono
                         if !defined($p->{negative_renewed_mono}) || $source_mono>$p->{negative_renewed_mono};
                 }
@@ -3102,14 +3233,14 @@ sub GP_ResumeTrip {
                         || scalar(keys %{$state->{action_elapsed}})!=scalar(keys %{$state->{action_last}});
                 }
                 # Later local presence overrides the saved absence, even if the checkpoint is valid.
-                my $rrtime=GP_ReadingTime($cfg->{roommate},'state');
-                die "a later ROOMMATE Home state superseded the departure\n" if defined($rrtime)
-                    && $rrtime>=int($trip->{away_time}) && GP_Read($cfg->{roommate},'state','') =~ /\A(?:home|gotosleep|asleep|awoken)\z/;
+                my $rr=GP_SourceReading($cfg->{roommate},'state');
+                die "a later ROOMMATE Home state superseded the departure\n" if $rr->{value} =~ /\A(?:home|gotosleep|asleep|awoken)\z/
+                    && (!defined($rr->{latest}) || $rr->{latest}>$now || $rr->{latest}>=int($trip->{away_time}));
                 if (GP_UsesSource($cfg->{sourceMode},'phone')) {
-                    my $samples=GP_PhoneSamples($cfg,$now);
+                    my $samples=GP_PhoneSamples($cfg);
                     die "a later local presence superseded the departure\n" if grep {
                         my $v=$samples->{$_}; $v->{healthy} && ($v->{value}//'') eq 'present'
-                            && defined($v->{time}) && $v->{time}>=int($trip->{away_time}) && $v->{time}<=$now
+                            && (!defined($v->{latest_time}) || $v->{latest_time}>$now || $v->{latest_time}>=int($trip->{away_time}))
                     } @{$cfg->{proxies}};
                 }
             }
@@ -3470,43 +3601,59 @@ sub GP_ActorFeedbackSources {
         : ([$p->{stateDevice},'state'],[$p->{upperContact},'state'],[$p->{lowerContact},'state']);
 }
 
-# GP_ReadingFingerprint: Combine a Reading's timestamp and value to detect actual updates.
+# GP_ReadingFingerprint: Combine timestamp, value and write identity from an existing source snapshot.
 sub GP_ReadingFingerprint {
-    my ($device,$reading)=@_;
-    return (GP_Reading($device,$reading)->{TIME}//'')."\0".GP_Read($device,$reading,'');
+    my ($source)=@_;
+    return join("\0",$source->{stamp}//'',$source->{value}//'',$source->{sequence}//0);
 }
 
 # GP_ActorReadingFresh: Check for feedback observed after an actor reservation was created.
 sub GP_ActorReadingFresh {
     my ($actor,$device,$reading)=@_;
-    my $time=GP_ReadingTime($device,$reading);
-    # TIME represents a whole second, not the beginning of the actual update.
-    # Accept the dispatch second only with evidence of an update after reserving
-    # this actor. Rounding alone could reuse a preceding pulse's confirmation.
-    return 0 unless defined($time) && $time>=int($actor->{start});
+    my $source=GP_SourceReading($device,$reading);
+    my $time=$source->{time};
+    # Native updates carry a monotonic observation bound. Cold exact timestamps
+    # retain only whole seconds and still need a changed or observed fingerprint.
+    return 0 unless defined($time) && $time<=GP_Now()
+        && (defined($source->{mono}) ? $source->{mono}>=$actor->{mono} : $time>=int($actor->{start}));
     my $watch=$actor->{feedback}{$device}{$reading} or return 0;
-    my $current=GP_ReadingFingerprint($device,$reading);
+    my $current=GP_ReadingFingerprint($source);
     return $current ne $watch->{before} || $current eq ($watch->{observed}//'');
 }
 
-# GP_UpdateNotifyDevices: Subscribe the controller to global, ROOMMATE, and active actor events.
+# GP_UpdateNotifyDevices: Observe source writes and subscribe only to events with a Notify consumer.
 sub GP_UpdateNotifyDevices {
     my ($c)=@_;
-    my %devices=(global=>1);
-    $devices{$defs{$_}{ROOMMATE}}=1 for GP_Residents($c);
+    my $catalog=$c->{helper}{gp_config}//$c->{helper}{gp_source_catalog};
+    my $actors=join("\0",sort keys %{$c->{helper}{gp}{actors}//{}});
+    return if $catalog && ($c->{helper}{gp_source_catalog}//0)==$catalog
+        && ($c->{helper}{gp_source_actors}//'') eq $actors
+        && ($c->{helper}{gp_source_notify}//'') eq ($c->{NOTIFYDEV}//'');
+    my $wanted=$catalog ? $catalog->{source_readings}:{};
+    my %devices=(global=>1,map {$defs{$_}{ROOMMATE}=>1} GP_Residents($c));
     for my $actor (values %{$c->{helper}{gp}{actors}}) {
-        $devices{$_}=1 for keys %{$actor->{feedback}//{}};
+        for my $name (keys %{$actor->{feedback}//{}}) {
+            $devices{$name}=1;
+            for my $reading (keys %{$actor->{feedback}{$name}}) {
+                my $key=join("\0",$name,$reading);
+                next if exists $wanted->{$key};
+                $wanted={%$wanted} if $catalog && $wanted==$catalog->{source_readings};
+                $wanted->{$key}=[$name,$reading];
+            }
+        }
     }
+    GP_SourceSubscriptions($c,$wanted);
     my $notify=join(',',sort keys %devices);
     setNotifyDev($c,$notify) if ($c->{NOTIFYDEV}//'') ne $notify;
+    @{$c->{helper}}{qw(gp_source_catalog gp_source_actors gp_source_notify)}=($catalog,$actors,$notify);
 }
 
 # GP_ActorPositionUsable: Validate a position source against its health, timestamp, and signal mode.
 sub GP_ActorPositionUsable {
-    my ($device,$reading,$start,$mode)=@_;
+    my ($device,$reading,$start,$mode,$start_mono)=@_;
     my $d=$defs{$device} or return 0;
-    my $time=GP_ReadingTime($device,$reading);
-    return 0 unless defined($time) && $time<=GP_Now();
+    my $source=GP_SourceReading($device,$reading);
+    return 0 unless defined($source->{latest}) && $source->{latest}<=GP_Now();
     return 0 if GP_Attr($device,'disable',0) || (($d->{helper}//{})->{DISABLED})
         || ($d->{STATE}//'') =~ /\A(?:disconnected|disabled|error|timeout|unreachable|dead)(?:\b|:)/i
         || GP_Read($device,'Activity','') eq 'dead';
@@ -3517,20 +3664,23 @@ sub GP_ActorPositionUsable {
         return 0 if GP_Attr($io->{NAME},'disable',0) || (($io->{helper}//{})->{DISABLED})
             || ($io->{STATE}//'') =~ /\A(?:disconnected|disabled|error|timeout|unreachable|dead)(?:\b|:)/i;
     }
-    return $mode eq 'measurement' ? $time>$start : 1;
+    return 1 unless $mode eq 'measurement';
+    return 0 unless defined($source->{time});
+    return defined($source->{mono}) && defined($start_mono)
+        ? $source->{mono}>$start_mono : $source->{time}>$start;
 }
 
 # GP_ActorView: Classify door or garage position from validated contact and state Readings.
 sub GP_ActorView {
-    my ($intent,$start,$actor)=@_;
+    my ($intent,$start,$actor,$start_mono)=@_;
     my $p=$intent->{params};
     my @needed=$intent->{kind} eq 'door_open' ? ([$p->{contact},'state'])
-        : ([$p->{stateDevice},'state'],[$p->{upperContact},'state'],[$p->{lowerContact},'state']);
+        : GP_ActorFeedbackSources($intent);
     for my $ref (@needed) {
         if ($actor) {
             return 'unknown' unless GP_ActorReadingFresh($actor,@$ref);
         } else {
-            return 'unknown' unless GP_ActorPositionUsable(@$ref,$start,$p->{positionSignalMode}//'state');
+            return 'unknown' unless GP_ActorPositionUsable(@$ref,$start,$p->{positionSignalMode}//'state',$start_mono);
         }
     }
     if ($intent->{kind} eq 'door_open') {
@@ -3685,7 +3835,7 @@ sub GP_Dispatch {
             $s->{$intent->{kind} eq 'door_open'?'door_result':'garage_result'}='shared';
             next;
         }
-        my $view=GP_ActorView($intent,$rt->{start});
+        my $view=GP_ActorView($intent,$rt->{start},undef,$rt->{mono});
         my $result=$intent->{kind} eq 'door_open'?'door_result':'garage_result';
         if ($view eq 'open' || $view eq 'opening') {
             $s->{$result}='already_satisfied'; GP_Trace($s,$now,'actor already open or opening',{target=>$target}); next;
@@ -3696,7 +3846,7 @@ sub GP_Dispatch {
         # Reserve before CommandSet: DOIF/readings callbacks can run synchronously.
         my $actor=$rt->{actors}{$target}={intent=>$intent,start=>$now,mono=>$mono,waiters=>{$r=>1},timeout=>$cfg->{actor_timeout}};
         for my $ref (GP_ActorFeedbackSources($intent)) {
-            $actor->{feedback}{$ref->[0]}{$ref->[1]}={before=>GP_ReadingFingerprint(@$ref)};
+            $actor->{feedback}{$ref->[0]}{$ref->[1]}={before=>GP_ReadingFingerprint(GP_SourceReading(@$ref))};
         }
         # Subscribe before CommandSet as the complete pulse may be reported
         # synchronously, with the same value and TIME as the previous pulse.
@@ -3954,7 +4104,7 @@ sub GP_TimerStep {
                 my $samples;
                 if ($debug && ($s->{phone_mode}//'live') eq 'simulated') {
                     $samples={map {$_=>{value=>$s->{sim_phone}//'absent',time=>$wall,ttl=>150,healthy=>1}} @{$cfg->{proxies}}};
-                } else { $samples=$live_samples//=GP_Profile($c,'phone_readings',$target,sub {GP_PhoneSamples($cfg,$now)}); }
+                } else { $samples=$live_samples//=GP_Profile($c,'phone_readings',$target,sub {GP_PhoneSamples($cfg)}); }
                 my $phone=GP_Profile($c,'phone',$target,sub {GP_Phone($s,$cfg,$samples,$wall,$clock)});
                 if ($phone) {
                     push @{$s->{queued_phones}},$phone;
@@ -4156,7 +4306,7 @@ sub GeoPresence_Notify {
         for my $reading (keys %$watch) {
             my $value=GP_Read($device->{NAME},$reading,'');
             next unless grep {$_ eq "$reading: $value" || ($reading eq 'state' && $_ eq $value)} @$events;
-            $watch->{$reading}{observed}=GP_ReadingFingerprint($device->{NAME},$reading);
+            $watch->{$reading}{observed}=GP_ReadingFingerprint(GP_SourceReading($device->{NAME},$reading));
             $updated=1;
         }
         if ($updated) {
@@ -4578,10 +4728,11 @@ sub GP_ReportResident {
     } elsif ($debug && ($s->{phone_mode}//'live') eq 'simulated') {
         push @sensor_rows,['All simulated sensors',$s->{sim_phone}//'absent','Simulation','No physical measurement'];
     } else {
-        my $samples=GP_PhoneSamples($cfg,$now);
+        my $samples=GP_PhoneSamples($cfg);
         for my $name (@{$cfg->{proxies}}) {
             my $v=$samples->{$name};
-            push @sensor_rows,[$name,$v->{value}//'unknown',$v->{healthy}?'Source reports healthy':'Source unavailable or inconsistent',GP_ReportTime($v->{time})];
+            push @sensor_rows,[$name,$v->{value}//'unknown',$v->{healthy}?'Source reports healthy':'Source unavailable or inconsistent',
+                $v->{ambiguous} ? 'Saved local time is ambiguous; a new update is required for arrival evidence':GP_ReportTime($v->{time})];
         }
     }
     push @{$report->{sections}},{id=>'sensors',heading=>'Phone sensors',collapsed=>1,columns=>['Sensor','State','Source health','Observed'],rows=>\@sensor_rows,
@@ -4994,6 +5145,11 @@ set Geo.PERSON mode debug</pre>
   <p>In state mode, valid negatives observed before Home exit may start a new full absence window after the exit without another identical sensor message. Earlier elapsed time and pre-start snapshots alone cannot authorize that departure. Measurement mode still needs new, renewed measurements after the exit. A return observed or received before the full window completes cannot become eligible through later processing. A valid return after the actual deadline remains eligible even if the next poll confirms the elapsed window later.</p>
   <p>Valid phone presence can revoke an old trip and pending outputs even after its action freshness budget expires. For an active trip, the first newly accepted positive observation at or after the relevant departure anchors a phone return, including its freshness, minimum absence and output budget. A later positive reading from another sensor cannot make a delayed return fresh or extend these limits. Without an active trip, the latest valid positive observation supplies presence status, including phone_only and later status cycles after a completed trip. An older simultaneous reading cannot hide current presence behind a newer nearby location. The completed trip remains available for revocation and pending output checks; its departure times and output budgets are not renewed. This status update creates no trip permission. The trip checks also cover pre-start presence delivered only after an older trip was restored, including independently qualified Geo trips; it cannot execute a historical arrival or rewind a newer position. Observations before a genuinely later new trip do not anchor that new return. A positive observation before an absence completion invalidates that collected record, while an actual later return preserves a valid earlier completion. Polling never refreshes source timestamps.</p>
   <p>A nearby ordinary location does not interrupt valid held absence continuity. A phone-qualified trip retains its actual absolute and monotonic completion bounds for later returns, including measurement renewal after the nominal window. Only the first required renewal of each source contributes to those bounds; further identical measurements do not move an already satisfied deadline or supersede an eligible return before the next poll. The same early return is rejected in shared and separate batches. Independently qualified Geo trips and phone_only status changes retain their own contracts.</p>
+  <h5>Source reading times</h5>
+  <p>Phone sources, actuator positions, completion feedback and trip restoration share the same reading-time interpretation. For observed FHEM updates, GeoPresence retains the original numeric update time and first receipt before FHEM removes that metadata. Updates in the repeated autumn hour remain ordered correctly. Later polling preserves those times and the monotonic receipt used by action deadlines; delayed measurements do not become fresh merely because they arrived later.</p>
+  <p>A saved local timestamp has no UTC offset. If it can identify two different instants, GeoPresence retains both possibilities. Ambiguous held phone presence may synchronize status, but cannot supply a fresh arrival or measurement. Held actuator positions remain usable when every possible time is in the past; measurement positions and completion feedback require an exact time. Nonexistent spring-transition times supply no valid evidence. Source metadata is temporary and is not added to trip checkpoints.</p>
+  <p>Late ambiguous phone presence can still revoke a trip and its waiting opening permissions. Its latest possible time remains relevant even when another sensor also provides a fresh exact reading. It never authorizes an arrival or replaces a newer position with an older possible time.</p>
+  <p>A positive time range that overlaps the previous sensor observation is not discarded merely because its earliest possibility is older. Unchanged ranges are processed once. Without an active trip, held ambiguous presence can set Home status when even its earliest time is at least as recent as the stored position. This status transition uses the original lower time and invokes no arrival rules; newer positions remain protected.</p>
   <h5>Home arrival confirmation</h5>
   <p>If held indoor presence rejects an outer departure, an earlier unarmed local Home exit remains pending when it is newer than the last actual positive phone observation. Only complete phone absence qualification can authorize that trip; rejected distance or prior-exit evidence is not retained. A new Home entry or positive phone observation cancels the unarmed suspicion. Short reception gaps therefore cannot open either actor.</p>
   <p>A qualified Home entry is provisional (<code>returning</code>). Default confirmation waits:</p>
@@ -5012,6 +5168,7 @@ set Geo.PERSON mode debug</pre>
   <p>FHEM rename updates GeoPresence's internal controller and parent bindings, including saved definitions. A controller rename closes its old HTTP clients and rebinds the listener under the new owner. A resident rename moves its stored password verifier and retains its request quota. Affected trips and pending commands are revoked; already dispatched actuator feedback remains observed. Public rule and external-device attribute references require explicit correction after validation. Use save after correcting the configuration. If credential migration fails, gp_auth_error keeps authentication blocked across reloads; repair the key store and set webhookPassword again. Affected Geo residents are disabled.</p>
   <p>Use FHEM's normal save mechanism for definitions, attributes and production readings. A deviceId confirmed with learnConfirm is an ordinary configuration attribute; learnConfirm does not call save. Production geometry is stored in gp_geometry. A qualified unfinished production trip is stored as one versioned gp_trip_checkpoint reading. Version 3 stores current consumption, original absolute plan times and elapsed cooldown durations. Valid version 1 and 2 data is imported once without replaying actions or renewing departure evidence. After restart, rereadcfg or module reload it can resume if identity, configuration, geometry and the trip_resume_max_age limit still match and no later Home or indoor presence contradicts it. A NEW return is required; startup alone never opens, and old arrival timers, queued commands, unconfirmed departures and debug trips never resume. The checkpoint is consumed before dispatching opening commands. gp_resume_status/gp_resume_reason and explain describe restoration or rejection.</p>
   <p>A restored cooldown resumes the remainder recorded at the last checkpoint. Time since that save, including downtime, is conservatively not credited because intervening clock corrections cannot be verified. A cooldown already expired at the save remains expired. Older formats derive their initial elapsed duration from the saved checkpoint time and the last plan time; earlier clock corrections cannot be reconstructed.</p>
+  <p>When restoring a trip, saved Home or indoor presence rejects the departure if its possible time range extends beyond that departure. A range entirely before departure does not contradict the trip. A current Home or healthy positive phone reading with an unusable or future timestamp also prevents restoration. A process restart must interpret saved local times again because the earlier numeric source metadata is no longer available.</p>
   <p>A restored trip keeps its saved ID. Each new runtime context adds a fresh random session component; new trip IDs use that context and a local counter, so restarting the counters alone cannot recreate an old ID. This also applies to new debug contexts. Checkpoint versions 1, 2 and 3 remain readable.</p>
   <p>Checkpoints use the ordinary FHEM state file; no additional database or automatic configuration save is used. A clean shutdown writes the state file; after an abrupt crash only the last successfully written state is available, so observations missed during downtime cannot be reconstructed. Test requests never promote debug geometry or permissions. Learning results for a configured phone remain available in the current process after learnConfirm or timeout; a restart, new learning session, phone identity change or resident deletion discards them. An unconfirmed phone candidate is also discarded by cancellation, relevant configuration/password changes or module reload.</p>
 
@@ -5434,6 +5591,7 @@ get Geo.PERSON explain debug</pre>
       </ul>
       <p>After Home exit, state mode may use still-valid negatives from before the exit for a new complete absence window. Time before the exit does not count. Measurement mode requires new observations after the exit and renewed measurements during qualification. Pre-start snapshots alone cannot authorize a new trip.</p>
       <p>An explicit failure interrupts absence qualification; recovery alone does not restore invalidated old observations.</p>
+      <p>Ambiguous saved local times supply held status only; they cannot prove a fresh phone arrival or measurement. Observed updates keep their original measurement and receipt times. Measurement expiry uses their monotonic age when available, so polling and wall-clock corrections cannot renew a measurement.</p>
       <p>A silent unreported sensor failure cannot be detected reliably from held state alone.</p>
       <p><b>Example:</b></p>
       <pre style="white-space: pre-wrap; overflow-wrap: anywhere;">attr Geo.PERSON phoneSignalMode state</pre>

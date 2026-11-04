@@ -46,6 +46,7 @@ sub attribute {
     return;
 }
 sub fixture {
+    GP_SourceSubscriptions($_,{}) for grep {($_->{TYPE}//'') eq 'GeoPresence' && ($_->{SUBTYPE}//'') eq 'controller'} values %defs;
     %defs=(); %attr=(); %data=(); %keys=(); @commands=(); @messages=();
     $now=1790000000; $mono=1000; $init_done=0;
     my $c=define('GP','controller'); GP_StoreMode($c,'active');

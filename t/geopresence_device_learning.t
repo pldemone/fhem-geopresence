@@ -12,6 +12,7 @@ $readingFnAttributes=''; $unicodeEncoding=1;
 sub setReadingsVal { $_[0]{READINGS}{$_[1]}={VAL=>$_[2],TIME=>$_[3]}; }
 sub InternalTimer { }
 sub RemoveInternalTimer { }
+sub setNotifyDev { $_[0]{NOTIFYDEV}=$_[1]; }
 require "$FindBin::Bin/lib/FhemKeyStore.pm";
 sub Log3 { }
 sub CommandSet { push @outputs,[@_]; return; }
@@ -44,6 +45,7 @@ sub define_device {
     return $defs{$name};
 }
 sub fixture {
+    GP_SourceSubscriptions($_,{}) for grep {($_->{TYPE}//'') eq 'GeoPresence' && ($_->{SUBTYPE}//'') eq 'controller'} values %defs;
     %defs=(); %attr=(); %data=(); %keys=(); @config_commands=(); @outputs=();
     $attr_error=undef; $after_attr=undef; $init_done=0; $now=1790000000; $mono=1000;
     my $c=define_device('GP','controller'); $attr{GP}={webhookPort=>8090}; GP_StoreMode($defs{GP},'debug');

@@ -10,7 +10,7 @@ our ($now,$mono,@commands,@messages);
 $readingFnAttributes=''; $unicodeEncoding=1;
 sub InternalTimer { }
 sub RemoveInternalTimer { }
-sub setNotifyDev { }
+sub setNotifyDev { $_[0]{NOTIFYDEV}=$_[1]; }
 sub Log3 { }
 sub deviceEvents { return $_[0]{CHANGED}; }
 sub CommandSet { push @commands,$_[1]; return; }
@@ -46,6 +46,7 @@ sub advance { $now+=$_[0]; $mono+=$_[0]; }
 sub config_event { GeoPresence_Notify($defs{GP},{NAME=>'global',CHANGED=>[@_]}); }
 sub fixture {
     my ($profile)=@_;
+    GP_SourceSubscriptions($_,{}) for grep {($_->{TYPE}//'') eq 'GeoPresence' && ($_->{SUBTYPE}//'') eq 'controller'} values %defs;
     %defs=(); %attr=(); %data=(); %keys=(); @commands=(); @messages=();
     $now=1790000000; $mono=1000; $init_done=0;
     $defs{rr_Test}={NAME=>'rr_Test',TYPE=>'ROOMMATE'};

@@ -9,6 +9,7 @@ $readingFnAttributes = '';
 sub setReadingsVal { $_[0]{READINGS}{$_[1]}={VAL=>$_[2],TIME=>$_[3]}; }
 sub InternalTimer { }
 sub RemoveInternalTimer { }
+sub setNotifyDev { $_[0]{NOTIFYDEV}=$_[1]; }
 sub Log3 { }
 sub deviceEvents { $_[0]{CHANGED}; }
 sub FileRead { return (undef, 'GeoPresence_Geo.Test_auth:' . ('a' x 32) . ':' . ('b' x 64)); }
@@ -24,6 +25,7 @@ sub define_geo {
 }
 
 sub fixture {
+    GP_SourceSubscriptions($_,{}) for grep {($_->{TYPE}//'') eq 'GeoPresence' && ($_->{SUBTYPE}//'') eq 'controller'} values %defs;
     %defs = (); %attr = (); %data = (); $init_done = 0;
     my $c = define_geo('GP', 'controller');
     $attr{GP} = {webhookPort => 8090}; GP_StoreMode($defs{GP},'debug');

@@ -1,6 +1,6 @@
 # GeoPresence – Architektur
 
-**Version 0.79 · Stand 02.11.2026 · Handbuch 2.41**
+**Version 0.80 · Stand 03.11.2026 · Handbuch 2.42**
 
 Diese Beschreibung spezifiziert den aktuellen Aufbau von `FHEM/98_GeoPresence.pm`. Einrichtung und Bedienung stehen im [Handbuch](GeoPresence_Handbuch.md); Prüfabläufe und Testprogramm sind in der [Testanleitung](GeoPresence_Testanleitung.md) beschrieben. Gerätenamen wie `Geo.PERSON` und `Geo.PERSON.ORT` sind austauschbare Beispiele.
 
@@ -182,6 +182,28 @@ Für Fristen wird eine monotone Uhr verwendet. Ein deutlicher Sprung zwischen Sy
 
 Der Timer prüft den Uhrbezug jedes Bewohnerkontexts vor der Telefonverarbeitung. Der anschließende Zustandstick übernimmt dieselben bereits geprüften System- und monotonen Zeitwerte; diese Prüfung ist seine interne Aufrufvoraussetzung. Ereignisverarbeitung und unmittelbare Ausgabefreigabe behalten ihre eigenen Uhrprüfungen. Vor jeder tatsächlichen Ausgabe werden die Uhren weiterhin neu gelesen.
 
+### 4.3 Zeiten externer FHEM-Readings
+
+`GP_SourceReading` stellt je Gerät und Reading eine gemeinsame Quellenansicht bereit: Wert, ursprünglicher lokaler Zeittext, eindeutige Aktualisierungszeit oder mögliche Zeitgrenzen sowie gegebenenfalls den ersten Empfang und seinen monotonen Bezug. Telefonabfrage, Aktorposition, Abschlussprüfung und Wiederherstellung verwenden dieselbe Interpretation. Solange Wert und Zeittext unverändert bleiben, wird eine gespeicherte lokale Zeit nicht erneut umgerechnet. Polling erzeugt weder eine neue Aktualisierungszeit noch einen neuen Empfangsbezug.
+
+FHEM entfernt seine numerische `.updateTime` vor dem Notify. Für tatsächlich verwendete Quellen beobachtet das Modul deshalb den vorhandenen `readingsBulkUpdate`-Pfad, solange diese Metadaten verfügbar sind. Eine lokal begrenzte Beobachtung von `setReadingsVal` erfasst nur tatsächlich ausgeführte Schreibzugriffe. Unterdrückte Updates erneuern keinen Nachweis. Bei normalen Updates ohne ausdrücklich mitgegebenen Zeittext wird die ursprüngliche numerische Aktualisierungszeit übernommen; der Notify-Empfang ersetzt sie nicht. Das gilt auch für identische Werte und Zeittexte bei unterschiedlichen tatsächlichen Updates während der wiederholten Herbststunde.
+
+Die Beobachtung betrifft konfigurierte ROOMMATE-Zustände, verwendete Telefonquellen und Quellen aktivierter, anwendbarer Öffnungsregeln. Bereits ausgegebene Aktoren behalten ihre benötigten Quellen bis zum Abschluss. Unbeteiligte Reading-Updates werden unverändert weitergereicht und erhalten keinen Quellen-Cache. Die Auswahl wird aus dem vorhandenen Katalog vorbereitet und bei unveränderten Abonnements nicht erneut aufgebaut. Die Weitergabe erhält Funktionsprototyp, Aufrufkontext, Ergebnis und Ausnahmen; die lokale Schreibbindung wird nach dem Aufruf wiederhergestellt. Beim Freigeben der Quellenmenge wird die eigene äußere Funktionsbindung zurückgenommen, soweit sie noch dem Modul gehört. FHEM-Dateien werden dafür nicht geändert. Zusätzliche Timer oder Ereignisse entstehen nicht.
+
+Der einzige Controller besitzt eine zentrale Beobachtungsmenge mit aktuellen Gerätereferenzen und Reading-Zuordnungen. Ein gültiger Aufruf ersetzt diese Menge vollständig; eine zusätzliche Eigentümertabelle je Reading oder Rückwärtstabelle wird nicht geführt. Eine Controllerreferenz schützt die Menge vor veralteten Registrierungen und Freigaben. Der bisherige Besitzer kann seine Menge auch nach Entfernung aus dem Gerätebestand freigeben. Gleiche Gerätenamen ersetzen keine Prüfung der tatsächlichen Gerätereferenz. Die Quellenmetadaten bleiben bei einer Neuordnung unverändert.
+
+Der Katalog liest das Quellenprofil je Bewohner einmal und ermittelt Öffnungsquellen während der ohnehin erforderlichen Bewohnerprüfung einer Regel. Die vollständige Regelvalidierung bleibt erhalten. Vorbereitete Quellenzuordnungen werden lesend weitergegeben; erst eine tatsächlich fehlende Quelle eines ausstehenden Aktorauftrags erzeugt eine Ergänzungskopie. Bereits vorhandene Paare werden weiterverwendet. Die Katalogtabelle bleibt unverändert, und ausgegebene Altaufträge behalten ihre Rückmeldungsquellen.
+
+Die Schreibbeobachtung benötigt keine zusätzlichen Notify-Abonnements für Telefon- oder unbeschäftigte Aktorquellen. `NOTIFYDEV` enthält ausschließlich `global`, die gebundenen ROOMMATE-Geräte und die Rückmeldungsgeräte tatsächlich ausstehender Aktoraufträge. Ein zugleich als Telefonquelle verwendetes Rückmeldungsgerät bleibt während dieses Auftrags abonniert. Nach dessen Abschluss entfällt das Abonnement; seine benötigten Quellenzeiten werden weiterhin am Schreibpfad erfasst. Die Telefonverarbeitung bleibt beim vorhandenen Polling.
+
+Nur als lokaler Text verfügbare Zeiten, etwa aus der Zustandsdatei, werden mit den gültigen Sommer- und Winterzeitinterpretationen abgeglichen. Ungültige oder bei der Frühjahrsumstellung nicht vorhandene Ortszeiten liefern keinen Zeitpunkt. Bei zwei gültigen Interpretationen bleibt das Intervall zwischen frühestem und spätestem Zeitpunkt erhalten; es wird kein pauschaler Stundenoffset angewandt. Auch eine Umstellung um eine halbe Stunde wird berücksichtigt. Ein ausdrücklich zurückdatierter Zeittext wird nicht allein wegen seines aktuellen Empfangs einer neueren Zeitinterpretation zugeordnet.
+
+Eine mehrdeutige positive Telefonquelle darf im Zustandsmodus einen gehaltenen Status liefern, aber keinen frischen Ankunftsnachweis. Eine unabhängig vorhandene eindeutige positive Quelle behält ihre eigene Zeit. Der Messmodus und Aktorabschlüsse verlangen eindeutige Zeiten. Gehaltene Aktorpositionen bleiben bei gesundem, vollständig vergangenem Zeitintervall verwendbar; der Positions-Messmodus verlangt weiterhin eine eindeutige Aktualisierung nach Sitzungsbeginn. Für beobachtete native Updates kann die Aktorprüfung zusätzlich den monotonen Bezug zur Reservierung verwenden. Unveränderte alte Abschlusswerte werden weiterhin nicht wiederverwendet.
+
+Telefonereignisse übernehmen den ursprünglichen Empfang ihrer ausgewählten Quelle. Eine verzögerte Abfrage verschiebt daher die monotone Aktionsfrist nicht. Auch bei ausdrücklich mitgegebenem Zeittext bleibt der tatsächliche Empfang getrennt von der Messzeit erhalten. Für eindeutig beobachtete Messungen und deren erste erforderliche Negativerneuerung wird das Alter auf die monotone Uhr bezogen; eine spätere Systemzeitkorrektur berechnet diesen Bezug nicht neu.
+
+Bei der Wiederherstellung widerspricht eine gespeicherte Heim- oder Telefonanwesenheit dem Ausflug, sobald ihr möglicher Zeitbereich bis nach dessen Abwesenheitsbestätigung reicht. Ein vollständig davor liegendes Intervall widerlegt die spätere Reise nicht. Ein aktueller Heimzustand oder gesunder positiver Telefonwert mit unbrauchbarer oder zukünftiger Zeit liefert ebenfalls keinen belastbaren Fortsetzungsnachweis. Die numerischen Quellenmetadaten bleiben flüchtig: Ein Reload im selben Prozess kann beobachtete Quellenzeiten erhalten; ein Prozessneustart muss lokale Zeittexte wieder als solche bewerten. Der Reise-Checkpoint erhält dadurch keine neuen Felder oder Formatversion.
+
 ## 5. Anwesenheit und Ausflug
 
 ### 5.1 Zustandsmodell je Person
@@ -222,6 +244,8 @@ Ein Raumwechsel kann einen Sensor verlieren und einen anderen gewinnen; mehrere 
 
 `GP_PhoneSamples` liest die tatsächlichen Quellen. Pro Bewohner und Timerlauf teilen sich fällige Produktions- und Live-Debug-Abfragen denselben unveränderlichen Eingangsschnappschuss; simulierte Telefonwerte bleiben davon getrennt. `GP_PhoneEvidence` prüft Gesundheit, Zeitstempel, Quellenvertrag und Reihenfolge in einem Durchlauf und ermittelt die benötigten Zeitgrenzen ohne zusätzliche Wertelisten oder Sortierungen. `GP_Phone` führt daraus die je Kontext unabhängige Anwesenheitskontinuität, Übergangslücke und Abwesenheitsfrist. Nur der geordnete Reisekern in `GP_ProcessPhone` entscheidet über Status, Widerruf und Rückkehr; die Quellenabfrage selbst erteilt keine Reiseberechtigung.
 
+Je Quelle bleibt nur der letzte angenommene Stand aus Wert, frühestem und spätestem Zeitpunkt sowie einer nicht rückläufigen Ordnungsgrenze erhalten. Positive Zeitbereiche werden anhand ihres spätesten möglichen Zeitpunkts mit dieser Grenze verglichen. Eine Überlappung ist dadurch nicht fälschlich sicher älter. Das bisherige Annahmekriterium für Negativwerte und der Wiederanlauf nach Quellenfehlern bleiben bestehen. Eine angenommene Überlappung setzt die bekannte Ordnungsgrenze nicht zurück. Änderungen von Wert oder Zeitbereich kennzeichnen eine neue Beobachtung; unveränderte Polls erzeugen weder erneut ein Ereignis noch einen neuen Quellenstand. Die vier skalaren Angaben ersetzen den bisherigen einzelnen Zeitwert und bilden keine Historie.
+
 ### 6.2 Messvertrag
 
 | `phoneSignalMode` | Positiver Wert | Negativer Wert |
@@ -250,6 +274,10 @@ Bestätigt dieser Abschluss einen unbestätigten Home-Abgang, referenziert die R
 Der `revoked`-Marker wird ausschließlich an noch gepufferten Abschlüssen gesetzt und vor deren Übernahme geprüft. Ein erfolgreich übernommener Nachweis befindet sich nicht mehr im Telefonpuffer. Spätere Gegenbeweise widerrufen Reise und Ausgaben über den Reisekern; Prüfungen eines nachträglich gesetzten Markers an `phone_qualification` sind daher nicht erforderlich. Die absoluten und monotonen Abschlussgrenzen sowie die aktuellen Freigabeprüfungen vor dem Geräteaufruf bleiben wirksam.
 
 Gültige lokale Telefonanwesenheit kann eine bestehende Reise und ihre wartenden Ausgaben auch nach Ablauf von `action_max_age` widerrufen. Dafür werden Freigabenummer, Reise-, Bewegungs- und Ankunftsnachweise gemeinsam entwertet. Eine jüngere bekannte Position wird nicht zurückgesetzt; ohne frische Rückkehr entstehen keine Ankunftsaktionen. Die Statusübernahme verwendet wie eine bestätigte Rückkehr das gemeinsame `GP_Home` und entfernt damit unvereinbare entfernte Mitgliedschaften, ohne Ankunftsregeln für die widerrufene Reise auszuwerten. Das gemeinsame Veto `GP_PhoneVeto` berücksichtigt gehaltene Anwesenheit und kurze Übergangslücken sowohl vor einem Geo-Abgang als auch bei späterer Verarbeitung widersprechender Telefonanwesenheit. Eine ältere positive Beobachtung vor einem noch unbestätigten Home-Austritt lässt dessen Verdacht bestehen; ein dadurch widerlegter Abwesenheitsabschluss wird dennoch entwertet. Eine frische tatsächliche Telefon-Rückkehr nach gültigem Abschluss behält den normalen Öffnungsvertrag.
+
+Mehrdeutige Anwesenheit wird davon nicht ausgenommen. `phone_snapshot` kennzeichnet weiterhin Beobachtungen vor oder gleich dem Sitzungsbeginn. Ist die gewählte Quellenzeit mehrdeutig, trägt das Ereignis zusätzlich `ambiguous` und kann unabhängig von seinem Ereignistyp keine Ankunft auslösen. `uncertain_until` enthält die späteste mögliche Zeit aller neu angenommenen mehrdeutigen positiven Quellen. Reicht diese bis zum maßgeblichen Abgang oder darüber hinaus, widerruft sie die Reise und wartende Freigaben. Der Gegenbeweis bleibt auch bei gleichzeitig vorhandener eindeutiger frischer Quelle wirksam. Ohne passenden Widerruf gelten die bisherigen Grenzen für gehaltenen Status und jüngere Positionen; ein vollständig vor einer tatsächlich späteren Sitzung und Reise liegender Wert erhält diese Reise. Die zusätzliche Zeitgrenze wird im vorhandenen Quellendurchlauf ermittelt; weitere Quellenlisten oder Telefonereignisse entstehen nicht.
+
+Ohne laufende Reise kann nach Sitzungsbeginn angenommene mehrdeutige Anwesenheit den gehaltenen Heimstatus setzen, wenn ihr frühester Zeitpunkt die gespeicherte Position nicht unterschreitet. Der Übergang verwendet `GP_Home`, behält diesen ursprünglichen unteren Zeitbezug als Position und wertet keine Ankunftsregeln aus. Eine jüngere Position bleibt geschützt. Ein Start-Snapshot behält dagegen die bisherige Anlaufgrenze und ersetzt keinen bereits vorhandenen Positionsstand.
 
 Im aktuellen Telefonzweig wird zuerst nach der Beobachtungszeit unterschieden: Vor dem maßgeblichen Abgang entscheidet ausschließlich das bereits berechnete Anwesenheitsveto. Ab dem Abgang gelten die bisherigen Gründe wie fehlende Bestätigung, Frische, Mindestabwesenheit und kontinuierliche Anwesenheit mit passendem Positionsbezug. Die unabhängigen Widerrufsgründe für wiederhergestellte Reisen und widerlegte Telefonqualifikationen bleiben davor wirksam. Vor dem Abgang wird keine entscheidungsirrelevante Abwesenheitsdauer berechnet.
 
@@ -551,6 +579,17 @@ Weitere Prüfungen umfassen abgeschlossene Geo- und telefonbestätigte Reisen mi
 Die Prüfungen der Telefonverarbeitung sichern die fachlichen Abläufe im Zustands- und Messmodus ab. Direkte interne Testereignisse enthalten die Pflichtfelder des regulären Erzeugers. Eine zusätzliche Gegenprobe qualifiziert Abwesenheit im Zustands- und Messmodus, prüft unveränderte Negativwerte und meldet anschließend einen Quellenfehler. Der Fehler muss auch nach bereits bestätigter Abwesenheit erkannt werden; eine bloße Wiederverbindung mit alten Werten genügt nicht, neue Beobachtungen und eine vollständige erneuerte Frist bleiben erforderlich.
 
 ## 13. Änderungen seit der letzten Version
+
+Änderungen von Version 0.79 auf 0.80:
+
+- Gemeinsame Zeitbewertung für Telefonquellen, Aktorpositionen, Abschlussrückmeldungen und Wiederherstellung eingeführt.
+- Tatsächliche FHEM-Aktualisierungszeiten vor dem Verlust der numerischen Metadaten erfasst; doppelte lokale Herbstzeiten vertauschen dadurch keine beobachteten Updates.
+- Mehrdeutige gespeicherte Zeiten konservativ bewertet und wiederholte Umrechnung unveränderter Readings vermieden.
+- Nachgelieferte mehrdeutige Anwesenheit für den Widerruf laufender Reisen und wartender Öffnungen berücksichtigt; zukünftige Heimzeitstempel bei der Wiederherstellung abgewiesen.
+- Überlappende positive Quellenbereiche bei Annahme und Neuheit berücksichtigt und gehaltene Statuswechsel gegenüber älteren Positionen zugelassen.
+- Notify-Abonnements auf tatsächlich benötigte Ereignisempfänger begrenzt; die Quellenbeobachtung bleibt davon unabhängig.
+- Quellenverwaltung auf eine Controllerreferenz und eine zentrale Menge vereinfacht; zusätzliche Bewohnerdurchläufe, Zugriffe und unnötige Ergänzungskopien entfernt.
+- Reload-Fehlerhilfe von der Entwertung bei Moduswechseln unterschieden.
 
 Änderungen von Version 0.78 auf 0.79:
 

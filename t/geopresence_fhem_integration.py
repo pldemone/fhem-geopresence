@@ -574,6 +574,154 @@ def check_http_quotas(command, http_request, request, auth_headers, password, ch
                 "GP_ResetController($defs{GP});; GeoPresence_Timer($defs{GP});; return 'quota fixture cleared' }")
 
 
+def check_source_times(command, check):
+    """Keep exact native update times through a repeated local hour."""
+    first = int(datetime.datetime(2026, 10, 25, 0, 55, tzinfo=datetime.timezone.utc).timestamp())
+    second = first + 600
+    for line in ("define SourceClock.Sensor PRESENCE event breachProbe:ClockAbsent breachProbe:ClockPresent",
+                 "define SourceClock.Pulse dummy"):
+        check(command(line) == "", "define isolated source-clock device")
+    before = command("{ JSON::PP->new->encode([ReadingsVal('door','state',''),ReadingsVal('garage','state','')]) }")
+    try:
+        result = json.loads(command(
+            "{ my $out={};; "
+            f"my ($wall,$mono)=({first},1000);; "
+            "{ local $ENV{TZ}='Europe/Berlin';; POSIX::tzset();; no warnings 'redefine';; "
+            "local *GP_Now=sub {$wall};; local *GP_Mono=sub {$mono};; "
+            "my $c=$defs{GP};; my $base=GP_Config($c,'Geo.Test',1);; my $catalog=GP_Catalog($c);; "
+            "GP_SourceSubscriptions($c,{%{$catalog->{source_readings}},"
+            "join(chr(0),'SourceClock.Sensor','presence')=>['SourceClock.Sensor','presence'],"
+            "join(chr(0),'SourceClock.Pulse','pulse_state')=>['SourceClock.Pulse','pulse_state']});; "
+            "my $update=sub {my ($name,$reading,$value,$epoch,$explicit)=@_;; my $h=$defs{$name};; "
+            "readingsBeginUpdate($h);; $h->{'.updateTime'}=$epoch;; "
+            "$h->{'.updateTimestamp'}=strftime('%Y-%m-%d %H:%M:%S',localtime($epoch));; "
+            "readingsBulkUpdate($h,$reading,$value,undef,$explicit);; readingsEndUpdate($h,1)};; "
+            "$out->{notify}=$defs{GP}{NOTIFYDEV};; "
+            "for my $mode ('state','measurement') {"
+            f"$wall={first};; $mono=1000;; "
+            "my $cfg={%$base,sourceMode=>'phone_only',phoneSignalMode=>$mode,proxies=>['SourceClock.Sensor']};; "
+            "my $s=GP_NewState($wall-60,$mono-60,'source-clock','phone_only');; "
+            "$update->('SourceClock.Sensor','state','present',$wall);; "
+            "$update->('SourceClock.Sensor','presence','present',$wall);; "
+            "my $sample=GP_PhoneSamples($cfg);; $out->{modes}{$mode}{first}=$sample->{'SourceClock.Sensor'}{time};; "
+            "GP_Phone($s,$cfg,$sample,$wall,$mono);; $wall+=600;; $mono+=600;; "
+            "$update->('SourceClock.Sensor','presence','present',$wall);; "
+            "$sample=GP_PhoneSamples($cfg);; $out->{modes}{$mode}{second}=$sample->{'SourceClock.Sensor'}{time};; "
+            "GP_Phone($s,$cfg,$sample,$wall,$mono);; $out->{modes}{$mode}{latest}=$s->{phone}{latest}};; "
+            "$out->{timestamp}=ReadingsTimestamp('SourceClock.Sensor','presence','');; "
+            "$out->{native_metadata_removed}=exists($defs{'SourceClock.Sensor'}{'.updateTime'})?0:1;; "
+            "$update->('SourceClock.Sensor','presence','present',$wall,'2026-10-25 02:05:00');; "
+            "my $v=GP_SourceReading('SourceClock.Sensor','presence');; "
+            "$out->{ambiguous}=defined($v->{time})?0:1;; $out->{earliest}=$v->{earliest};; $out->{latest}=$v->{latest};; "
+            f"$update->('SourceClock.Sensor','presence','present',{first});; "
+            "$out->{delayed}=GP_SourceReading('SourceClock.Sensor','presence')->{time};; "
+            f"$wall={second}+3300-3000;; $mono=5000;; "
+            "my $cfg={%$base,sourceMode=>'geofency_phone',phoneSignalMode=>'state',"
+            "proxies=>['SourceClock.Sensor'],arrival_wait_unknown=>60};; "
+            "my $s=GP_NewState($wall-3000,$mono-3000,'delayed-held-presence','geofency_phone');; "
+            "$update->('SourceClock.Sensor','presence','absent',$wall);; "
+            "$update->('SourceClock.Sensor','state','absent',$wall);; "
+            "GP_Phone($s,$cfg,GP_PhoneSamples($cfg),$wall,$mono);; "
+            "my $geo=sub {my ($zone,$entry)=@_;; GP_Process($s,$cfg,{kind=>'geo',zone=>$zone,entry=>$entry,"
+            "time=>$wall,received=>$wall,key=>$zone.':'.$wall},$wall,$mono)};; "
+            "$wall+=900;; $mono+=900;; $geo->('Z.Work',1);; "
+            "$wall+=2090;; $mono+=2090;; $geo->('Z.Home',1);; "
+            "$out->{pending_before_presence}=$s->{arrival}?1:0;; my $revision=$s->{output_revision};; "
+            "my $position=$s->{position_time};; $wall+=10;; $mono+=10;; "
+            "$update->('SourceClock.Sensor','presence','present',$wall,'2026-10-25 02:45:00');; "
+            "$update->('SourceClock.Sensor','state','present',$wall);; "
+            "my $event=GP_Phone($s,$cfg,GP_PhoneSamples($cfg),$wall,$mono);; "
+            "GP_Process($s,$cfg,$event,$wall,$mono);; "
+            "$out->{presence_revoked}=!$s->{trip} && !$s->{arrival} && $s->{output_revision}>$revision ? 1:0;; "
+            "$out->{position_preserved}=$s->{position_time}==$position?1:0;; "
+            "$out->{repeated_presence}=GP_Phone($s,$cfg,GP_PhoneSamples($cfg),$wall,$mono)?1:0;; "
+            "$wall+=60;; $mono+=60;; GP_ConfirmArrival($s,$cfg,$wall,$mono);; "
+            "$out->{plans_after_revocation}=scalar @{$s->{intents}};; "
+            f"$wall={second};; $mono=16000;; "
+            "$update->('SourceClock.Pulse','pulse_state','idle',$wall);; "
+            "my $actor={intent=>{kind=>'door_open',params=>{feedbackDevice=>'SourceClock.Pulse'}},start=>$wall,mono=>$mono,"
+            "feedback=>{'SourceClock.Pulse'=>{pulse_state=>{before=>GP_ReadingFingerprint(GP_SourceReading('SourceClock.Pulse','pulse_state'))}}}};; "
+            "$wall+=0.5;; $mono+=0.5;; $update->('SourceClock.Pulse','pulse_state','confirmed',$wall);; "
+            "$out->{completion}=GP_ActorResult($actor);; "
+            "$update->('SourceClock.Pulse','pulse_state','failed',$wall,'2026-10-25 02:05:00');; "
+            "$out->{ambiguous_completion}=GP_ActorResult($actor);; GP_SourceSubscriptions($c,$catalog->{source_readings});; } "
+            "POSIX::tzset();; return JSON::PP->new->encode($out) }"))
+        for mode in ("state", "measurement"):
+            check(result["modes"][mode]["first"] == first, f"{mode}: real FHEM captures first-fold update epoch")
+            check(result["modes"][mode]["second"] == second, f"{mode}: real FHEM captures second-fold update epoch")
+            check(result["modes"][mode]["latest"] == second, f"{mode}: later positive reading is not discarded")
+        check(result["timestamp"] == "2026-10-25 02:05:00" and result["native_metadata_removed"] == 1,
+              "exact time survives native metadata removal and backward local timestamp text")
+        check(result["ambiguous"] == 1 and result["earliest"] == second - 3600 and result["latest"] == second,
+              "explicit ambiguous FHEM timestamps retain both possibilities without guessing")
+        check(result["delayed"] == first, "native delayed measurement retains its original earlier epoch")
+        check(set(result["notify"].split(",")) == {"global", "rr_Test"},
+              "configured phone and idle actuator sources require no Notify subscription")
+        check(result["pending_before_presence"] == 1 and result["presence_revoked"] == 1,
+              "native ambiguous presence overlapping the last negative revokes the waiting Home arrival")
+        check(result["repeated_presence"] == 0, "unchanged overlapping native presence emits no repeated return")
+        check(result["position_preserved"] == 1 and result["plans_after_revocation"] == 0,
+              "revocation preserves the newer position and prevents later opening plans")
+        check(result["completion"] == "confirmed", "second-fold pulse confirms the actual actor reservation")
+        check(result["ambiguous_completion"] is None, "ambiguous explicit pulse cannot confirm an actor")
+        check(command("{ JSON::PP->new->encode([ReadingsVal('door','state',''),ReadingsVal('garage','state','')]) }") == before,
+              "source-time checks do not issue actuator commands")
+    finally:
+        command("{ POSIX::tzset();; return 'timezone restored' }")
+        command("delete SourceClock.Sensor")
+        command("delete SourceClock.Pulse")
+
+
+def check_held_phone_status(command, check):
+    """Publish held ambiguous presence through a complete native status cycle."""
+    poll = int(datetime.datetime(2026, 10, 25, 0, 45, 10, tzinfo=datetime.timezone.utc).timestamp())
+    try:
+        for line in (
+                "define rr_SourceStatus ROOMMATE", "attr rr_SourceStatus rr_locationUnderway underway",
+                "define SourceStatus.Sensor PRESENCE event breachProbe:SourceAbsent breachProbe:SourcePresent",
+                "define SourceStatus.Resident GeoPresence resident GP rr_SourceStatus",
+                "attr SourceStatus.Resident sourceMode phone_only",
+                "attr SourceStatus.Resident phoneSignalMode state",
+                "attr SourceStatus.Resident phoneProxies SourceStatus.Sensor",
+                "set SourceStatus.Resident mode active", "set GP mode active"):
+            check(command(line) == "", "prepare isolated held-status fixture: " + line)
+        result = json.loads(command(
+            "{ my $out={};; "
+            f"my ($wall,$mono)=({poll}-1000,1000);; "
+            "{ local $ENV{TZ}='Europe/Berlin';; POSIX::tzset();; no warnings 'redefine';; "
+            "local *GP_Now=sub {$wall};; local *GP_Mono=sub {$mono};; "
+            "my $c=$defs{GP};; GP_ResetController($c);; GeoPresence_Timer($c);; "
+            "my $update=sub {my ($value,$stamp)=@_;; my $d=$defs{'SourceStatus.Sensor'};; "
+            "readingsBeginUpdate($d);; $d->{'.updateTime'}=$wall;; "
+            "$d->{'.updateTimestamp'}=strftime('%Y-%m-%d %H:%M:%S',localtime($wall));; "
+            "readingsBulkUpdate($d,'presence',$value,undef,$stamp);; readingsBulkUpdate($d,'state',$value);; "
+            "readingsEndUpdate($d,1)};; "
+            "$wall+=600;; $mono+=600;; $update->('absent');; GeoPresence_Timer($c);; "
+            "$wall+=181;; $mono+=181;; GeoPresence_Timer($c);; "
+            "$out->{absent}=ReadingsVal('rr_SourceStatus','state','');; "
+            "$wall+=219;; $mono+=219;; $update->('present','2026-10-25 02:45:00');; GeoPresence_Timer($c);; "
+            "my $s=GP_State($c,'SourceStatus.Resident',0);; "
+            "$out->{phase}=$s->{phase};; $out->{phone}=$s->{phone}{state};; "
+            "$out->{roommate}=ReadingsVal('rr_SourceStatus','state','');; $out->{position}=$s->{position_time};; "
+            "$out->{travel}=$s->{trip} || $s->{last_trip} || @{$s->{intents}} ? 1:0;; "
+            "$wall+=5;; $mono+=5;; GeoPresence_Timer($c);; "
+            "$out->{held}=ReadingsVal('rr_SourceStatus','state','');; "
+            "$out->{stamp}=ReadingsTimestamp('SourceStatus.Sensor','presence','');; } "
+            "POSIX::tzset();; return JSON::PP->new->encode($out) }"))
+        check(result["absent"] == "absent", "qualified native phone absence sets ROOMMATE absent")
+        check(result["phase"] == result["roommate"] == "home" and result["phone"] == "present",
+              "ambiguous held presence synchronizes GeoPresence and ROOMMATE")
+        check(result["position"] == poll - 10, "held status keeps the source lower time rather than session start")
+        check(result["travel"] == 0, "held ambiguous status creates no travel or action permission")
+        check(result["held"] == "home" and result["stamp"] == "2026-10-25 02:45:00",
+              "status remains Home on unchanged polls without altering the source timestamp")
+    finally:
+        command("{ POSIX::tzset();; return 'timezone restored' }")
+        command("set GP mode debug")
+        for name in ("SourceStatus.Resident", "rr_SourceStatus", "SourceStatus.Sensor"):
+            command("delete " + name)
+
+
 def check_auth_key_names(command, http_request, auth_headers, password, check):
     """Use the real regex-based FHEM store with colliding legacy names."""
     other_password = "other_password_0123456789"
@@ -1117,6 +1265,8 @@ def run(source, encoding="bytestream", help_only=False):
             check_lifecycle(command, request, advance, web_port, check)
             check_roommate_echoes(command, check)
             check_auth_key_names(command, http_request, auth_headers, password, check)
+            check_source_times(command, check)
+            check_held_phone_status(command, check)
             check(command("attr GP verbose 4") == "", "normal controller verbosity accepted")
             check(command("attr GP logFile ./log/geopresence-%Y-%m.log") == "", "separate monthly diagnostic log configured")
             check(command("define GP.LogFile FileLog ./log/geopresence-%Y-%m.log .* readonly") == "", "optional FHEMWEB log viewer syntax accepted")
@@ -1466,8 +1616,8 @@ def run(source, encoding="bytestream", help_only=False):
             actor_reading("feedback", "pulse_state", "confirmed")
             for device, value in (("gate", "on"), ("upper", "closed"), ("lower", "open")):
                 actor_reading(device, "state", value)
-            check(float(command("{ GP_ReadingTime('feedback','pulse_state') }")) == int(started),
-                  "actual FHEM pulse feedback timestamp is truncated to dispatch second")
+            check(int(float(command("{ GP_SourceReading('feedback','pulse_state')->{time} }"))) == int(started),
+                  "actual FHEM pulse feedback occurs within the dispatch second")
             command("{ GeoPresence_Timer($defs{GP});; return 'ticked' }")
             check(command("{ ReadingsVal('Geo.Test','gp_door_result','unknown') }") == "confirmed",
                   "same-second pulse feedback confirms door rather than waiting for timeout")
@@ -3550,6 +3700,20 @@ def run(source, encoding="bytestream", help_only=False):
             checkpoint_before_retry = command("{ ReadingsVal('Geo.Recovery','gp_trip_checkpoint','') }")
             checkpoint_timestamp = command("{ ReadingsTimestamp('Geo.Recovery','gp_trip_checkpoint','') }")
             compact = json.loads(checkpoint_before_retry)
+            rejected = json.loads(command(
+                "{ my $c=$defs{GP};; my $cfg=GP_Config($c,'Geo.Recovery');; "
+                "local $defs{rr_Recovery}{READINGS}{state}={VAL=>'home',"
+                "TIME=>strftime('%Y-%m-%d %H:%M:%S',localtime(GP_Now()+120))};; "
+                "local $defs{rr_Recovery}{helper}{gp_source_times}={};; "
+                "my $saved=$defs{'Geo.Recovery'}{READINGS}{gp_trip_checkpoint};; "
+                "local $defs{'Geo.Recovery'}{READINGS}{gp_trip_checkpoint}={%$saved};; "
+                "my $s=GP_NewState(GP_Now(),GP_Mono(),'future-home','geofency_only');; "
+                "GP_ResumeTrip($c,'Geo.Recovery',$cfg,$s);; "
+                "return JSON::PP->new->encode({status=>$s->{resume}{status},trip=>$s->{trip}?1:0}) }"))
+            check(rejected == {"status": "rejected", "trip": 0},
+                  "current ROOMMATE Home with a future time prevents trip restoration")
+            check(command("{ ReadingsVal('Geo.Recovery','gp_trip_checkpoint','') }") == checkpoint_before_retry,
+                  "isolated invalid-time probe preserves the actual recovery checkpoint")
             check(compact["version"] == 3 and compact["state"]["action_visits"] == {
                 "A.RecoveryLight|enter|location:Geo.Recovery.Work": 1}, "real checkpoint stores one current consumption slot")
             check(not {"notify_seen", "notify_order", "notify_last"} & compact["state"].keys(),
@@ -3683,6 +3847,8 @@ def run(source, encoding="bytestream", help_only=False):
                   "new departure does not replay an opening")
             command("delete GP")
             check(command("{ scalar grep { /^GeoPresenceHTTP:/ } keys %selectlist }") == "0", "undef releases all listener select entries")
+            check(command("{ defined($main::GP_SOURCE_NATIVE) || defined($main::GP_SOURCE_OWNER) ? 1:0 }") == "0",
+                  "controller removal releases the source owner and restores the native update function")
             log = (root / "log/fhem.log").read_text()
             check(not re.search(r" GP GeoPresence \w+ \{", log), "structured module diagnostics never enter FHEM log")
             # The Git mirror omits SVN version captures. apptime intentionally
