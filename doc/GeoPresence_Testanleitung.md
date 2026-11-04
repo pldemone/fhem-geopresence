@@ -1,6 +1,6 @@
 # GeoPresence – Testanleitung
 
-**Version 4.38 · Stand 03.11.2026 · Handbuch 2.42 · Architektur 0.80**
+**Version 4.39 · Stand 04.11.2026 · Handbuch 2.43 · Architektur 0.81**
 
 Diese Anleitung beschreibt die Prüfung einer eingerichteten GeoPresence-Anlage. Die Testanwendung simuliert Alltagswege und prüft deren neue Diagnosezeilen; gezielte App-Tests prüfen eigene Orts- und Gruppenregeln. Einrichtung, Begriffe und Parameter stehen im [Handbuch](GeoPresence_Handbuch.md).
 
@@ -198,6 +198,10 @@ Weitere Prüfungen verwenden eine abgeschlossene Reise mit Heimkehr 200, später
 Die Prüfungen der Telefonverarbeitung sichern die bisherigen fachlichen Abläufe ab. Eine zusätzliche Prüfung meldet im Zustands- und Messmodus erst nach vollständig bestätigter Abwesenheit einen Quellenfehler. Die Qualifikation muss verworfen werden; alte Werte nach Wiederverbindung dürfen sie nicht wiederherstellen. Erst neue gültige Beobachtungen und eine vollständige erneuerte Frist bestätigen Abwesenheit wieder. Direkte interne Testereignisse verwenden die Pflichtfelder des normalen Erzeugers; die öffentlichen Bedienabläufe bleiben gleich.
 
 Die Software-Regressionstests prüfen zusätzlich Geometrieänderungen beim Home-Austritt und Wiederholungen mit erst nachgelieferten Bewegungsdaten. Sie verwenden kontrollierte Zeitabläufe und eine temporäre FHEM-Installation mit Dummy-Aktoren; die Alltagstest-Anwendung verändert dafür keine Radien in deiner Anlage. Erwartet wird ein neuer unbestätigter Ausflug nach einem gültigen Austritt, eine vollständig erneuerte Telefonabwesenheitsqualifikation und genau ein Türauftrag nach bestätigter Fußweg-Rückkehr. Doppelte Home-Meldungen mit zunächst fehlender Bewegung und anschließend `walking` dürfen weder eine Garagenfreigabe durch fehlende Bewegung noch einen zweiten Öffnungsauftrag erzeugen; der ursprüngliche Beobachtungszeitpunkt und der Beginn der Ankunftsfrist bleiben erhalten.
+
+Weitere Softwareprüfungen sichern die vereinfachte Geometrieverarbeitung ab. Neuere Beobachtungszeiten müssen gespeichert werden, ohne unveränderte Kreise erneut aufzubereiten. Gleiche Zeiten und sehr feine Sekundenbruchteile behalten ihren bisherigen Datensatzvergleich; widersprüchliche Kreise bleiben bis zu einer neueren eindeutigen Meldung gesperrt. Zeitgleiche Home-Eintritte und Outer-Austritte müssen in beiden Verarbeitungsreihenfolgen die Reise und eine wartende Ankunft widerrufen. Bereits ausgetretene ältere Orte benötigen keine erneute Distanzberechnung, noch aktive Gegenpositionen werden dagegen weiterhin deaktiviert. Die geometrische Bereinigung darf dabei keinen ausdrücklichen Gruppen-Austritt erfinden.
+
+Grenzproben prüfen die Mindestentfernung mit gleichem und versetztem Home-Mittelpunkt sowie einer älteren aktiven Home-Beobachtung. Ein Gebietsaustritt genau an oder unter der Mindestentfernung bleibt unbestätigt; erst ein größerer Abstand qualifiziert die lokale Reise. Historische Home-Bereinigung, Entfernungsnachweis und Mindestentfernungsprüfung teilen sich dabei auch bei Wert null denselben Home-Abstand. Die ältere geometrische Home-Beobachtung wird weiterhin deaktiviert, ihre ausdrückliche Mitgliedschaft bleibt davon getrennt. Ohne anschließende Abgangsprüfung entfällt die Outer-Distanzberechnung.
 
 ## 4. Eine eigene Ortsregel am Telefon prüfen
 

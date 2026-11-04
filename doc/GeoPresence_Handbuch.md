@@ -1,6 +1,6 @@
 # GeoPresence – Handbuch
 
-**Version 2.42 · Stand 03.11.2026 · Architektur 0.80**
+**Version 2.43 · Stand 04.11.2026 · Architektur 0.81**
 
 GeoPresence ist eine Anwesenheits- und Ortssteuerung für FHEM. Es wertet aus, wer zu Hause ist, wer das Haus verlassen hat und wer zurückkehrt, und verbindet diese Informationen mit konfigurierbaren Automationen. So lässt sich beispielsweise beim Betreten eines Gartenbereichs ein Licht einschalten, beim Erreichen eines Arbeitsortes eine Nachricht senden oder bei einer berechtigten Heimkehr die vorhandene Tür- und Garagensteuerung ansprechen. Ziel ist, solche Aktionen passend zur Situation auszuführen und Fehlreaktionen auf einzelne unzuverlässige Meldungen zu vermeiden.
 

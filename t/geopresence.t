@@ -629,9 +629,72 @@ subtest 'batch sorting and conflicts do not depend on reception order' => sub {
         is(scalar(grep {/^(?:door|garage) /} @commands),0,"conflicting Home pair blocks entire batch $reverse");
         like(GeoPresence_Get($c,'GP','explain','Geo.Test','format=json'),qr/conflicting batch/,'conflict diagnosed');
     }
-    my ($c,$cfg)=fixture();my $s=new_state();advance(40);process($s,$cfg,'Work',0);advance(90);
-    process($s,$cfg,'Home',1);process($s,$cfg,'Outer',0);
-    ok(!$s->{trip},'simultaneous disjoint observations do not rearm');
+    for my $home_first (0,1) {
+        my ($c,$cfg)=fixture();my $s=new_state();advance(40);process($s,$cfg,'Work',0);advance(90);
+        my @events=([Home=>1],[Outer=>0]); @events=reverse @events unless $home_first;
+        process($s,$cfg,@$_) for @events;
+        ok($s->{conflict},'same-time conflicts include stored exit observations in either order');
+        ok(!$s->{trip},'simultaneous disjoint observations do not rearm');
+        ok(!$s->{arrival},'the conflicting observation cancels any pending arrival');
+    }
+};
+
+subtest 'geometric cleanup skips inactive places and preserves explicit membership' => sub {
+    my ($c,$cfg)=fixture();my $s=new_state();advance(40);
+    process($s,$cfg,'Work',0);
+    advance(1);process($s,$cfg,'Work2',1);
+    ok(!$s->{zones}{'Z.Work'}{entry} && $s->{zones}{'Z.Work2'}{entry},'history contains an exited and an active place');
+    my ($inactive_distances,$active_distances)=(0,0); my $distance=\&GP_Distance;
+    advance(1);
+    {
+        no warnings 'redefine';
+        local *GP_Distance=sub {
+            $inactive_distances++ if $_[1]==$cfg->{zones}{'Z.Work'};
+            $active_distances++ if $_[1]==$cfg->{zones}{'Z.Work2'};
+            return $distance->(@_);
+        };
+        process($s,$cfg,'Checkpoint',1);
+    }
+    is($inactive_distances,0,'an exited historical place needs no distance calculation');
+    is($active_distances,1,'an active historical place is still checked geometrically');
+    ok(!$s->{zones}{'Z.Work2'}{entry},'disjoint older active place is still made inactive');
+    ok($s->{members}{'Z.Work2'}{entry},'geometric cleanup does not invent an explicit group exit');
+};
+
+subtest 'departure distance boundaries reuse one Home distance and preserve local qualification' => sub {
+    for my $latitude (0,0.001) {
+        for my $difference (-0.000001,0,0.000001) {
+            my ($c,$cfg)=fixture(source_mode=>'geofency_only');
+            $cfg={%$cfg,zones=>{%{$cfg->{zones}},
+                'Z.Drive'=>{%{$cfg->{zones}{'Z.Drive'}},lat=>$latitude}}};
+            delete $cfg->{revision};
+            is_deeply([GP_GeometryErrors($cfg)],[],'boundary fixture has valid technical circles');
+            my ($zone,$home,$outer)=@{$cfg->{zones}}{qw(Z.Drive Z.Home Z.Outer)};
+            my $limit=$zone->{radius}-GP_Distance($zone,$home)-$home->{radius};
+            $cfg->{departure_margin}=$limit+$difference;
+            my $s=new_state(); advance(40);
+            process($s,$cfg,'Home',1); advance(1);
+            ok($s->{zones}{'Z.Home'}{entry},'an older active Home observation precedes the area exit');
+            my ($home_calls,$outer_calls)=(0,0); my $distance=\&GP_Distance;
+            {
+                no warnings 'redefine';
+                local *GP_Distance=sub {
+                    $home_calls++ if $_[0]==$zone && $_[1]==$home;
+                    $outer_calls++ if $_[0]==$zone && $_[1]==$outer;
+                    return $distance->(@_);
+                };
+                process($s,$cfg,'Drive',0);
+            }
+            my $qualifies=$difference<0 ? 1:0;
+            my $context="latitude=$latitude margin_difference=$difference";
+            is($home_calls,1,"one Home distance for historical cleanup and departure checks, including zero: $context");
+            is($outer_calls,$qualifies,"Outer distance only when a departure check is needed: $context");
+            ok(!$s->{zones}{'Z.Home'}{entry},"older Home observation is still made inactive: $context");
+            ok($s->{members}{'Z.Home'}{entry},"geometric cleanup preserves explicit Home membership: $context");
+            is($s->{trip} && $s->{trip}{armed} ? 1:0,$qualifies,"strict departure boundary retained: $context");
+            is(($s->{trip}//{})->{scope},$qualifies ? 'local':undef,"local scope retained: $context");
+        }
+    }
 };
 
 subtest 'older observations from another zone or phone cannot rewind position' => sub {
@@ -5141,7 +5204,7 @@ subtest 'distinct observation times need no pairwise batch conflict comparisons'
         local *GP_Contradiction=sub {$comparisons++;return $compare->(@_)};
         GeoPresence_Timer($c);
     }
-    cmp_ok($comparisons,'<=',64,'only the ordinary checks against the preceding location remain');
+    is($comparisons,0,'distinct times need no conflict comparisons against stored locations');
     is(scalar @{$c->{helper}{gp}{queue}},0,'the entire due batch is processed');
     my $s=GP_State($c,'Geo.Test',0);
     is($s->{last_observed},$latest,'the newest observation is processed');

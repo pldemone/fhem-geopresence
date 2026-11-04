@@ -160,13 +160,60 @@ subtest 'geometry invalidates only changed coordinates in the affected pool' => 
     my $s=GP_State($c,'Geo.A',0);
     my $e={kind=>'geo',zone=>'A.Home',entry=>1,key=>'geometry',time=>$now,received=>$now,
         geometry=>{lat=>0,lon=>0,radius=>50}};
-    is(GP_UpdateGeometry($c,'Geo.A',0,$s,$e,$cfg,$now),'same','same coordinates with newer time');
+    my ($encodes,$old_checks)=(0,0); my $encode=JSON::PP->can('encode');
+    my $old=GP_Geometry($c,'Geo.A','A.Home',0); my $has_geometry=\&GP_HasGeometry;
+    {
+        no warnings qw(redefine once);
+        local *GP_HasGeometry=sub {
+            $old_checks++ if ref($_[0]) eq 'HASH' && $_[0]==$old;
+            return $has_geometry->(@_);
+        };
+        local *JSON::PP::encode=sub {
+            $encodes++ if ref($_[1]) eq 'HASH' && exists($_[1]{lat}) && exists($_[1]{radius});
+            return $encode->(@_);
+        };
+        is(GP_UpdateGeometry($c,'Geo.A',0,$s,$e,$cfg,$now),'same','same coordinates with newer time');
+    }
+    is($encodes,0,'a newer observation needs no geometry serialization for comparison');
+    is($old_checks,0,'the validated cached circle needs no repeated validation');
+    is(GP_Geometry($c,'Geo.A','A.Home',0)->{time},$now,'new observation time is retained');
+    ok($c->{helper}{gp}{geometry_dirty}{'Geo.A'}{'A.Home'},'new observation is marked for persistence');
     is(refaddr(GP_Config($c,'Geo.A')),refaddr($cfg),'timestamp update retains configuration');
     $e={%$e,time=>$now+1,geometry=>{lat=>0,lon=>0,radius=>60}}; advance(1);
     is(GP_UpdateGeometry($c,'Geo.A',0,$s,$e,$cfg,$now),'changed','changed radius is detected');
     is(GP_Config($c,'Geo.A')->{zones}{'A.Home'}{radius},60,'affected view receives new geometry');
     is(refaddr(GP_Config($c,'Geo.A',1)),refaddr($debug),'debug configuration remains separate');
     is(refaddr(GP_Config($c,'Geo.B')),refaddr($other),'other resident retains its view');
+};
+
+subtest 'equal geometry times retain record comparison and conflict recovery' => sub {
+    my $c=fixture(); advance(40);
+    my $cfg=GP_Config($c,'Geo.A'); my $s=GP_State($c,'Geo.A',0);
+    my $e={kind=>'geo',zone=>'A.Home',entry=>1,key=>'geometry',time=>$now,received=>$now,
+        geometry=>{lat=>0,lon=>0,radius=>50}};
+    GP_UpdateGeometry($c,'Geo.A',0,$s,$e,$cfg,$now);
+    my $stored=GP_Geometry($c,'Geo.A','A.Home',0);
+    delete $c->{helper}{gp}{geometry_dirty}{'Geo.A'}{'A.Home'};
+    is(GP_UpdateGeometry($c,'Geo.A',0,$s,$e,$cfg,$now),'same','identical repeat remains unchanged');
+    is(refaddr(GP_Geometry($c,'Geo.A','A.Home',0)),refaddr($stored),'identical repeat retains the stored record');
+    ok(!$c->{helper}{gp}{geometry_dirty}{'Geo.A'}{'A.Home'},'identical repeat creates no persistence work');
+    my $subsecond={%$e,time=>$now+0.0000002};
+    cmp_ok($subsecond->{time},'>',$e->{time},'the subsecond observation is numerically newer');
+    is(GP_UpdateGeometry($c,'Geo.A',0,$s,$subsecond,$cfg,$now),'same','rounded subsecond observation retains the circle');
+    is(refaddr(GP_Geometry($c,'Geo.A','A.Home',0)),refaddr($stored),'equal serialized times retain the stored record');
+    ok(!$c->{helper}{gp}{geometry_dirty}{'Geo.A'}{'A.Home'},'equal serialized times create no persistence work');
+    $stored->{note}='old metadata';
+    is(GP_UpdateGeometry($c,'Geo.A',0,$s,$e,$cfg,$now),'same','old extra metadata does not change the circle');
+    ok(!exists(GP_Geometry($c,'Geo.A','A.Home',0)->{note}),'equal-time comparison still replaces differing metadata');
+    ok($c->{helper}{gp}{geometry_dirty}{'Geo.A'}{'A.Home'},'metadata replacement is marked for persistence');
+    is(refaddr(GP_Config($c,'Geo.A')),refaddr($cfg),'metadata replacement retains configuration');
+    my $conflicting={%$e,geometry=>{lat=>0,lon=>0,radius=>60}};
+    is(GP_UpdateGeometry($c,'Geo.A',0,$s,$conflicting,$cfg,$now),'conflict','different circles at the same time remain blocked');
+    ok(GP_Geometry($c,'Geo.A','A.Home',0)->{blocked},'conflict marker remains stored');
+    is(GP_UpdateGeometry($c,'Geo.A',0,$s,$e,$cfg,$now),'stale','same-time repeat cannot release the conflict');
+    advance(1); $e={%$e,time=>$now,received=>$now};
+    is(GP_UpdateGeometry($c,'Geo.A',0,$s,$e,$cfg,$now),'changed','a newer observation releases the conflict');
+    ok(!GP_Geometry($c,'Geo.A','A.Home',0)->{blocked},'newer geometry clears the conflict marker');
 };
 
 subtest 'accepted edits commit before rebuild and rejected edits retain the active snapshot' => sub {

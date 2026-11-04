@@ -1,6 +1,6 @@
 # GeoPresence – Architektur
 
-**Version 0.80 · Stand 03.11.2026 · Handbuch 2.42**
+**Version 0.81 · Stand 04.11.2026 · Handbuch 2.43**
 
 Diese Beschreibung spezifiziert den aktuellen Aufbau von `FHEM/98_GeoPresence.pm`. Einrichtung und Bedienung stehen im [Handbuch](GeoPresence_Handbuch.md); Prüfabläufe und Testprogramm sind in der [Testanleitung](GeoPresence_Testanleitung.md) beschrieben. Gerätenamen wie `Geo.PERSON` und `Geo.PERSON.ORT` sind austauschbare Beispiele.
 
@@ -152,7 +152,13 @@ Die Konfigurationsvalidierung prüft Definitionen und Referenzen. `geometry_read
 
 Entfernungsnachweis eines gewöhnlichen Ortes bedeutet: Der Abstand zwischen den Kreismittelpunkten muss größer als die Summe aus Home-Radius, Ortsradius und `departure_margin` sein. Auch ein ausreichend weit entfernter Helferort kann deshalb bestätigen, dass Home verlassen wurde. Eine Bewegungsklassifikation allein ist kein Entfernungsnachweis.
 
+Nach bestandener Geometriebereitschaft verwendet die Geo-Verarbeitung die bereits bestätigten Home- und Outer-Kreise direkt. Der aktuell gemeldete Ort wird weiterhin separat geprüft, weil gewöhnliche Orte ihre Geometrie später liefern können. Historische Home-Vergleiche, Entfernungsnachweis und Mindestentfernungsprüfung teilen sich denselben ungerundeten Home-Abstand; die Rechenfolge bleibt erhalten. Seine Berechnung erfolgt erst nach den bisherigen Zeit-, Konflikt- und Abschlussprüfungen. Beim Vergleich des Home-Kreises mit sich selbst wird der exakte Abstand null direkt verwendet. Die Reichweite zum Outer-Kreis wird erst bestimmt, wenn eine Abgangsprüfung ansteht; ein ausdrücklicher Outer-Austritt bleibt dabei ein Fernbereichsnachweis.
+
 Veraltete Geometrie überschreibt keine neuere Geometrie. Unterschiedliche Geometrien mit identischem Zeitstempel sperren die Entscheidung, bis eine neuere widerspruchsfreie Beobachtung eintrifft. Das Ändern einer Kennung macht Geometrie einer anderen Identität unbrauchbar.
+
+Fehlt ein alter Geometriedatensatz oder liegt die neue Beobachtungszeit mindestens eine Sekunde nach der gespeicherten, steht die Datensatzänderung bereits fest. Der neue Datensatz wird dann ohne zwei zusätzliche JSON-Serialisierungen übernommen und wie bisher zur Speicherung vorgemerkt. Bei gleichen Zeitstempeln oder einem neueren Zeitstempel mit weniger als einer Sekunde Abstand bleibt der vollständige Vergleich erhalten. Sehr feine Sekundenbruchteile können trotz numerischer Verschiedenheit denselben JSON-Zeittext ergeben; auch solche Fälle behalten ihre bisherige Behandlung. Eine bloß fortgeschriebene Beobachtungszeit bei unverändertem, ungesperrtem Kreis entwertet weiterhin keine Regelkonfiguration oder Reiseberechtigung. Meldungen mit älterer Geometriezeit werden bereits vor dem Vergleich der Kreisparameter abgewiesen.
+
+Der Geometriespeicher liefert einen geprüften Kreis mit Zeitstempel oder einen leeren Bestand. Gespeicherte Readings, bestätigte Lerngeometrie und neue Meldungen werden an ihren Eingängen geprüft; der spätere Kreisvergleich verwendet diesen Vertrag, ohne den alten Kreis erneut vollständig zu validieren. Das gilt auch für den produktiven Altbestand bei `applyGeometry`; die anzuwendenden Debug-Daten werden weiterhin vollständig geprüft. Eine bestehende Sperre bleibt bei gleicher Zeit ohne neuen Kreiswiderspruch wirksam. Neuere Meldungen erreichen weiterhin die Prüfung, ob die Sperre aufgehoben werden kann.
 
 ### 4.2 Reihenfolge und Frische
 
@@ -163,6 +169,8 @@ Telefonabwesenheit wird erst nach Abschluss ihrer vollständigen Bestätigungsfr
 Nach der Entnahme gehören die Queue-Ereignisse dem aktuellen Verarbeitungslauf und werden ohne weitere Hashkopie übernommen. Der Geometriefilter sammelt akzeptierte Ereignisse direkt in der späteren Verarbeitungsliste; seine sortierte Eingabefolge wird zuvor getrennt ausgewertet. Home-Vormerkungen, der neueste Home-Nachweis und Aktionspläne behalten dagegen eigene Ereigniskopien für ihren längeren Lebenszyklus. Eine Ergänzungskopie mit ursprünglichen Empfangszeiten wird erst angelegt, wenn eine wartende Home-Vormerkung sie benötigt.
 
 Vor der Geometrieauswertung werden Geo-Meldungen chronologisch sortiert. Die Konfliktvorprüfung übernimmt diese Reihenfolge und prüft Frische, Sitzungsgrenze und bisherige Position einmal je Meldung. Paarvergleiche erfolgen nur innerhalb gleicher Beobachtungszeitpunkte; bei unterschiedlichen Zeitstempeln entfallen sie vollständig. Ein erkannter Konflikt beendet die Vorprüfung. Gleichzeitige Meldungen können weiterhin Paarvergleiche innerhalb ihrer Gruppe benötigen. Identische Wiederholungen werden dedupliziert; zeitgleiche widersprüchliche Kreisbeobachtungen sperren die betroffenen Aktionspläne.
+
+Auch beim Vergleich mit bereits gespeicherten Ortsbeobachtungen wird die Zeitgleichheit vor dem Aufbau einer Vergleichskopie geprüft. Zeitgleiche Austritte bleiben mögliche Gegenbeweise; sie werden nicht pauschal ausgeschlossen. Erst die nachfolgende geometrische Bereinigung überspringt bereits inaktive ältere Ortsstände vor der Distanzberechnung. Noch betretene ältere Orte werden weiterhin geprüft. Die getrennt geführten ausdrücklichen Orts- und Gruppenmitgliedschaften bleiben davon unberührt.
 
 Eine fällige Ankunft wird erst nach der vollständigen Auswertung des fälligen Bündels bestätigt. Das schließt jüngere Gegenbeobachtungen ein, deren eigener Empfang noch keine volle Sortierfrist zurückliegt. Eine erst später begonnene, noch nicht fällige Sammlung hält die Ankunft weiterhin bis zur gemeinsamen Auswertung zurück.
 
@@ -579,6 +587,16 @@ Weitere Prüfungen umfassen abgeschlossene Geo- und telefonbestätigte Reisen mi
 Die Prüfungen der Telefonverarbeitung sichern die fachlichen Abläufe im Zustands- und Messmodus ab. Direkte interne Testereignisse enthalten die Pflichtfelder des regulären Erzeugers. Eine zusätzliche Gegenprobe qualifiziert Abwesenheit im Zustands- und Messmodus, prüft unveränderte Negativwerte und meldet anschließend einen Quellenfehler. Der Fehler muss auch nach bereits bestätigter Abwesenheit erkannt werden; eine bloße Wiederverbindung mit alten Werten genügt nicht, neue Beobachtungen und eine vollständige erneuerte Frist bleiben erforderlich.
 
 ## 13. Änderungen seit der letzten Version
+
+Änderungen von Version 0.80 auf 0.81:
+
+- Zusätzliche JSON-Vergleiche bei der ersten Geometrieübernahme und mindestens einer Sekunde neuerer Geometriezeit vermieden; gleiche Zeiten, kurze Bruchteilsabstände und bisherige Metadatenvergleiche erhalten.
+- Ältere Geometriezeiten vor dem wirkungslosen Vergleich der Kreisparameter abgewiesen.
+- Zeitlich unpassende Konfliktkandidaten vor der temporären Kopie ausgeschlossen; zeitgleiche Gegenbeweise einschließlich Austritten weiterhin geprüft.
+- Distanzberechnungen für bereits inaktive Ortsstände übersprungen; aktive Gegenpositionen und ausdrückliche Gruppenmitgliedschaften unverändert behandelt.
+- Bereits geprüfte Kreise wiederverwendet und die Sperrbedingung vereinfacht.
+- Home-Abstand für historische Home-Beobachtungen und Abgangsprüfungen wiederverwendet; Outer-Reichweite nur für anstehende Abgangsprüfungen berechnet.
+- Home-Selbstabstand direkt verwendet und die erneute Prüfung bereits geladener Altgeometrie bei der ausdrücklichen Übernahme vermieden.
 
 Änderungen von Version 0.79 auf 0.80:
 

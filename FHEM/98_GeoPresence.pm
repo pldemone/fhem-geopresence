@@ -1213,7 +1213,7 @@ sub GP_ValidGeometryRecord {
         && GP_Number($g->{changed}) && $g->{changed}>0 && $g->{changed}<=$g->{time};
 }
 
-# GP_Geometry: Load or reuse geometry in the selected production or debug pool.
+# GP_Geometry: Load or reuse validated geometry with a timestamp, or an empty record.
 sub GP_Geometry {
     my ($c,$r,$zone,$debug)=@_;
     my $pool=$debug ? 'debug':'prod';
@@ -1280,15 +1280,18 @@ sub GP_UpdateGeometry {
     my $old=GP_Geometry($c,$r,$e->{zone},$debug);
     my $g=$e->{geometry};
     return 'stale' unless GP_HasGeometry($g);
-    my $different=!GP_HasGeometry($old) || grep {$g->{$_}!=$old->{$_}} qw(lat lon radius);
     return 'stale' if defined($old->{time}) && $e->{time}<$old->{time};
+    # Cached geometry is either validated with a timestamp or empty.
+    my $different=!defined($old->{time}) || grep {$g->{$_}!=$old->{$_}} qw(lat lon radius);
     my $conflict=$different && defined($old->{time}) && $e->{time}==$old->{time};
-    return 'stale' if $old->{blocked} && $e->{time}<=($old->{time}//0) && !$conflict;
+    return 'stale' if $old->{blocked} && $e->{time}==$old->{time} && !$conflict;
     my $changed=$different || $old->{blocked};
     my $next=$conflict ? {%$old,blocked=>1} : {%$g,time=>$e->{time},
         changed=>$changed ? $e->{time}:$old->{changed},blocked=>0,
         id=>lc GP_Attr($e->{zone},'zoneId',''),device=>lc GP_Attr($r,'deviceId','')};
-    if ($GP_JSON->encode($next) ne $GP_JSON->encode($old)) {
+    # Subsecond numeric changes can serialize identically; compare those records.
+    if (!defined($old->{time}) || $e->{time}-$old->{time}>=1
+        || $GP_JSON->encode($next) ne $GP_JSON->encode($old)) {
         $c->{helper}{gp}{geometry}{$debug?'debug':'prod'}{$r}{$e->{zone}}=$next;
         $c->{helper}{gp}{geometry_dirty}{$r}{$e->{zone}}=1 unless $debug;
     }
@@ -1382,7 +1385,7 @@ sub GP_ApplyGeometry {
             next;
         }
         my $old=GP_Geometry($c,$r,$zone,0);
-        my $different=!GP_HasGeometry($old) || grep {$g->{$_}!=$old->{$_}} qw(lat lon radius);
+        my $different=!defined($old->{time}) || grep {$g->{$_}!=$old->{$_}} qw(lat lon radius);
         next if !$different && !$old->{blocked};
         if (defined($old->{time}) && $g->{time}<=$old->{time}) {
             push @errors,"$zone: production geometry is newer or conflicting at the same time; send a newer Geofency test";
@@ -2575,7 +2578,9 @@ sub GP_Process {
     my $previous=$s->{zones}{$e->{zone}};
     return GP_Trace($s,$now,'older zone observation') if $previous && $e->{time}<$previous->{time};
     for my $name (keys %{$s->{zones}}) {
-        if (GP_Contradiction($e,{%{$s->{zones}{$name}},zone=>$name},$cfg)) {
+        my $v=$s->{zones}{$name};
+        next unless $v->{time}==$e->{time};
+        if (GP_Contradiction($e,{%$v,zone=>$name},$cfg)) {
             $s->{conflict}=1; delete $s->{trip}; GP_CancelArrival($s,$now,'contradictory locations');
             GP_RevokeOutputs($s);
             return GP_Trace($s,$now,'contradictory locations at same time');
@@ -2589,24 +2594,23 @@ sub GP_Process {
     my $previous_position=$s->{position_time};
     $s->{position_time}=$e->{time};
     my $role=$zone->{role}; $e->{role}=$role;
+    # geometry_ready guarantees exactly one valid Home and outer circle.
+    my $home=$cfg->{zones}{$cfg->{roles}{home}[0]};
+    my $home_distance=$zone==$home ? 0 : GP_Distance($zone,$home);
     # Geometrically disjoint or nested contradictory older observations are stale.
     for my $other (keys %{$s->{zones}}) {
         next if $other eq $e->{zone};
-        my $v=$s->{zones}{$other}; my $oz=$cfg->{zones}{$other} or next;
-        next if $v->{time}>=$e->{time};
+        my $v=$s->{zones}{$other};
+        next if !$v->{entry} || $v->{time}>=$e->{time};
+        my $oz=$cfg->{zones}{$other} or next;
         next unless GP_HasGeometry($oz);
-        my $dist=GP_Distance($zone,$oz);
+        my $dist=$oz==$home ? $home_distance : GP_Distance($zone,$oz);
         if (($e->{entry} && $dist>$zone->{radius}+$oz->{radius})
             || (!$e->{entry} && $dist+$oz->{radius}<=$zone->{radius})) { $v->{entry}=0; }
     }
     $s->{zones}{$e->{zone}}={entry=>$e->{entry},time=>$e->{time},role=>$role};
     $s->{location}=$e->{entry} ? $zone->{label} : 'underway';
-    my ($home)=map {$cfg->{zones}{$_}} @{$cfg->{roles}{home}//[]};
-    my ($outer)=map {$cfg->{zones}{$_}} @{$cfg->{roles}{outer}//[]};
-    my $far = GP_HasGeometry($home)
-        && GP_Distance($zone,$home)>$zone->{radius}+$home->{radius}+$cfg->{departure_margin};
-    my $remote = ($role eq 'outer' && !$e->{entry})
-        || (GP_HasGeometry($outer) && GP_Distance($zone,$outer)>$zone->{radius}+$outer->{radius});
+    my $far=$home_distance>$zone->{radius}+$home->{radius}+$cfg->{departure_margin};
     GP_CancelArrival($s,$now,'Home or surrounding area exited')
         if !$e->{entry} && $role =~ /\A(?:home|approach|outer)\z/;
     if (!$e->{entry} && $role eq 'home') {
@@ -2616,11 +2620,14 @@ sub GP_Process {
     # Without independent indoor sensors, a near-identical surrounding circle
     # cannot provide the extra distance evidence. Use its nearest boundary.
     if ($area_exit && $cfg->{sourceMode} eq 'geofency_only'
-        && $zone->{radius}-GP_Distance($zone,$home)-$home->{radius}<=$cfg->{departure_margin}) {
+        && $zone->{radius}-$home_distance-$home->{radius}<=$cfg->{departure_margin}) {
         $area_exit=0;
         GP_Trace($s,$now,'departure area too close to Home; distance evidence required');
     }
     if ($area_exit || $far) {
+        my $outer=$cfg->{zones}{$cfg->{roles}{outer}[0]};
+        my $remote=($role eq 'outer' && !$e->{entry})
+            || GP_Distance($zone,$outer)>$zone->{radius}+$outer->{radius};
         return unless GP_Arm($s,$cfg,$e,$now,$mono,$remote ? 'remote':'local',$previous_position);
         $s->{desired_status}='absent' if $s->{phase} eq 'away';
     }
