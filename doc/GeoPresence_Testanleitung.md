@@ -1,6 +1,6 @@
 # GeoPresence – Testanleitung
 
-**Version 4.39 · Stand 04.11.2026 · Handbuch 2.43 · Architektur 0.81**
+**Version 4.40 · Stand 04.11.2026 · Handbuch 2.44 · Architektur 0.82**
 
 Diese Anleitung beschreibt die Prüfung einer eingerichteten GeoPresence-Anlage. Die Testanwendung simuliert Alltagswege und prüft deren neue Diagnosezeilen; gezielte App-Tests prüfen eigene Orts- und Gruppenregeln. Einrichtung, Begriffe und Parameter stehen im [Handbuch](GeoPresence_Handbuch.md).
 
@@ -119,6 +119,10 @@ python3 tools/geopresence_test.py --url https://PUBLIC_HOST/fhem/geopresence --r
 Damit wird Test 17 ergänzt. Ein solcher Helferort ist eine normale location mit Funktion place; `--checkpoint` ist nur die Auswahloption der Testanwendung. Bei vorhandenen Arbeits- und Rückwegregeln sind außerdem die Tests 1,2,5,10 ausdrücklich wählbar.
 
 ## 3. Geprüfte Szenarien
+
+Die Softwareprüfungen der Diagnose verwenden beide FHEM-Zeichenkodierungen. Sie erhalten vollständige Unicode-Berichtswerte und die 512-Zeichen-Grenze der Logtexte, prüfen Steuerzeichenbereinigung sowie sicheres HTML und JSON und verändern keine aufbewahrten Entscheidungen. Für die Betriebszusammenfassung einer Entscheidung werden Namen nur bei sichtbarer Meldung aufbereitet; ihre Diagnosedaten bleiben erhalten. Warnungen bleiben bei passender Logstufe sichtbar. Weitere Fälle prüfen wiederholte JSON-Ausgaben ohne erneute Encoderanlage sowie unveränderte zweispaltige Textausrichtung und den entfallenen Breitenpass bei HTML und mehrspaltigem Text.
+
+Nachrichtenprüfungen verwenden die Kanäle 0, 1, 2 und 10 sowie den Standardkanal. Sowohl erfolgreiche als auch fehlgeschlagene Übergaben müssen die tatsächliche Kanalnummer nennen; die an `pushMsg` übergebenen Werte bleiben gleich.
 
 „Tür“ und „Garage“ bedeuten in dieser Tabelle **Aktionsplan im Debug**, keine reale Öffnung. Bei `--door-only` erwartet die Anwendung ausschließlich die Tür und ausdrücklich keinen Garagenplan. Eine gemeldete Rückkehr vor Ablauf der Ankunftsfrist genügt noch nicht als Plan.
 

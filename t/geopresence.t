@@ -3824,6 +3824,34 @@ subtest 'Telnet uses separate fields without wrapping text or truncating identif
     is(GP_RenderReport({title=>'Commands',sections=>[{commands=>[$line]}]},0),"Commands\n$line\n",'commands stay intact for copy and paste');
 };
 
+subtest 'HTML and multicolumn reports do not make an unused label-width pass' => sub {
+    fixture();
+    my $label='Distinct row label';
+    for my $view ([0,3],[1,2],[1,3]) {
+        my ($html,$column_count)=@$view;
+        my $columns=$column_count==2 ? ['Name','Value']:['Name','Kind','Value'];
+        my $row=$column_count==2 ? [$label,'Complete value']:[$label,'place','Complete value'];
+        my $report={title=>'Output',sections=>[{heading=>'Rows',columns=>$columns,rows=>[$row]}]};
+        my $before=JSON::PP->new->canonical->encode($report);
+        my $labels=0; my $normalize=\&GP_ReportValue;
+        my $output;
+        {
+            no warnings 'redefine';
+            local *GP_ReportValue=sub {
+                $labels++ if defined($_[0]) && $_[0] eq $label;
+                return $normalize->(@_);
+            };
+            $output=GP_RenderReport($report,$html);
+        }
+        is($labels,1,'each first-column value is normalized only for actual rendering');
+        like($output,qr/\Q$label\E/,'the full row label remains visible');
+        like($output,qr/Complete value/,'the full row value remains visible');
+        is(JSON::PP->new->canonical->encode($report),$before,'rendering leaves structured input unchanged');
+    }
+    is(GP_RenderReport({title=>'Aligned',sections=>[{rows=>[['Short','one'],['Long label','two']]}]},0),
+        "Aligned\n  Short      : one\n  Long label : two\n",'two-column text retains aligned labels');
+};
+
 subtest 'recent phone decisions retain their actual source without inheriting stale causes' => sub {
     my ($c,$cfg)=fixture();my $s=GP_State($c,'Geo.Test',0);advance(40);
     GP_Process($s,$cfg,{kind=>'phone_snapshot',time=>$now-1,received=>$now,generation=>$s->{generation}},$now,$mono);

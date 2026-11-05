@@ -1,6 +1,6 @@
 # GeoPresence – Handbuch
 
-**Version 2.43 · Stand 04.11.2026 · Architektur 0.81**
+**Version 2.44 · Stand 04.11.2026 · Architektur 0.82**
 
 GeoPresence ist eine Anwesenheits- und Ortssteuerung für FHEM. Es wertet aus, wer zu Hause ist, wer das Haus verlassen hat und wer zurückkehrt, und verbindet diese Informationen mit konfigurierbaren Automationen. So lässt sich beispielsweise beim Betreten eines Gartenbereichs ein Licht einschalten, beim Erreichen eines Arbeitsortes eine Nachricht senden oder bei einer berechtigten Heimkehr die vorhandene Tür- und Garagensteuerung ansprechen. Ziel ist, solche Aktionen passend zur Situation auszuführen und Fehlreaktionen auf einzelne unzuverlässige Meldungen zu vermeiden.
 
@@ -720,6 +720,8 @@ Die erste Zeile lautet **=== PRODUCTION ===** oder **=== DEBUG ===** und benennt
 Für Programme `format=json` ergänzen, etwa `get System.GeoPresence explain Geo.PERSON debug format=json`. Die vollständigen Daten der gewählten Ansicht stehen unter `state` und `geometry`; `view` enthält `debug` oder `production`, `mode` den wirksamen Betriebsmodus. `requested_mode`, `controller_mode` und `mode_reason` erklären die beiden Einstellungen und deren Zusammenspiel. Weitere Felder sind `initialized`, `geometry_ready`, `geometry_errors`, `missing_geometry`, `pending_actors` und `errors`; die Debug-Ansicht enthält außerdem `debug_ready` und `debug_blockers`. Die Testanwendung fragt ausdrücklich `explain Geo.PERSON debug format=json` ab und prüft die gemeldete Ansicht vor dem ersten Test. `get System.GeoPresence debugTrace Geo.PERSON limit=20` zeigt mehr Einträge des aufgezeichneten Simulationsverlaufs. Keiner dieser Aufrufe verarbeitet Ereignisse oder bestätigt eine Ankunft.
 
 Normale englische Aktionsmeldungen stehen im FHEM-Log. Ausführliche technische Diagnosen erscheinen ausschließlich in der mit `logFile` gewählten Datei. Mit `attr System.GeoPresence debugLog 1` kann die Diagnose im Produktivbetrieb eingeschaltet werden, ohne den Betriebsmodus zu ändern; `auto` aktiviert sie bei Simulation, `0` deaktiviert sie. FHEMs `verbose` beeinflusst die normalen Logmeldungen.
+
+Eine Meldung wie `Notification handed to pushMsg channel 2` beschreibt die Übergabe an den Nachrichtenadapter über Kanal 2. Welcher Dienst darüber erreicht wird, bestimmt die eingerichtete `pushMsg`-Funktion. Fehlgeschlagene Übergaben nennen ebenfalls den tatsächlichen Kanal.
 
 ### 8.2 Konfiguration ändern oder eine weitere Person aufnehmen
 

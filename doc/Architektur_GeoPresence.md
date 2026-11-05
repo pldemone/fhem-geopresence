@@ -1,6 +1,6 @@
 # GeoPresence – Architektur
 
-**Version 0.81 · Stand 04.11.2026 · Handbuch 2.43**
+**Version 0.82 · Stand 04.11.2026 · Handbuch 2.44**
 
 Diese Beschreibung spezifiziert den aktuellen Aufbau von `FHEM/98_GeoPresence.pm`. Einrichtung und Bedienung stehen im [Handbuch](GeoPresence_Handbuch.md); Prüfabläufe und Testprogramm sind in der [Testanleitung](GeoPresence_Testanleitung.md) beschrieben. Gerätenamen wie `Geo.PERSON` und `Geo.PERSON.ORT` sind austauschbare Beispiele.
 
@@ -440,7 +440,13 @@ Die Testanwendung prüft vor dem ersten Reset die Modulunterstützung über `deb
 
 Das normale FHEM-Log enthält kurze englische Betriebsereignisse: betretene/verlassene Orte, angeforderte Geräteaktionen, Nachrichtenaufträge und relevante Betriebsfehler. Es enthält keine umfangreichen JSON-Entscheidungsdatensätze. Die allgemeinen FHEM-Logstufen bestimmen dessen Sichtbarkeit.
 
+Bei produktiven Entscheidungszeilen prüft die Aufbereitung zuerst den Meldungsgrund und die benötigte Logstufe. Bewohnernamen werden erst für eine tatsächlich ausgewählte und sichtbare Betriebsmeldung aufgelöst, Zielbezeichnungen ausschließlich für die betroffenen Geräte- und Rückmeldungszweige. Unberücksichtigte Entscheidungen und durch `verbose` ausgeblendete Betriebsmeldungen bleiben unabhängig davon für die ausführliche Diagnose verfügbar. Behaltene Trace-Datensätze werden durch die Formatierung nicht verändert.
+
+Logtexte und Berichtswerte verwenden dieselbe Unicode-Dekodierung und Steuerzeichenbereinigung. Nur Logtexte werden anschließend auf 512 Zeichen begrenzt; Berichtswerte bleiben vollständig. HTML-Escaping und die sichere JSON-Ausgabe bleiben getrennte Ausgaberegeln. Nachrichtenmeldungen nennen den tatsächlich an `pushMsg` übergebenen Kanal. Die externe Adapterkonfiguration bestimmt dessen Zustellungsziel.
+
 Die ausführliche Diagnose schreibt GeoPresence ausschließlich in das ausdrücklich konfigurierte `logFile`. Ohne dieses Attribut wird keine Diagnosedatei geschrieben; die Handbuchbeispiele verwenden eine monatliche Datei im Logverzeichnis. `debugLog auto` aktiviert sie bei effektivem Debug und Lernen, `1` auch im Produktivbetrieb und `0` unterdrückt sie. Strukturierte Daten enthalten ausgewählte Ereignis-, Zeit-, Regel- und Entscheidungsfelder, keine Passwörter oder vollständigen HTTP-Anfragen. `logStatus` zeigt Pfad, Aktivierung und Schreibfehler.
+
+Die beiden vorhandenen kanonischen JSON-Encoder für UTF-8 und ASCII werden wiederverwendet. Diagnosezeilen, FHEMWEB-JSON und Checkpoints verwenden dieselbe ASCII-Konfiguration, behalten aber ihre getrennten Datensätze und Schutzregeln. Strukturierte JSON-Werte werden nicht durch die Textbereinigung für menschlich lesbare Ausgaben verändert.
 
 ### 10.3 Bedienoberfläche
 
@@ -451,6 +457,8 @@ Der Gerätestatus STATE einer Person zeigt ihren wirksamen Betriebsmodus disable
 Die Abfrage `set <controller> ?` liefert FHEMs standardisierte Liste einzelner Befehle mit ihren Eingabefeldern. Bewohner und feste Parameter werden in nativen Auswahllisten angeboten; `debugAdvance` verwendet ein Textfeld für Bewohner und Sekunden. Das Ermitteln der Befehlsliste verändert keine Reisen, Geometrie oder Lernfenster. Ein Aufruf ohne Bewohner erklärt die benötigten Parameter und führt nichts aus; die vorhandenen Modus- und Quellenprüfungen gelten auch für die Oberfläche.
 
 Englische Modulhilfe und kontextbezogene Attributhilfe gehören zur Moduldatei. Menschliche `get`-Ausgaben verwenden in FHEMWEB gegliederte HTML-Berichte und in Telnet Großbuchstabenüberschriften, Trennlinien, ausgerichtete Werte und eingerückte Blöcke. Jede Eigenschaft steht in einer eigenen Zeile; Werte und Erläuterungen enthalten keine vom Renderer eingefügten Zeilenumbrüche. Kennungen und kopierbare Befehle werden nicht gekürzt.
+
+Die Berechnung der ersten Spaltenbreite erfolgt ausschließlich für zweispaltige Texttabellen. HTML-Tabellen und mehrspaltige Textblöcke verarbeiten ihre Werte direkt im passenden Ausgabezweig. Die Aufbereitung verändert weder Berichtsdaten noch Zeileninhalte.
 
 `explain PERSON` und `explain PERSON prod` zeigen immer den vollständigen produktiven Bericht, unabhängig vom aktuellen Betriebsmodus. `explain PERSON debug` zeigt den vollständigen Simulationsbericht. Auf einem Bewohnergerät kann der Personenname entfallen. Der Kopf markiert den Zustandsbereich mit DEBUG oder PRODUCTION; Status nennt den tatsächlichen Modus separat. Disabled, pausierte Produktivverarbeitung und nicht initialisierte Zustände werden ausdrücklich kenntlich gemacht. Die Abfrage verändert keinen Modus, erzeugt keine Laufzeitreise und initialisiert keinen Simulationszustand.
 
@@ -587,6 +595,13 @@ Weitere Prüfungen umfassen abgeschlossene Geo- und telefonbestätigte Reisen mi
 Die Prüfungen der Telefonverarbeitung sichern die fachlichen Abläufe im Zustands- und Messmodus ab. Direkte interne Testereignisse enthalten die Pflichtfelder des regulären Erzeugers. Eine zusätzliche Gegenprobe qualifiziert Abwesenheit im Zustands- und Messmodus, prüft unveränderte Negativwerte und meldet anschließend einen Quellenfehler. Der Fehler muss auch nach bereits bestätigter Abwesenheit erkannt werden; eine bloße Wiederverbindung mit alten Werten genügt nicht, neue Beobachtungen und eine vollständige erneuerte Frist bleiben erforderlich.
 
 ## 13. Änderungen seit der letzten Version
+
+Änderungen von Version 0.81 auf 0.82:
+
+- Gemeinsame Textnormalisierung für Logs und vollständige Berichtswerte verwendet; die Loglängenbegrenzung bleibt getrennt.
+- Bezeichnungen produktiver Entscheidungen erst bei Bedarf aufbereitet; vorhandene JSON-Encoder wiederverwendet.
+- Spaltenbreiten nur für zweispaltige Textausgaben berechnet; Ausgabeinhalte und Transport-Escaping erhalten.
+- Nachrichtenmeldungen auf den tatsächlichen `pushMsg`-Kanal bezogen und die allgemeine Get-Hilfe an die vollständige Textausgabe angepasst.
 
 Änderungen von Version 0.80 auf 0.81:
 

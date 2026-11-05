@@ -73,7 +73,7 @@ my %GP_ACTION_ATTRS = (
     switch_on => [qw(target command)],
 );
 my $GP_JSON = JSON::PP->new->canonical->utf8;
-my $GP_CHECKPOINT_JSON = JSON::PP->new->canonical->ascii;
+my $GP_ASCII_JSON = JSON::PP->new->canonical->ascii;
 my @GP_CHECKPOINT_TRIP_FIELDS = qw(id start home_exit scope armed away_time away_reason actions exits);
 my @GP_CHECKPOINT_STATE_FIELDS = qw(location position_time boundary zones members zone_visits group_visits motion motion_time automotive);
 my $GP_PHONE_DEPARTURE_REASON = 'Home exit and qualified phone absence';
@@ -380,20 +380,24 @@ sub GP_DebugLogEnabled {
 
 # GP_LogText: Decode, sanitize, and bound text written to operational logs.
 sub GP_LogText {
-    my ($text)=@_;
-    $text//='';
-    # FHEM's bytestream attributes contain UTF-8 bytes, while module literals
-    # are characters. Decode before joining or removing Unicode controls.
-    $text=decode('UTF-8',$text) if !$unicodeEncoding && !utf8::is_utf8($text);
-    $text =~ s/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]+/ /g;
-    return substr($text,0,512);
+    return substr(GP_ReportValue($_[0]),0,512);
 }
 
 # GP_LogResident: Resolve a resident's human-readable name for log messages.
 sub GP_LogResident {
     my ($r)=@_;
-    my $rr=GP_Field($r,'ROOMMATE',$r);
-    return GP_LogText(GP_Attr($r,'alias',GP_Attr($rr,'alias',$rr)));
+    my $name=GP_Attr($r,'alias',undef);
+    if (!defined($name)) {
+        my $rr=GP_Field($r,'ROOMMATE',$r);
+        $name=GP_Attr($rr,'alias',$rr);
+    }
+    return GP_LogText($name);
+}
+
+# GP_LogTarget: Resolve a hardware target's display name for an operational message.
+sub GP_LogTarget {
+    my ($target)=@_; $target//='';
+    return GP_LogText(GP_Attr($target,'alias',$target));
 }
 
 # GP_NormalLog: Write a sanitized operational message through FHEM's logger.
@@ -401,7 +405,7 @@ sub GP_LogResident {
 sub GP_NormalLog {
     my ($c,$level,$text)=@_;
     return unless $c && defined &Log3;
-    return if $level>GP_Attr($c->{NAME},'verbose',GP_Attr('global','verbose',3));
+    return if $level>(GP_Attr($c->{NAME},'verbose',undef)//GP_Attr('global','verbose',3));
     my $line=$c->{NAME}.' GeoPresence: '.GP_LogText($text);
     GP_Profile($c,'normal_log',$c->{NAME},sub {Log3($c->{NAME},$level,$unicodeEncoding ? $line : encode('UTF-8',$line))});
 }
@@ -409,10 +413,12 @@ sub GP_NormalLog {
 # GP_LogAction: Translate selected productive decisions into concise operational messages.
 sub GP_LogAction {
     my ($c,$r,$row)=@_;
+    return unless $c && defined &Log3;
     my $reason=$row->{reason}//'';
-    my $who=GP_LogResident($r);
-    my $target=GP_LogText(GP_Attr($row->{target}//'','alias',$row->{target}//''));
-    my ($text,$level)=('',3);
+    # Only failures and unsuccessful actor feedback use the warning level.
+    my $level=($reason =~ / failed\z/ || ($reason eq 'actor feedback' && ($row->{result}//'') ne 'confirmed')) ? 2:3;
+    return if $level>(GP_Attr($c->{NAME},'verbose',undef)//GP_Attr('global','verbose',3));
+    my $text='';
     if ($reason eq 'zone observation processed' && $row->{changed}) {
         my $zone=GP_LogText($row->{zone_label}//$row->{zone});
         $text=($row->{entry} ? 'Entered area “' : 'Left area “').$zone.'”.';
@@ -421,32 +427,32 @@ sub GP_LogAction {
     } elsif ($reason eq 'phone absence qualified' && $row->{changed}) {
         $text='Marked absent (phone absence confirmed).';
     } elsif ($reason eq 'notification dispatched' || $reason eq 'notification failed') {
-        my %channels=(0=>'SmartHome',1=>'SmartHome',2=>'SmartAdmin',10=>'Pushover');
-        my $channel=$channels{$row->{channel}//0}//'notification service';
+        my $channel='pushMsg channel '.($row->{channel}//0);
         if ($reason eq 'notification dispatched') {
             $text='Notification handed to '.$channel.': “'.GP_LogText($row->{message}).'”.';
-        } else { $text='Could not hand notification to '.$channel.'.'; $level=2; }
+        } else { $text='Could not hand notification to '.$channel.'.'; }
     } elsif ($reason eq 'switch command dispatched' || $reason eq 'switch command failed') {
+        my $target=GP_LogTarget($row->{target});
         $text=($reason eq 'switch command dispatched' ? 'Switch-on requested for “' : 'Switch-on failed for “').$target.'”.';
-        $level=2 if $reason eq 'switch command failed';
     } elsif ($reason eq 'actor command dispatched' || $reason eq 'actor command failed') {
+        my $target=GP_LogTarget($row->{target});
         my $kind=($row->{kind}//'') eq 'door_open' ? 'Door opening' : 'Garage opening';
         $text=$reason eq 'actor command dispatched'
             ? $kind.' requested for “'.$target.'”.'
             : 'Could not request '.lcfirst($kind).' for “'.$target.'”.';
-        $level=2 if $reason eq 'actor command failed';
     } elsif ($reason eq 'actor feedback') {
         my $door=($row->{kind}//'') eq 'door_open';
         if (($row->{result}//'') eq 'confirmed') {
+            my $target=GP_LogTarget($row->{target});
             $text=$door ? 'Door opener “'.$target.'” confirmed the opening pulse.' : 'Garage “'.$target.'” is open.';
         } else {
             my %results=(failed=>'failed',cancelled=>'cancelled',uncertain=>'ended without confirmation');
             return unless exists $results{$row->{result}//''};
+            my $target=GP_LogTarget($row->{target});
             $text=($door ? 'Door opening' : 'Garage opening').' for “'.$target.'” '.$results{$row->{result}}.'.';
-            $level=2;
         }
     }
-    GP_NormalLog($c,$level,$who.': '.$text) if length $text;
+    GP_NormalLog($c,$level,GP_LogResident($r).': '.$text) if length $text;
 }
 
 # GP_Log: Record operational notices and bounded, filtered file diagnostics.
@@ -480,7 +486,7 @@ sub GP_Log {
         $safe{$key}=substr($detail->{$key},0,512);
     }
     # ASCII JSON escapes embedded line breaks and Unicode separators as data.
-    my $text=$c->{NAME}.' GeoPresence '.$event.' '.JSON::PP->new->canonical->ascii->encode(\%safe);
+    my $text=$c->{NAME}.' GeoPresence '.$event.' '.$GP_ASCII_JSON->encode(\%safe);
     my $error=GP_Profile($c,'diagnostic_file',$c->{NAME},sub {GP_WriteLog($path,$level,$text)});
     if ($error) {
         $c->{helper}{gp_log_error}=$error;
@@ -3048,7 +3054,7 @@ sub GP_WriteHTTP {
 sub GP_ClearCheckpoint {
     my ($r,$reason)=@_;
     my $d=$defs{$r} or return;
-    my $value=$GP_CHECKPOINT_JSON->encode({version=>3,status=>'none',reason=>$reason});
+    my $value=$GP_ASCII_JSON->encode({version=>3,status=>'none',reason=>$reason});
     return if GP_Read($r,'gp_trip_checkpoint','') eq $value;
     setReadingsVal($d,'gp_trip_checkpoint',$value,POSIX::strftime('%Y-%m-%d %H:%M:%S',localtime(GP_Now())));
 }
@@ -3061,7 +3067,7 @@ sub GP_ResumeRevision {
     return $cfg->{resume_revision} if defined $cfg->{resume_revision};
     my $revision=GP_ConfigRevision($cfg);
     my (undef,$auth)=GP_Auth($r);
-    return $cfg->{resume_revision}=sha256_hex($GP_CHECKPOINT_JSON->encode({
+    return $cfg->{resume_revision}=sha256_hex($GP_ASCII_JSON->encode({
         config=>$revision,controller=>$c->{NAME},resident=>$r,
         device=>lc(GP_Attr($r,'deviceId','')),user=>lc(GP_Attr($r,'webhookUser','')),
         auth=>sha256_hex($auth//''),roommate=>$cfg->{roommate}}));
@@ -3100,7 +3106,7 @@ sub GP_Checkpoint {
             trip=>{map {$_=>$t->{$_}} grep {exists $t->{$_}} @GP_CHECKPOINT_TRIP_FIELDS},
             state=>{action_elapsed=>$elapsed,map {$_=>$s->{$_}} grep {exists $s->{$_}}
                 (@GP_CHECKPOINT_STATE_FIELDS,qw(action_visits action_last))}};
-        my $value=eval {$GP_CHECKPOINT_JSON->encode($checkpoint)};
+        my $value=eval {$GP_ASCII_JSON->encode($checkpoint)};
         if (defined($value) && length($value)<=65536) {
             setReadingsVal($defs{$r},'gp_trip_checkpoint',$value,
                 POSIX::strftime('%Y-%m-%d %H:%M:%S',localtime(GP_Now())));
@@ -3127,7 +3133,7 @@ sub GP_ResumeTrip {
         local $@;
         my $ok=eval {
             die "checkpoint too large\n" if length($raw)>65536;
-            $checkpoint=$GP_CHECKPOINT_JSON->decode($raw);
+            $checkpoint=$GP_ASCII_JSON->decode($raw);
             die "invalid checkpoint structure\n" unless ref($checkpoint) eq 'HASH'
                 && !ref($checkpoint->{version}) && ($checkpoint->{version}//'') =~ /\A[123]\z/
                 && !ref($checkpoint->{status}) && ($checkpoint->{status}//'') =~ /\A(?:qualified|none)\z/;
@@ -4506,10 +4512,12 @@ sub GP_ReportDuration {
     return sprintf('%d h %02d min',int($seconds/3600),int($seconds/60)%60);
 }
 
-# GP_ReportValue: Normalize report text to Unicode and remove control characters.
+# GP_ReportValue: Normalize log and report text to Unicode and remove control characters.
 sub GP_ReportValue {
     my ($text)=@_;
     $text//='';
+    # FHEM's bytestream attributes contain UTF-8 bytes, while module literals
+    # are characters. Decode before joining or removing Unicode controls.
     $text=decode('UTF-8',$text) if !$unicodeEncoding && !utf8::is_utf8($text);
     $text =~ s/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]+/ /g;
     return $text;
@@ -4530,7 +4538,7 @@ sub GP_ReportEscape {
 # GP_ReportJSON: Encode report data as JSON safe for the selected FHEM transport.
 sub GP_ReportJSON {
     my ($value,$web)=@_;
-    my $json=$web ? JSON::PP->new->canonical->ascii->encode($value) : $GP_JSON->encode($value);
+    my $json=($web ? $GP_ASCII_JSON : $GP_JSON)->encode($value);
     # FHEMWEB inserts even a JSON response into a <pre> using .html().
     # Escapes preserve decoded values and prevent executable markup.
     $json =~ s/([<>&])/sprintf('\\u%04x',ord($1))/eg if $web;
@@ -4541,7 +4549,7 @@ sub GP_ReportJSON {
 sub GP_ReportCell {
     my ($text)=@_;
     my $escaped=GP_ReportEscape($text);
-    if (defined($text) && GP_Name($text) && exists($defs{$text}) && defined($FW_ME)) {
+    if (defined($FW_ME) && defined($text) && GP_Name($text) && exists($defs{$text})) {
         return '<a href="'.GP_ReportEscape($FW_ME.($FW_subdir//'').'?detail='.$text).'">'.$escaped.'</a>';
     }
     return $escaped;
@@ -4590,9 +4598,11 @@ sub GP_RenderReport {
         my $columns=$section->{columns}//['Item','Status'];
         if (@$rows) {
             my $width=0;
-            for my $row (@$rows) {
-                my $length=length(GP_ReportValue($row->[0]));
-                $width=$length if $length>$width;
+            if (!$html && @$columns==2) {
+                for my $row (@$rows) {
+                    my $length=length(GP_ReportValue($row->[0]));
+                    $width=$length if $length>$width;
+                }
             }
             $out.='<table class="block" style="width:100%;table-layout:fixed;border-collapse:collapse"><thead><tr>'
                 .join('',map {'<th style="text-align:left;padding:.4em;vertical-align:top">'.GP_ReportEscape($_).'</th>'} @$columns).'</tr></thead><tbody>' if $html;
@@ -4608,8 +4618,8 @@ sub GP_RenderReport {
                     $out.="\n" unless $first_row;
                     $out.=GP_ReportLine($row->[0]);
                     $out.=GP_ReportLine($row->[$_],'  '.$columns->[$_].': ') for 1..$#$columns;
+                    $first_row=0;
                 }
-                $first_row=0;
             }
             $out.='</tbody></table>' if $html;
         }
@@ -4938,11 +4948,12 @@ sub GP_GetData {
     my $c=GP_Controller($hash);
     return (undef,'Controller unavailable') unless $c;
     if ($command eq 'logStatus') {
-        return ({file=>GP_LogPath($c),verbose=>GP_Attr($c->{NAME},'verbose',GP_Attr('global','verbose',3)),
+        my $path=GP_LogPath($c);
+        return ({file=>$path,verbose=>(GP_Attr($c->{NAME},'verbose',undef)//GP_Attr('global','verbose',3)),
             debugLog=>GP_Attr($c->{NAME},'debugLog','auto'),normal_log=>'FHEM',
-            debugEnabled=>length(GP_LogPath($c)) && GP_DebugLogEnabled($c,{mode=>'debug'}) ? 1:0,
-            learningEnabled=>length(GP_LogPath($c)) && GP_DebugLogEnabled($c,{mode=>'learning'}) ? 1:0,
-            activeEnabled=>length(GP_LogPath($c)) && GP_DebugLogEnabled($c,{mode=>'active'}) ? 1:0,
+            debugEnabled=>length($path) && GP_DebugLogEnabled($c,{mode=>'debug'}) ? 1:0,
+            learningEnabled=>length($path) && GP_DebugLogEnabled($c,{mode=>'learning'}) ? 1:0,
+            activeEnabled=>length($path) && GP_DebugLogEnabled($c,{mode=>'active'}) ? 1:0,
             error=>$c->{helper}{gp_log_error}//'',rate_limit=>300});
     }
     if ($command eq 'timerStats') {
@@ -5260,7 +5271,7 @@ get System.GeoPresence validate Geo.PERSON</pre>
   <a id="GeoPresence-get"></a>
   <h4>Get commands</h4>
   <p>These commands return information without executing device definitions or actuator commands. The examples use the controller; debugTrace and explain also infer the resident when invoked on a resident device without a resident argument.</p>
-  <p><b>Output formats:</b> FHEMWEB shows formatted reports; Telnet uses uppercase section headings, underlines, aligned values and indented entries. Prose wraps at about 80 columns; identifiers and commands are never cut. Append <code>format=json</code> for scripts, <code>format=text</code> for text in either interface, or <code>format=html</code> for HTML. Browser text is displayed in a safe, wrapping text block.</p>
+  <p><b>Output formats:</b> FHEMWEB shows formatted reports; Telnet uses uppercase section headings, underlines, aligned values and indented entries. Each property stays on one line without added wrapping; values, identifiers and commands remain complete. Append <code>format=json</code> for scripts, <code>format=text</code> for text in either interface, or <code>format=html</code> for HTML. Browser text is displayed in a safe, wrapping text block.</p>
   <p>JSON contains complete diagnostic data and Unix timestamps; errors use an <code>error</code> field. Reports are snapshots: reading them does not confirm arrivals, create a simulation, send commands or advance timers.</p>
   <ul>
     <li><a id="GeoPresence-get-validate"></a><b>validate [&lt;resident&gt;]</b>

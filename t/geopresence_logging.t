@@ -208,15 +208,88 @@ subtest 'Phone state summaries and normal verbose filter' => sub {
     like(debug_text(),qr/observation received/,'verbose 2 does not hide detail file');
 };
 
+subtest 'Quiet and filtered operational decisions preserve trace data without resolving labels' => sub {
+    fixture(); $attr{$c->{NAME}}{debugLog}=1;
+    my @rows=(
+        {reason=>'observation received',target=>'Door'},
+        {reason=>'zone observation processed',changed=>0,zone_label=>'Vorgarten'},
+        {reason=>'actor feedback',result=>'pending',target=>'Door'},
+        {reason=>'duplicate event',target=>'Light'});
+    my $before=dclone(\@rows);
+    my ($residents,$targets)=(0,0); my $resident=\&GP_LogResident; my $target=\&GP_LogTarget;
+    {
+        no warnings 'redefine';
+        local *GP_LogResident=sub {$residents++; return $resident->(@_)};
+        local *GP_LogTarget=sub {$targets++; return $target->(@_)};
+        GP_LogDecision($c,$r,$_,0) for @rows;
+        is_deeply([$residents,$targets],[0,0],'unselected decisions resolve no display names');
+        $attr{$c->{NAME}}{verbose}=2;
+        GP_LogDecision($c,$r,{reason=>'switch command dispatched',target=>'Light'},0);
+        is_deeply([$residents,$targets],[0,0],'verbose-filtered actions resolve no display names');
+        GP_LogDecision($c,$r,{reason=>'switch command failed',target=>'Light'},0);
+        is_deeply([$residents,$targets],[1,1],'a visible warning resolves each required label once');
+    }
+    is_deeply(\@rows,$before,'formatting does not modify retained decisions');
+    is(scalar @normal,1,'only the warning is written to the operational log');
+    is($normal[0][1],2,'failure remains visible at warning verbosity');
+    like(output(),qr/Lumo: Switch-on failed for “Vorgartenlicht”/,'warning text is unchanged');
+    like(debug_text(),qr/observation received/,'unselected decisions remain in the diagnostic file');
+    like(debug_text(),qr/switch command dispatched/,'verbose-filtered actions retain their diagnostic entry');
+};
+
+subtest 'Log and report text share normalization while keeping separate length limits' => sub {
+    for my $unicode (0,1) {
+        fixture(); $unicodeEncoding=$unicode;
+        my $text="Grüße 🌙\x{202e}\n".('x'x650)."\x{2029}\tEnd";
+        my $expected='Grüße 🌙 '.('x'x650).' End';
+        my $input=$unicode ? $text : encode('UTF-8',$text);
+        my $before=$input;
+        is(GP_ReportValue($input),$expected,'reports preserve the complete normalized value');
+        is(GP_LogText($input),substr($expected,0,512),'logs keep the original character limit');
+        is(length(GP_LogText($input)),512,'the log limit counts characters in either encoding');
+        is($input,$before,'normalization leaves the original input unchanged');
+        is(GP_ReportValue(undef),'','missing report values stay empty');
+        is(GP_LogText(0),'0','zero remains a valid log value');
+    }
+};
+
+subtest 'Repeated diagnostics and JSON reports reuse their encoder configuration' => sub {
+    fixture(); $attr{$c->{NAME}}{debugLog}=1;
+    my $value={text=>"Grüße 🌙 <script>&\x{2028}"};
+    my $before=dclone($value);
+    my (@web,@plain); my $constructors=0; my $new=JSON::PP->can('new');
+    {
+        no warnings qw(redefine once);
+        local *JSON::PP::new=sub {$constructors++; return $new->(@_)};
+        for (1..3) {
+            GP_Log($c,4,'decision',{resident=>$r,mode=>'active',reason=>$value->{text}});
+            push @web,GP_ReportJSON($value,1);
+            push @plain,GP_ReportJSON($value,0);
+        }
+    }
+    is($constructors,0,'neither log lines nor report queries create another encoder');
+    for my $json (@web) {
+        unlike($json,qr/[^\x00-\x7f]|[<>&]/,'web JSON stays ASCII and safe for HTML embedding');
+        is_deeply(decode_json($json),$value,'web JSON preserves the complete original data');
+    }
+    is_deeply(decode_json($_),$value,'non-web JSON preserves the same data') for @plain;
+    is(scalar @{file_lines()},3,'each diagnostic row is written once');
+    like(debug_text(),qr/\\u[0-9a-fA-F]{4}/,'diagnostic Unicode remains ASCII-escaped');
+    is_deeply($value,$before,'encoder reuse leaves caller data unchanged');
+};
+
 subtest 'Production notifications and switches report actual handoff' => sub {
-    fixture();
-    intent('notify',{message=>'%resident% kommt nach Hause',channel=>0,priority=>0}); dispatch();
-    is_deeply(\@messages,[[0,0,'Lumo kommt nach Hause']],'real notification adapter called once');
-    like(output(),qr/Notification handed to SmartHome: “Lumo kommt nach Hause”/,'human message with service and text');
-    $push_error=1;
-    intent('notify',{message=>'Nicht gesendet',channel=>2}); dispatch();
-    like(output(),qr/Could not hand notification to SmartAdmin/,'failed handoff not logged as sent');
-    is($normal[-1][1],2,'notification failure at level 2');
+    for my $channel (0,1,2,10,undef) {
+        fixture(); my $expected=$channel//0;
+        intent('notify',{message=>'%resident% kommt nach Hause',channel=>$channel,priority=>0}); dispatch();
+        is_deeply(\@messages,[[$expected,0,'Lumo kommt nach Hause']],'real notification adapter called once with the configured channel');
+        like(output(),qr/Notification handed to pushMsg channel $expected: “Lumo kommt nach Hause”/,'human message identifies the actual adapter channel and text');
+        $push_error=1;
+        intent('notify',{message=>'Nicht gesendet',channel=>$channel}); dispatch();
+        like(output(),qr/Could not hand notification to pushMsg channel $expected\./,'failed handoff identifies the actual channel');
+        unlike(output(),qr/SmartHome|SmartAdmin|Pushover/,'generic channels do not assume an external service');
+        is($normal[-1][1],2,'notification failure at level 2');
+    }
     intent('switch_on',{target=>'Light',command=>'on'}); dispatch();
     is($sets[-1],'Light on','unchanged fixed switch command');
     like(output(),qr/Switch-on requested for “Vorgartenlicht”/,'switch request accurately described');
