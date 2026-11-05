@@ -1,6 +1,6 @@
 # GeoPresence – Handbuch
 
-**Version 2.44 · Stand 04.11.2026 · Architektur 0.82**
+**Version 2.45 · Stand 05.11.2026 · Architektur 0.83**
 
 GeoPresence ist eine Anwesenheits- und Ortssteuerung für FHEM. Es wertet aus, wer zu Hause ist, wer das Haus verlassen hat und wer zurückkehrt, und verbindet diese Informationen mit konfigurierbaren Automationen. So lässt sich beispielsweise beim Betreten eines Gartenbereichs ein Licht einschalten, beim Erreichen eines Arbeitsortes eine Nachricht senden oder bei einer berechtigten Heimkehr die vorhandene Tür- und Garagensteuerung ansprechen. Ziel ist, solche Aktionen passend zur Situation auszuführen und Fehlreaktionen auf einzelne unzuverlässige Meldungen zu vermeiden.
 
@@ -749,13 +749,17 @@ Für eine sofortige Überprüfung die Person auf `mode debug` stellen, die Anlau
 
 Ein Neustart während deiner Abwesenheit kann den bereits bestätigten Ausflug fortsetzen. GeoPresence speichert dafür `gp_trip_checkpoint` als zusammengehöriges Reading in FHEMs normaler Zustandsdatei. Der Stand enthält den ursprünglichen Abwesenheitsnachweis, die lokale/ferne Reichweite, den Ortsverlauf und bereits verbrauchte Aktionen. Keine zusätzliche Datenbank ist erforderlich. Reines `absent`, ein noch unbestätigter Home-Austritt oder ein Debug-Ausflug reichen dafür nicht.
 
-Der gespeicherte Stand wird bei Änderungen am Ausflug aktualisiert. Identische Webhook-Wiederholungen, reine Diagnoseeinträge und unveränderte Timerläufe schreiben ihn nicht erneut; auch ein Neustart allein erneuert im aktuellen Format seinen Speicherzeitpunkt nicht. Neue gültige Bewegungsdaten, entfallene Nachweise und verbrauchte Berechtigungen werden weiterhin gespeichert.
+Der gespeicherte Stand wird bei Änderungen am Ausflug aktualisiert. Identische Webhook-Wiederholungen, reine Diagnoseeinträge und unveränderte Timerläufe schreiben ihn nicht erneut; auch ein Neustart allein erneuert bei aktuellem Daten- und Bindungsformat seinen Speicherzeitpunkt nicht. Neue gültige Bewegungsdaten, entfallene Nachweise und verbrauchte Berechtigungen werden weiterhin gespeichert.
 
 GeoPresence behält dafür aktuelle Verbrauchsstände und Cooldowns statt einer wachsenden Liste alter Besuche. Beim Update werden gültige Checkpoints der Versionen 1 und 2 einmal in das Format Version 3 übernommen. Der ursprüngliche Ausflug und bereits verbrauchte Aktionen bleiben erhalten; die Umstellung holt keine Befehle nach und erneuert den Abwesenheitsnachweis nicht. Ein bereits verworfener oder ungültiger alter Stand wird dadurch nicht wieder gültig.
 
 Der Checkpoint hält zusätzlich fest, wie viel der Cooldown-Sperrzeit beim Speichern tatsächlich verstrichen war. Eine dort noch offene Restzeit läuft nach dem Neustart weiter; Zeit seit diesem Speicherstand und während des Stillstands wird vorsichtshalber nicht angerechnet. Waren beispielsweise 290 von 300 Sekunden abgelaufen, bleibt die Aktion nach dem Neustart noch zehn Sekunden gesperrt. Bereits beim Speichern abgelaufene Sperren beginnen nicht erneut. Ältere Formate liefern als Ausgangspunkt den Abstand zwischen ihrem Speicherzeitpunkt und der letzten Aktion; frühere Uhrkorrekturen lassen sich daraus nicht nachträglich ermitteln.
 
 Nach Neustart, rereadcfg oder Modulreload prüft GeoPresence den gespeicherten Stand. Identität, Kennwortbindung, Quellenprofil, relevante Konfiguration und Geometrie müssen passen; eine spätere lokale Anwesenheit oder ein späteres ROOMMATE `home` widerspricht dem Ausflug. Die ursprüngliche Abwesenheitsbestätigung darf standardmäßig höchstens 48 Stunden alt sein. `trip_resume_max_age` am Controller legt diese Grenze in Sekunden fest; Speichern oder wiederholtes Neustarten erneuert den Nachweis nicht.
+
+Eine reine Änderung oder Löschung des ROOMMATE-Alias verhindert bei neuen Checkpoints die Wiederherstellung nicht. Das gilt auch ohne Nachrichtenregeln. Anzeigen und spätere neue Nachrichten verwenden den aktuellen Namen; der Aliaswechsel benötigt keine zusätzliche Speicherung des Ausflugs.
+
+Beim Update wird ein vorhandener älterer Bindungsprüfwert zunächst vollständig nach seinem bisherigen Verfahren geprüft und bei erfolgreicher Wiederherstellung einmal ersetzt. Dabei bleiben Reise-ID, ursprünglicher Abwesenheitsnachweis, verbrauchte Aktionen und Cooldowns erhalten. Wurde der Alias bereits vor dieser Übernahme geändert, kann die alte Bindung nicht mehr bestätigt werden; dann wird der Stand abgelehnt und eine neue bestätigte Abwesenheit ist nötig. Die Prüfung wird für einen Altstand nicht übersprungen.
 
 Ein gespeicherter lokaler Zeittext enthält keinen UTC-Offset. Kann er bei der Herbstumstellung zwei Zeitpunkte bezeichnen, wird bei der Wiederherstellung auch der spätere mögliche Zeitpunkt berücksichtigt. Eine möglicherweise nach dem Abgang liegende Anwesenheit verhindert deshalb die Fortsetzung. Lagen beide möglichen Zeitpunkte davor, widerspricht dieser Wert der späteren Reise nicht. Im Diagnosebericht zeigt ein Hinweis auf eine mehrdeutige Quellenzeit an, dass für neue Ankunftsnachweise eine eindeutige Aktualisierung benötigt wird.
 

@@ -3700,6 +3700,8 @@ def run(source, encoding="bytestream", help_only=False):
             checkpoint_before_retry = command("{ ReadingsVal('Geo.Recovery','gp_trip_checkpoint','') }")
             checkpoint_timestamp = command("{ ReadingsTimestamp('Geo.Recovery','gp_trip_checkpoint','') }")
             compact = json.loads(checkpoint_before_retry)
+            check(re.fullmatch(r"2:[0-9a-f]{64}", compact["revision"]) is not None,
+                  "real checkpoint identifies the display-independent binding contract")
             rejected = json.loads(command(
                 "{ my $c=$defs{GP};; my $cfg=GP_Config($c,'Geo.Recovery');; "
                 "local $defs{rr_Recovery}{READINGS}{state}={VAL=>'home',"
@@ -3732,6 +3734,9 @@ def run(source, encoding="bytestream", help_only=False):
                   "duplicate webhook preserved checkpoint content and timestamp in real FHEM")
             check(command("{ ReadingsVal('recoveryLamp','state','') }") == "untouched", "identical retry did not repeat the switch")
             legacy = json.loads(checkpoint_before_retry)
+            legacy["revision"] = command("{ GP_ResumeRevision($defs{GP},'Geo.Recovery',GP_Config($defs{GP},'Geo.Recovery'),1) }")
+            check(re.fullmatch(r"[0-9a-f]{64}", legacy["revision"]) is not None,
+                  "prepare the original display-bound checkpoint signature")
             legacy["version"] = 1
             legacy["state"]["notify_seen"] = {"A.RecoveryLight|enter|1|location:Geo.Recovery.Work": 1}
             legacy["state"]["notify_order"] = list(legacy["state"]["notify_seen"])
@@ -3753,6 +3758,8 @@ def run(source, encoding="bytestream", help_only=False):
             check(prepared["version"] == 1, "prepare an ordinary version 1 checkpoint")
             check(prepared["resume"] == "restored", "real reload imports the legacy checkpoint")
             migrated = json.loads(command("{ ReadingsVal('Geo.Recovery','gp_trip_checkpoint','{}') }"))
+            check(re.fullmatch(r"2:[0-9a-f]{64}", migrated["revision"]) is not None,
+                  "verified legacy import writes the current binding contract")
             check(migrated["version"] == 3 and migrated["trip"]["id"] == compact["trip"]["id"]
                   and migrated["trip"]["away_time"] == compact["trip"]["away_time"],
                   "legacy import preserves the original qualified trip")
@@ -3772,6 +3779,25 @@ def run(source, encoding="bytestream", help_only=False):
                   "legacy recovery did not repeat the consumed visit even with zero cooldown")
             checkpoint_before_retry = command("{ ReadingsVal('Geo.Recovery','gp_trip_checkpoint','') }")
             checkpoint_timestamp = command("{ ReadingsTimestamp('Geo.Recovery','gp_trip_checkpoint','') }")
+            for alias_command in ("attr rr_Recovery alias Rückkehr Jörg 🚲", "deleteattr rr_Recovery ^alias$",
+                                  "attr rr_Recovery alias Rückkehr 🌙"):
+                check(command(alias_command) == "", "change only the recovery resident display name")
+                check(command("reload 98_GeoPresence.pm") == "", "reload after a pure display-name change")
+                command("{ GeoPresence_Timer($defs{GP});; return 'display change restored' }")
+                display_state = json.loads(command("get GP explain Geo.Recovery format=json"))["state"]
+                check(display_state["resume"]["status"] == "restored"
+                      and display_state["trip"]["id"] == migrated["trip"]["id"]
+                      and display_state["trip"]["away_time"] == migrated["trip"]["away_time"],
+                      "display-name change preserves the original qualified trip across reload")
+                check(command("{ ReadingsVal('Geo.Recovery','gp_trip_checkpoint','') }") == checkpoint_before_retry
+                      and command("{ ReadingsTimestamp('Geo.Recovery','gp_trip_checkpoint','') }") == checkpoint_timestamp,
+                      "display-name change and reload do not rewrite the checkpoint")
+                check(display_state["action_visits"] == migrated["state"]["action_visits"]
+                      and display_state["action_last"] == migrated["state"]["action_last"],
+                      "display-name change retains visit consumption and cooldown times")
+                check(command("{ ReadingsVal('recoveryLamp','state','') }") == "untouched"
+                      and command("{ ReadingsVal('recoveryDoor','state','') }") != "lock unlocked",
+                      "display-name change and reload execute no historical action")
             saved_state = json.loads(command("get GP explain Geo.Recovery format=json"))["state"]
             saved_location = saved_state["location"]
             saved_trip_id = saved_state["trip"]["id"]

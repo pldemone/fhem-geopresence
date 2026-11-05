@@ -157,6 +157,7 @@ sub fixture {
         $attr{"R.$row->[0]"}={trigger=>$row->[1],action=>$row->[2],residents=>'Geo.Test'};
     }
     $attr{'R.Late'}{arrivalFilter}='vehicle'; $attr{'R.Work'}{locationGroup}='Work';
+    $attr{'R.Work'}{enabled}=0 if $options{without_notifications};
     $defs{GP}{READINGS}{mode}{VAL}='active'; $init_done=1;
     GP_ResetController($c); GeoPresence_Timer($c);
     return ($c,GP_Config($c,'Geo.Test'));
@@ -3194,7 +3195,7 @@ subtest 'idle logging does not revisit a full already emitted trace' => sub {
 subtest 'idle validation skips fingerprint serialization and event snapshots retain revisions' => sub {
     my ($c)=fixture();$defs{GP}{READINGS}{mode}{VAL}='debug';
     my $cfg=GP_Config($c,'Geo.Test',1);
-    ok(!exists($cfg->{revision}),'building a snapshot does not serialize it');
+    ok(!exists($cfg->{semantic_revision}),'building a snapshot does not serialize it');
     my $fingerprints=0;my $original=\&GP_ConfigRevision;
     {
         no warnings 'redefine';
@@ -3211,7 +3212,7 @@ subtest 'idle validation skips fingerprint serialization and event snapshots ret
     isnt(GP_ConfigRevision($changed),$revision,'new snapshot reflects a changed permission');
     advance(40);my $s=new_state();advance(40);
     GP_Process($s,$changed,ev('Home',1,$now),$now,$mono);
-    is($s->{config_revision},$changed->{revision},'decision trace receives evaluated configuration revision');
+    is($s->{config_revision},GP_ConfigRevision($changed),'decision trace receives evaluated configuration revision');
     my $residents=\&GP_Residents;my $scans=0;
     {
         no warnings 'redefine';
@@ -4109,8 +4110,8 @@ subtest 'profiling preserves Perl context and exceptions and stays passive outsi
 };
 
 sub saved_trip_fixture {
-    my ($scope)=@_;
-    my ($c,$cfg)=fixture(); my $s=GP_State($c,'Geo.Test',0);
+    my ($scope,%options)=@_;
+    my ($c,$cfg)=fixture(%options); my $s=GP_State($c,'Geo.Test',0);
     actor_fresh(); advance(40);
     if ($scope eq 'local') {
         process($s,$cfg,'Home',0); advance(1);
@@ -4370,6 +4371,112 @@ sub checkpoint_work {
     return [$encodes,$writes];
 }
 
+subtest 'checkpoint bindings exclude resident display text and retain the original signatures for import' => sub {
+    my ($c)=fixture();
+    my $cfg={label=>'Resident',roommate=>'rr_Test'};
+    no warnings 'redefine';
+    local *GP_Auth=sub {return (undef,'stored verifier')};
+    is(GP_ConfigRevision($cfg,1),'ca23df9d51ce7bd732c64ad724117dc871750462a422b36180f05031713b1391',
+        'original configuration signature retains its exact encoded field contract');
+    my $old=GP_ResumeRevision($c,'Geo.Test',$cfg,1);
+    is($old,'adb5dae6b75cb840f94f80fba55a698d37c46cfef2a82d74a39761b5ecc4b595',
+        'original identity and credential binding remains verifiable');
+    my $current=GP_ResumeRevision($c,'Geo.Test',$cfg);
+    like($current,qr/\A2:[0-9a-f]{64}\z/,'current binding has an explicit contract prefix');
+    isnt($current,$old,'warm original cache slots are not reused for the current contract');
+    for my $label ('Changed name','','0') {
+        my $changed={label=>$label,roommate=>'rr_Test'};
+        is(GP_ResumeRevision($c,'Geo.Test',$changed),$current,'display text does not affect the current binding');
+        isnt(GP_ResumeRevision($c,'Geo.Test',$changed,1),$old,'old bindings still verify the original display text');
+    }
+};
+
+subtest 'resident alias changes survive reload and restart without additional checkpoint writes' => sub {
+    for my $without_notifications (0,1) {
+        for my $operation (qw(set delete pattern)) {
+            for my $restart (qw(process reload)) {
+                my ($c,$cfg,$s)=saved_trip_fixture('remote',without_notifications=>$without_notifications);
+                my $saved={%{$defs{'Geo.Test'}{READINGS}{gp_trip_checkpoint}}};
+                my $cp=JSON::PP::decode_json($saved->{VAL});
+                my $label="$operation, $restart, notifications ".($without_notifications?'disabled':'enabled');
+                like($cp->{revision},qr/\A2:[0-9a-f]{64}\z/,'checkpoint uses the display-independent binding');
+                is_deeply(checkpoint_work(sub {
+                    $operation eq 'set' ? attribute('rr_Test','alias','Updated name')
+                        : delete_attributes('rr_Test',$operation eq 'pattern'?'^alias$':'alias');
+                    $cfg=GP_Config($c,'Geo.Test');
+                    GP_Checkpoint($c,'Geo.Test',$cfg,$s);
+                }),[0,0],"$label changes no travel data and needs no serialization");
+                is($cfg->{label},$operation eq 'set'?'Updated name':'rr_Test','message label uses the current alias or name');
+                is_deeply(checkpoint_work(sub {
+                    if ($restart eq 'process') {($cfg,$s)=simulate_process_restart($c);}
+                    else {
+                        GP_ResetController($c,'resume'); GeoPresence_Timer($c);
+                        $cfg=GP_Config($c,'Geo.Test'); $s=GP_State($c,'Geo.Test',0);
+                    }
+                }),[0,0],"$label restores without rewriting an unchanged checkpoint");
+                is($s->{resume}{status},'restored',"$label retains the qualified trip");
+                is($s->{trip}{id},$cp->{trip}{id},'travel identity is unchanged');
+                is($s->{trip}{away_time},$cp->{trip}{away_time},'original departure evidence is unchanged');
+                is_deeply($s->{trip}{actions},$cp->{trip}{actions},'trip consumption is unchanged');
+                is_deeply($s->{action_visits},$cp->{state}{action_visits},'visit consumption is unchanged');
+                is_deeply($s->{action_last},$cp->{state}{action_last},'absolute cooldown times are unchanged');
+                is_deeply($defs{'Geo.Test'}{READINGS}{gp_trip_checkpoint},$saved,'saved value and timestamp are unchanged');
+                ok(!$s->{arrival} && !@{$s->{intents}} && !@commands && !@messages,'restoration alone executes nothing');
+                if (!$without_notifications && $operation eq 'set' && $restart eq 'process') {
+                    advance(301); process($s,$cfg,'Work',0); advance(1); process($s,$cfg,'Work',1);
+                    GP_Dispatch($c,'Geo.Test',$cfg,$s,0);
+                    is_deeply(\@messages,[[0,0,'Updated name arrived']],'a new eligible notification uses the changed alias');
+                }
+            }
+        }
+    }
+};
+
+subtest 'old display-bound checkpoints cannot bypass verification after an alias change' => sub {
+    for my $operation (qw(set delete)) {
+        my ($c,$cfg,$s)=saved_trip_fixture('remote');
+        my $cp=JSON::PP::decode_json(GP_Read('Geo.Test','gp_trip_checkpoint',''));
+        $cp->{revision}=GP_ResumeRevision($c,'Geo.Test',$cfg,1);
+        $operation eq 'set' ? attribute('rr_Test','alias','Changed before migration')
+            : delete_attributes('rr_Test','alias');
+        reading('Geo.Test','gp_trip_checkpoint',JSON::PP::encode_json($cp),$now);
+        ($cfg,$s)=simulate_process_restart($c);
+        is($s->{resume}{status},'rejected',"$operation cannot verify an already changed old binding");
+        like($s->{resume}{reason},qr/configuration or identity changed/,'rejection explains the failed binding');
+        ok(!$s->{trip} && !@commands && !@messages,'failed verification grants no permission or output');
+    }
+};
+
+subtest 'both checkpoint binding contracts reject changed semantics and unrecognized signatures' => sub {
+    for my $legacy_binding (0,1) {
+        for my $case (qw(signature contract future_contract missing reference permission source password geometry roommate_binding)) {
+            my ($c,$cfg,$s)=saved_trip_fixture('remote');
+            my $cp=JSON::PP::decode_json(GP_Read('Geo.Test','gp_trip_checkpoint',''));
+            $cp->{revision}=GP_ResumeRevision($c,'Geo.Test',$cfg,1) if $legacy_binding;
+            if ($case eq 'signature') {$cp->{revision} =~ s/.$/z/;}
+            elsif ($case eq 'contract') {$cp->{revision}=$legacy_binding?'2:'.$cp->{revision}:substr($cp->{revision},2);}
+            elsif ($case eq 'future_contract') {$cp->{revision}='3:'.substr($cp->{revision},-64);}
+            elsif ($case eq 'missing') {delete $cp->{revision};}
+            elsif ($case eq 'reference') {$cp->{revision}={value=>$cp->{revision}};}
+            elsif ($case eq 'permission') {$attr{'Geo.Test'}{allowDoor}=0;}
+            elsif ($case eq 'source') {$attr{'Geo.Test'}{phoneSignalMode}='state';}
+            elsif ($case eq 'password') {
+                $keys{GP_AuthKey('Geo.Test')}='b'x32 . ':'.Digest::SHA::sha256_hex('b'x32 . ':different password');
+            } elsif ($case eq 'geometry') {
+                my $geometry=JSON::PP::decode_json(GP_Read('Z.Home','gp_geometry',''));
+                $geometry->{radius}=60; reading('Z.Home','gp_geometry',JSON::PP::encode_json($geometry),$now);
+            } elsif ($case eq 'roommate_binding') {
+                device('rr_Another','ROOMMATE'); $attr{rr_Another}{rr_locationUnderway}='underway';
+                $defs{'Geo.Test'}{ROOMMATE}='rr_Another';
+            }
+            reading('Geo.Test','gp_trip_checkpoint',JSON::PP::encode_json($cp),$now);
+            ($cfg,$s)=simulate_process_restart($c);
+            is($s->{resume}{status},'rejected',"$case rejected for ".($legacy_binding?'original':'current').' binding');
+            ok(!$s->{trip} && !@commands && !@messages,'rejected binding cannot authorize any output');
+        }
+    }
+};
+
 subtest 'diagnostics, rejected observations and unchanged retries do no checkpoint work' => sub {
     my ($c,$cfg,$s)=saved_trip_fixture('remote');
     my $before={%{$defs{'Geo.Test'}{READINGS}{gp_trip_checkpoint}}};
@@ -4481,12 +4588,14 @@ subtest 'very short saved cooldown durations survive JSON conversion and restart
 };
 
 subtest 'older cooldown checkpoints upgrade once using elapsed time at the save' => sub {
-    for my $version (1,2) {
+    for my $version (1,2,3) {
         my ($c,$cfg,$s)=saved_trip_fixture('remote');
         advance(290); process($s,$cfg,'Work',0); GP_Checkpoint($c,'Geo.Test',$cfg,$s);
         my $cp=JSON::PP::decode_json(GP_Read('Geo.Test','gp_trip_checkpoint',''));
         my $last=$cp->{state}{action_last};
-        $cp->{version}=$version; delete $cp->{state}{action_elapsed};
+        $cp->{version}=$version;
+        $cp->{revision}=GP_ResumeRevision($c,'Geo.Test',$cfg,1);
+        delete $cp->{state}{action_elapsed} if $version<3;
         if ($version==1) {
             delete $cp->{state}{action_visits};
             $cp->{state}{notify_last}=delete $cp->{state}{action_last};
@@ -4499,8 +4608,14 @@ subtest 'older cooldown checkpoints upgrade once using elapsed time at the save'
         is($s->{resume}{status},'restored','older checkpoint restores the original trip');
         my $new=JSON::PP::decode_json(GP_Read('Geo.Test','gp_trip_checkpoint',''));
         is($new->{version},3,'portable cooldown timing is stored after migration');
+        like($new->{revision},qr/\A2:[0-9a-f]{64}\z/,'successful import writes the current binding contract');
+        is($new->{trip}{id},$cp->{trip}{id},'binding migration retains the travel identity');
+        is($new->{trip}{away_time},$cp->{trip}{away_time},'binding migration retains the original absence evidence');
         is($new->{state}{action_elapsed}{'A.Msg'},290,'migration uses the saved wall age without crediting downtime');
         is_deeply($new->{state}{action_last},$last,'original absolute plan times are retained');
+        is_deeply($s->{action_visits},{'A.Msg|enter|group:Work'=>1},'binding migration retains the consumed visit');
+        is_deeply(checkpoint_work(sub {($cfg,$s)=simulate_process_restart($c)}),[0,0],
+            'a second restart does not repeat the binding migration');
         advance(1); process($s,$cfg,'Work',1);
         is(scalar @{$s->{intents}},0,'older checkpoint does not bypass the remaining cooldown');
         advance(1); process($s,$cfg,'Work',0); advance(8); process($s,$cfg,'Work',1);

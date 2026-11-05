@@ -1467,17 +1467,20 @@ sub GP_BaseConfig {
     return $catalog->{config}{$r}=$cfg;
 }
 
-# GP_ConfigRevision: Fingerprint configuration fields that determine observation and action semantics.
+# GP_ConfigRevision: Fingerprint semantic fields, retaining the original form for checkpoint import.
 sub GP_ConfigRevision {
-    my ($cfg)=@_;
+    my ($cfg,$legacy)=@_;
+    # Separate cache slots also handle live views retained across a module update.
+    my $key=$legacy ? 'revision':'semantic_revision';
+    return $cfg->{$key} if defined $cfg->{$key};
     # Keep lookup indexes and memoized values out of the semantic fingerprint.
     # Adapter params contain only their allowed fields, shared by every rule.
-    # Version 1 included a null revision through //= autovivification. Preserve
-    # that encoding so ordinary existing checkpoints keep the same binding.
-    $cfg->{revision}//=sha256_hex($GP_JSON->encode({revision=>undef,map {$_=>$cfg->{$_}}
-        (qw(resident roommate zones roles groups rules allowDoor allowGarage sourceMode phoneSignalMode proxies label
+    # The old binding included the display label and a null revision. Preserve
+    # those bytes only when verifying an existing display-bound checkpoint.
+    return $cfg->{$key}=sha256_hex($GP_JSON->encode({
+        ($legacy ? (revision=>undef,label=>$cfg->{label}):()),map {$_=>$cfg->{$_}}
+        (qw(resident roommate zones roles groups rules allowDoor allowGarage sourceMode phoneSignalMode proxies
             geometry_errors geometry_ready),keys %GP_DEFAULT)}));
-    return $cfg->{revision};
 }
 
 # GP_Validate: Collect configuration errors for selected residents and activation requirements.
@@ -3061,13 +3064,15 @@ sub GP_ClearCheckpoint {
 
 # GP_ResumeRevision: Bind restart recovery to configuration, identities, and stored credentials.
 sub GP_ResumeRevision {
-    my ($c,$r,$cfg)=@_;
+    my ($c,$r,$cfg,$legacy)=@_;
     # Geometry, rules, adapters and source contract are part of the cfg hash.
     # Bind identities and authentication too, without persisting credentials.
-    return $cfg->{resume_revision} if defined $cfg->{resume_revision};
-    my $revision=GP_ConfigRevision($cfg);
+    my $key=$legacy ? 'resume_revision':'checkpoint_revision';
+    return $cfg->{$key} if defined $cfg->{$key};
+    my $revision=GP_ConfigRevision($cfg,$legacy);
     my (undef,$auth)=GP_Auth($r);
-    return $cfg->{resume_revision}=sha256_hex($GP_ASCII_JSON->encode({
+    # The prefix versions the binding independently of the travel-data format.
+    return $cfg->{$key}=($legacy ? '' : '2:').sha256_hex($GP_ASCII_JSON->encode({
         config=>$revision,controller=>$c->{NAME},resident=>$r,
         device=>lc(GP_Attr($r,'deviceId','')),user=>lc(GP_Attr($r,'webhookUser','')),
         auth=>sha256_hex($auth//''),roommate=>$cfg->{roommate}}));
@@ -3126,7 +3131,7 @@ sub GP_ResumeTrip {
     my $raw=GP_Read($r,'gp_trip_checkpoint','');
     $s->{resume}={status=>'none',reason=>'No saved qualified trip'};
     return unless length($raw);
-    my ($checkpoint,$trip,$state,$legacy,$timed);
+    my ($checkpoint,$trip,$state,$legacy,$timed,$legacy_binding);
     my ($now,$mono)=(GP_Now(),GP_Mono());
     my $error;
     {
@@ -3141,9 +3146,11 @@ sub GP_ResumeTrip {
             $timed=$checkpoint->{version}==3;
             if ($checkpoint->{status} eq 'qualified') {
                 die "resident is not active\n" unless GP_EffectiveMode($c,$r,0) eq 'active';
+                $legacy_binding=!ref($checkpoint->{revision})
+                    && ($checkpoint->{revision}//'') =~ /\A[0-9a-f]{64}\z/;
                 die "configuration or identity changed\n" unless $cfg->{geometry_ready}
                     && GP_UsesSource($cfg->{sourceMode},'geo')
-                    && ($checkpoint->{revision}//'') eq GP_ResumeRevision($c,$r,$cfg);
+                    && ($checkpoint->{revision}//'') eq GP_ResumeRevision($c,$r,$cfg,$legacy_binding);
                 $trip=$checkpoint->{trip}; $state=$checkpoint->{state};
                 die "invalid trip structure\n" unless ref($trip) eq 'HASH' && ref($state) eq 'HASH'
                     && !ref($trip->{armed}) && ($trip->{armed}//'') eq '1'
@@ -3286,7 +3293,7 @@ sub GP_ResumeTrip {
         qualified_mono=>$mono-($now-$checkpoint->{saved_at})}
         if ($trip->{away_reason}//'') eq $GP_PHONE_DEPARTURE_REASON;
     $s->{phase}='away';
-    $s->{checkpoint_dirty}=$timed ? 0:1;
+    $s->{checkpoint_dirty}=$timed && !$legacy_binding ? 0:1;
     $s->{checkpoint_trip}=$trip->{id};
     $s->{checkpoint_value}=$raw;
     $s->{resume_event_floor}=$s->{start};
@@ -5185,6 +5192,7 @@ set Geo.PERSON mode debug</pre>
   <h5>Persistence</h5>
   <p>FHEM rename updates GeoPresence's internal controller and parent bindings, including saved definitions. A controller rename closes its old HTTP clients and rebinds the listener under the new owner. A resident rename moves its stored password verifier and retains its request quota. Affected trips and pending commands are revoked; already dispatched actuator feedback remains observed. Public rule and external-device attribute references require explicit correction after validation. Use save after correcting the configuration. If credential migration fails, gp_auth_error keeps authentication blocked across reloads; repair the key store and set webhookPassword again. Affected Geo residents are disabled.</p>
   <p>Use FHEM's normal save mechanism for definitions, attributes and production readings. A deviceId confirmed with learnConfirm is an ordinary configuration attribute; learnConfirm does not call save. Production geometry is stored in gp_geometry. A qualified unfinished production trip is stored as one versioned gp_trip_checkpoint reading. Version 3 stores current consumption, original absolute plan times and elapsed cooldown durations. Valid version 1 and 2 data is imported once without replaying actions or renewing departure evidence. After restart, rereadcfg or module reload it can resume if identity, configuration, geometry and the trip_resume_max_age limit still match and no later Home or indoor presence contradicts it. A NEW return is required; startup alone never opens, and old arrival timers, queued commands, unconfirmed departures and debug trips never resume. The checkpoint is consumed before dispatching opening commands. gp_resume_status/gp_resume_reason and explain describe restoration or rejection.</p>
+  <p>New checkpoint bindings start with <code>2:</code> and exclude the ROOMMATE display alias. Changing or deleting that alias does not invalidate the trip or require an extra checkpoint write; new messages use the current name. An older binding is verified against its original configuration and alias before a one-time migration, including for version 3 data. Unverifiable older bindings and unknown binding contracts are rejected. Migration retains the trip ID, original departure evidence and consumption, and executes no historical actions.</p>
   <p>A restored cooldown resumes the remainder recorded at the last checkpoint. Time since that save, including downtime, is conservatively not credited because intervening clock corrections cannot be verified. A cooldown already expired at the save remains expired. Older formats derive their initial elapsed duration from the saved checkpoint time and the last plan time; earlier clock corrections cannot be reconstructed.</p>
   <p>When restoring a trip, saved Home or indoor presence rejects the departure if its possible time range extends beyond that departure. A range entirely before departure does not contradict the trip. A current Home or healthy positive phone reading with an unusable or future timestamp also prevents restoration. A process restart must interpret saved local times again because the earlier numeric source metadata is no longer available.</p>
   <p>A restored trip keeps its saved ID. Each new runtime context adds a fresh random session component; new trip IDs use that context and a local counter, so restarting the counters alone cannot recreate an old ID. This also applies to new debug contexts. Checkpoint versions 1, 2 and 3 remain readable.</p>

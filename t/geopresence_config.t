@@ -130,19 +130,20 @@ subtest 'cosmetic edits preserve checkpoint binding across reload' => sub {
     is(scalar @messages,0,'reload produces no notifications');
 };
 
-subtest 'ordinary version 1 checkpoints retain their previous configuration binding' => sub {
+subtest 'ordinary version 1 checkpoints verify their original binding before migration' => sub {
     my $c=fixture();
     delete @{$attr{Message}}{qw(room target)};
     # Generated with the earlier configuration fingerprint for this fixture, using only the
     # adapter's supported attributes. No dependency on the new hash builder.
     my $legacy_revision='54091508a3b8828224c7659f66f0050c24fd0df9ec73caa5f97e7b41c529cfc3';
     my $cfg=GP_Config($c,'Geo.A');
-    is(GP_ResumeRevision($c,'Geo.A',$cfg),$legacy_revision,'unchanged semantic configuration preserves the old binding');
+    is(GP_ResumeRevision($c,'Geo.A',$cfg,1),$legacy_revision,'original configuration and identity binding remains verifiable');
     advance(40); my $s=GP_State($c,'Geo.A',0);
     GP_Process($s,$cfg,{kind=>'geo',zone=>'A.Work',entry=>0,time=>$now,received=>$now,key=>'old-trip'},$now,$mono);
     GP_Checkpoint($c,'Geo.A',$cfg,$s);
     my $checkpoint=JSON::PP::decode_json(GP_Read('Geo.A','gp_trip_checkpoint',''));
     $checkpoint->{version}=1;
+    $checkpoint->{revision}=$legacy_revision;
     delete @{$checkpoint->{state}}{qw(action_visits action_last action_elapsed)};
     @{$checkpoint->{state}}{qw(notify_seen notify_order notify_last)}=({},[],{});
     $defs{'Geo.A'}{READINGS}{gp_trip_checkpoint}{VAL}=JSON::PP::encode_json($checkpoint);
@@ -152,6 +153,11 @@ subtest 'ordinary version 1 checkpoints retain their previous configuration bind
     $c->{helper}{gp}{ready}=1;
     my $restored=GP_State($c,'Geo.A',0);
     ok($restored->{trip}{armed},'qualified checkpoint is accepted with the unchanged version 1 binding');
+    GP_Checkpoint($c,'Geo.A',GP_Config($c,'Geo.A'),$restored);
+    my $migrated=JSON::PP::decode_json(GP_Read('Geo.A','gp_trip_checkpoint',''));
+    like($migrated->{revision},qr/\A2:[0-9a-f]{64}\z/,'verified checkpoint moves to the current binding');
+    is($migrated->{trip}{id},$checkpoint->{trip}{id},'migration keeps the original trip');
+    is($migrated->{trip}{away_time},$checkpoint->{trip}{away_time},'migration keeps the original departure evidence');
 };
 
 subtest 'geometry invalidates only changed coordinates in the affected pool' => sub {

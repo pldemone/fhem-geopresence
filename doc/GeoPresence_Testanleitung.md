@@ -1,6 +1,6 @@
 # GeoPresence – Testanleitung
 
-**Version 4.40 · Stand 04.11.2026 · Handbuch 2.44 · Architektur 0.82**
+**Version 4.41 · Stand 05.11.2026 · Handbuch 2.45 · Architektur 0.83**
 
 Diese Anleitung beschreibt die Prüfung einer eingerichteten GeoPresence-Anlage. Die Testanwendung simuliert Alltagswege und prüft deren neue Diagnosezeilen; gezielte App-Tests prüfen eigene Orts- und Gruppenregeln. Einrichtung, Begriffe und Parameter stehen im [Handbuch](GeoPresence_Handbuch.md).
 
@@ -395,7 +395,11 @@ Die Wiederherstellung betrifft ausschließlich produktive, bestätigte Ausflüge
 
 Im Diagnosefile heißt die erfolgreiche Übernahme `qualified unfinished trip restored; waiting for a new return`, Quelle restart. `gp_resume_status=rejected` beziehungsweise Restart recovery: Rejected nennt einen konkreten Grund, etwa abweichende Konfiguration, spätere Heimkehr oder einen abgelaufenen Abwesenheitsnachweis. Der Standard für die Wiederaufnahme beträgt 48 Stunden ab ursprünglicher Abwesenheitsbestätigung; die Ankunftsfristen selbst werden dadurch nicht verändert.
 
-Ohne neue Fachdaten bleiben Inhalt, `saved_at` und Reading-Zeitstempel von `gp_trip_checkpoint` auch nach Diagnoseeinträgen, identischen Webhook-Wiederholungen oder erfolgreicher Wiederherstellung unverändert. Neue Orts- oder Bewegungsnachweise, tatsächliche Datenabläufe und verbrauchte beziehungsweise widerrufene Berechtigungen müssen den gespeicherten Stand dagegen aktualisieren. `saved_at` zeigt den Speicherzeitpunkt und erneuert nicht den ursprünglichen Abwesenheitsnachweis.
+Ohne neue Fachdaten bleiben Inhalt, `saved_at` und Reading-Zeitstempel von `gp_trip_checkpoint` bei aktuellem Daten- und Bindungsformat auch nach Diagnoseeinträgen, identischen Webhook-Wiederholungen oder erfolgreicher Wiederherstellung unverändert. Neue Orts- oder Bewegungsnachweise, tatsächliche Datenabläufe und verbrauchte beziehungsweise widerrufene Berechtigungen müssen den gespeicherten Stand dagegen aktualisieren. `saved_at` zeigt den Speicherzeitpunkt und erneuert nicht den ursprünglichen Abwesenheitsnachweis.
+
+Die Bindungsprüfungen ändern und löschen den ROOMMATE-Alias während eines bestätigten Ausflugs und prüfen danach Modulreload und Prozessneustart. Mit und ohne Nachrichtenregel müssen Reise-ID, ursprüngliche Abwesenheit, Verbrauch sowie Inhalt und Zeitstempel des aktuellen Checkpoints erhalten bleiben. Eine neue zulässige Nachricht verwendet den geänderten Alias; die Wiederherstellung selbst führt keine Aktion aus. Reale FHEM-Befehle prüfen auch Unicode-Aliasse und Aliaslöschmuster vor einem Reload in beiden Zeichenmodi.
+
+Bisherige Bindungen aus allen drei Datenformaten werden nur nach erfolgreicher Prüfung einmal übernommen und erhalten dann den Präfix `2:`. Fest vorgegebene frühere Prüfwerte sichern die Kompatibilität mit dem bisherigen Verfahren ab; bereits vorhandene alte Cachefelder dürfen die neue Berechnung nicht beeinflussen. Ein zweiter Neustart schreibt den umgestellten Stand nicht erneut. Geänderte Berechtigungen, Quellen, Kennwörter, Geometrie und ROOMMATE-Bindungen sowie ungültige, unbekannte oder nur umetikettierte Signaturen müssen in beiden Verfahren abgelehnt werden. Ein alter Prüfwert mit bereits geändertem Alias darf nicht durch eine ungeprüfte Übernahme gültig werden.
 
 Die automatisierten Kennungsprüfungen widerrufen produktive und Debug-Kontexte wiederholt durch Uhrkorrekturen. Auch bereits verlängerte alte Laufzeitkennungen müssen nach jedem Widerruf wieder 64 Zeichen lang sein; widerrufene Kennungen werden nicht erneut vergeben. Nach 32 beziehungsweise 64 Widerrufen wird ein neuer Ausflug bestätigt, gespeichert und nach einem simulierten Prozessneustart übernommen. Reise-ID und ursprünglicher Abwesenheitsnachweis bleiben dabei erhalten. Der Start allein erzeugt keine Ausgabe; erst eine neue berechtigte Rückkehr darf öffnen. Die bestehende Lesergrenze von 256 Zeichen und die Übernahme gültiger alter Reise-IDs bleiben unverändert.
 
