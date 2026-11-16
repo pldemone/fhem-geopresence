@@ -1,6 +1,6 @@
 # GeoPresence – Handbuch
 
-**Version 2.45 · Stand 05.11.2026 · Architektur 0.83**
+**Version 2.46 · Stand 16.11.2026 · Architektur 0.84**
 
 GeoPresence ist eine Anwesenheits- und Ortssteuerung für FHEM. Es wertet aus, wer zu Hause ist, wer das Haus verlassen hat und wer zurückkehrt, und verbindet diese Informationen mit konfigurierbaren Automationen. So lässt sich beispielsweise beim Betreten eines Gartenbereichs ein Licht einschalten, beim Erreichen eines Arbeitsortes eine Nachricht senden oder bei einer berechtigten Heimkehr die vorhandene Tür- und Garagensteuerung ansprechen. Ziel ist, solche Aktionen passend zur Situation auszuführen und Fehlreaktionen auf einzelne unzuverlässige Meldungen zu vermeiden.
 
@@ -756,6 +756,8 @@ GeoPresence behält dafür aktuelle Verbrauchsstände und Cooldowns statt einer 
 Der Checkpoint hält zusätzlich fest, wie viel der Cooldown-Sperrzeit beim Speichern tatsächlich verstrichen war. Eine dort noch offene Restzeit läuft nach dem Neustart weiter; Zeit seit diesem Speicherstand und während des Stillstands wird vorsichtshalber nicht angerechnet. Waren beispielsweise 290 von 300 Sekunden abgelaufen, bleibt die Aktion nach dem Neustart noch zehn Sekunden gesperrt. Bereits beim Speichern abgelaufene Sperren beginnen nicht erneut. Ältere Formate liefern als Ausgangspunkt den Abstand zwischen ihrem Speicherzeitpunkt und der letzten Aktion; frühere Uhrkorrekturen lassen sich daraus nicht nachträglich ermitteln.
 
 Nach Neustart, rereadcfg oder Modulreload prüft GeoPresence den gespeicherten Stand. Identität, Kennwortbindung, Quellenprofil, relevante Konfiguration und Geometrie müssen passen; eine spätere lokale Anwesenheit oder ein späteres ROOMMATE `home` widerspricht dem Ausflug. Die ursprüngliche Abwesenheitsbestätigung darf standardmäßig höchstens 48 Stunden alt sein. `trip_resume_max_age` am Controller legt diese Grenze in Sekunden fest; Speichern oder wiederholtes Neustarten erneuert den Nachweis nicht.
+
+Bei einem telefonisch bestätigten Ausflug kann nach dem Start ein alter positiver Telefonstand wieder verfügbar werden, dessen Zeit noch vor der gespeicherten Abwesenheit liegt. Ist er eindeutig überholt, verwirft er den späteren Ausflug nicht und erzeugt keine Ankunft. Eine tatsächlich neue Home- oder Telefon-Rückkehr kann weiterhin die berechtigte Ankunft auslösen. Die alte Meldung allein erneuert weder den Checkpoint noch den Abwesenheitsnachweis. Spätere Anwesenheit und mögliche Zeitbereiche, die die Abwesenheitsgrenze erreichen, bleiben Gegenbeweise, auch neben einer gleichzeitig frischen positiven Quelle. Beim Modulreload bleibt für dieselbe geprüfte Reise der tatsächlich beobachtete monotone Beginn der Telefonabwesenheit erhalten. Dadurch kann auch eine kleine Uhrkorrektur vor dem Reload eine später beobachtete Telefonanwesenheit nicht als älter erscheinen lassen. Fehlt dieser beobachtete Zeitbezug, wird eine native positive Meldung vorsichtig als möglicher Gegenbeweis behandelt; ein aus der aktuellen Wanduhr berechneter Reisezeitpunkt genügt nicht zum Aussortieren.
 
 Eine reine Änderung oder Löschung des ROOMMATE-Alias verhindert bei neuen Checkpoints die Wiederherstellung nicht. Das gilt auch ohne Nachrichtenregeln. Anzeigen und spätere neue Nachrichten verwenden den aktuellen Namen; der Aliaswechsel benötigt keine zusätzliche Speicherung des Ausflugs.
 

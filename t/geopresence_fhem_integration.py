@@ -2439,8 +2439,8 @@ def run(source, encoding="bytestream", help_only=False):
             zones["Work"] = (zones["Work"][0], work_geometry["lat"], work_geometry["radius"])
             saved_intervals = json.loads(command("{ JSON::PP::encode_json({map { $_ => $defs{$_}{INTERVAL_NORMAL} } qw(p1 p2)}) }"))
             command("{ no warnings 'redefine';; $main::GP_phone_wall_base=int(GP_Now())+1;; "
-                    "$main::GP_phone_mono_base=GP_Mono()+1;; $main::GP_phone_elapsed=0;; "
-                    "*GP_Now=sub { $main::GP_phone_wall_base+$main::GP_phone_elapsed };; "
+                    "$main::GP_phone_mono_base=GP_Mono()+1;; $main::GP_phone_elapsed=0;; $main::GP_phone_wall_shift=0;; "
+                    "*GP_Now=sub { $main::GP_phone_wall_base+$main::GP_phone_elapsed+$main::GP_phone_wall_shift };; "
                     "*GP_Mono=sub { $main::GP_phone_mono_base+$main::GP_phone_elapsed };; return 'review clock' }")
             check(command("set GP mode debug") == "", "pause the isolated phone-source setup")
             zones["R05Near"] = ("place", 0.00135, 20)
@@ -2468,6 +2468,129 @@ def run(source, encoding="bytestream", help_only=False):
                 command(f"{{ $main::GP_phone_elapsed={origin + seconds}-$main::GP_phone_wall_base;; return 'review time' }}")
                 if tick:
                     command("{ GeoPresence_Timer($defs{GP});; return 'review tick' }")
+
+            for case in ("held_home", "held_phone", "mixed_return", "later_presence"):
+                origin = begin_phone_scenario()
+                phone_scenario_at(origin, 50)
+                for sensor in ("p1", "p2"):
+                    phone_state(sensor, "absent", origin + 50)
+                phone_scenario_at(origin, 50, tick=True)
+                phone_scenario_at(origin, 80)
+                check(request("Home", 0)[0] == 200, "accepts departure for phone-qualified recovery")
+                phone_scenario_at(origin, 80, tick=True)
+                phone_scenario_at(origin, 82, tick=True)
+                phone_scenario_at(origin, 85, tick=True)
+                phone_scenario_at(origin, 265, tick=True)
+                state = json.loads(command("get GP explain Geo.Test prod format=json"))["state"]
+                check(state.get("trip", {}).get("armed") and state["trip"].get("phone_qualification"),
+                      "full held absence qualifies the saved local trip: "
+                      + json.dumps({key: state.get(key) for key in ("phase", "trip", "phone", "last_reason")}))
+                saved = command("{ ReadingsVal('Geo.Test','gp_trip_checkpoint','') }")
+                checkpoint = json.loads(saved)
+                saved_timestamp = command("{ ReadingsTimestamp('Geo.Test','gp_trip_checkpoint','') }")
+                phone_scenario_at(origin, 300)
+                if case.startswith("held_"):
+                    phone_state("p1", "present", origin + 60)
+                command("{ GP_ResetController($defs{GP},'resume');; GeoPresence_Timer($defs{GP});; return 'phone trip restored' }")
+                state = json.loads(command("get GP explain Geo.Test prod format=json"))["state"]
+                check(state["resume"]["status"] == "restored"
+                      and state.get("trip", {}).get("id") == checkpoint["trip"]["id"]
+                      and state["trip"]["away_time"] == checkpoint["trip"]["away_time"],
+                      "first source poll preserves a valid later phone-qualified trip: " + case)
+                check(command("{ ReadingsVal('Geo.Test','gp_trip_checkpoint','') }") == saved
+                      and command("{ ReadingsTimestamp('Geo.Test','gp_trip_checkpoint','') }") == saved_timestamp,
+                      "earlier source and restoration leave checkpoint content and timestamp unchanged")
+                check(command("{ ReadingsVal('door','state','') }") == "untouched"
+                      and command("{ ReadingsVal('garage','state','') }") == "untouched",
+                      "restoration and old held presence issue no opening")
+                phone_scenario_at(origin, 400)
+                if case == "held_home":
+                    check(request("Home", 1, motion="walking")[0] == 200, "new Home return accepted after recovery")
+                    phone_scenario_at(origin, 403, tick=True)
+                    phone_scenario_at(origin, 461, tick=True)
+                else:
+                    if case in ("mixed_return", "later_presence"):
+                        phone_state("p1", "present", origin + (60 if case == "mixed_return" else 90))
+                    phone_state("p2", "present", origin + 400)
+                    phone_scenario_at(origin, 400, tick=True)
+                if case == "later_presence":
+                    state = json.loads(command("get GP explain Geo.Test prod format=json"))["state"]
+                    check(not state.get("trip") and not state.get("arrival"),
+                          "presence after saved departure still revokes beside a fresh positive")
+                    check(json.loads(command("{ ReadingsVal('Geo.Test','gp_trip_checkpoint','{}') }"))["status"] == "none",
+                          "relevant historical presence invalidates the checkpoint")
+                check(command("{ ReadingsVal('door','state','') }") == ("untouched" if case == "later_presence" else "lock unlocked")
+                      and command("{ ReadingsVal('garage','state','') }") == "untouched",
+                      "only a new eligible return opens the local-trip door: " + case)
+                if case != "later_presence":
+                    actor_reading("feedback", "pulse_state", "confirmed")
+                    phone_scenario_at(origin, 462 if case == "held_home" else 401, tick=True)
+
+            for reloads in (1, 2):
+                for timing in ("earlier", "later"):
+                    origin = begin_phone_scenario(window=10)
+                    phone_scenario_at(origin, 50)
+                    for sensor in ("p1", "p2"):
+                        phone_state(sensor, "absent", origin + 50)
+                    phone_scenario_at(origin, 50, tick=True)
+                    phone_scenario_at(origin, 80)
+                    check(request("Home", 0)[0] == 200, "accepts Home exit before the clock correction")
+                    for elapsed in (80, 82, 85, 95, 100):
+                        phone_scenario_at(origin, elapsed, tick=True)
+                    state = json.loads(command("get GP explain Geo.Test prod format=json"))["state"]
+                    check(state.get("trip", {}).get("armed") and state["trip"].get("phone_qualification"),
+                          "short full absence qualifies before the backward wall correction")
+                    saved_id = state["trip"]["id"]
+                    departure_mono = state["trip"]["away_mono"]
+                    saved = command("{ ReadingsVal('Geo.Test','gp_trip_checkpoint','') }")
+                    saved_timestamp = command("{ ReadingsTimestamp('Geo.Test','gp_trip_checkpoint','') }")
+                    phone_scenario_at(origin, 101)
+                    command("{ $main::GP_phone_wall_shift=-17;; return 'wall clock corrected' }")
+                    phone_state("p1", "present", origin + (64 if timing == "earlier" else 84))
+                    source = json.loads(command("{ JSON::PP::encode_json(GP_SourceReading('p1','presence')) }"))
+                    check(source["mono"] < departure_mono if timing == "earlier" else source["mono"] > departure_mono,
+                          "native reading keeps its actual order before reload: " + timing)
+                    phone_scenario_at(origin, 103)
+                    # Keep only the fixture clocks fixed while the real module replaces its functions.
+                    result = command(
+                        "{ no warnings 'redefine';; my $wall=GP_Now();; my $mono=GP_Mono();; "
+                        "local *Time::HiRes::time=sub { $wall };; "
+                        "local *Time::HiRes::clock_gettime=sub { $mono };; "
+                        f"for (1..{reloads}) {{ my $error=CommandReload(undef,'98_GeoPresence.pm');; "
+                        "die $error if defined($error) && length($error) };; "
+                        "*GP_Now=sub { $main::GP_phone_wall_base+$main::GP_phone_elapsed+$main::GP_phone_wall_shift };; "
+                        "*GP_Mono=sub { $main::GP_phone_mono_base+$main::GP_phone_elapsed };; return 'module reloaded' }")
+                    check(result == "module reloaded", "real reload succeeds after a small backward correction")
+                    command("{ GP_State($defs{GP},'Geo.Test',0);; return 'checkpoint validated' }")
+                    state = json.loads(command("get GP explain Geo.Test prod format=json"))["state"]
+                    check(state["resume"]["status"] == "restored" and state["trip"]["id"] == saved_id,
+                          "initial checkpoint validation permits the earlier wall timestamp")
+                    check(source["mono"] < state["trip"]["away_mono"],
+                          "reconstructed departure would incorrectly order the native reading")
+                    check(json.loads(command("{ JSON::PP::encode_json(GP_SourceReading('p1','presence')) }")) == source,
+                          "real reload retains the original native source metadata")
+                    phone_scenario_at(origin, 103, tick=True)
+                    state = json.loads(command("get GP explain Geo.Test prod format=json"))["state"]
+                    if timing == "earlier":
+                        check(state.get("trip", {}).get("id") == saved_id
+                              and command("{ ReadingsVal('Geo.Test','gp_trip_checkpoint','') }") == saved
+                              and command("{ ReadingsTimestamp('Geo.Test','gp_trip_checkpoint','') }") == saved_timestamp,
+                              "genuinely earlier native evidence preserves the unchanged checkpoint")
+                    else:
+                        check(not state.get("trip") and not state.get("arrival")
+                              and json.loads(command("{ ReadingsVal('Geo.Test','gp_trip_checkpoint','{}') }"))["status"] == "none",
+                              "later native presence revokes permission despite its earlier wall timestamp")
+                    phone_scenario_at(origin, 172)
+                    check(request("Home", 1, motion="walking")[0] == 200, "new Home return is accepted after reload")
+                    phone_scenario_at(origin, 175, tick=True)
+                    phone_scenario_at(origin, 233, tick=True)
+                    check(command("{ ReadingsVal('door','state','') }") == ("lock unlocked" if timing == "earlier" else "untouched")
+                          and command("{ ReadingsVal('garage','state','') }") == "untouched",
+                          "only a trip not disproved by native presence can open after reload")
+                    if timing == "earlier":
+                        actor_reading("feedback", "pulse_state", "confirmed")
+                        phone_scenario_at(origin, 234, tick=True)
+                    command("{ $main::GP_phone_wall_shift=0;; return 'wall clock restored' }")
 
             for case in ("contradiction", "mixed_positive", "genuine_return"):
                 origin = begin_phone_scenario(window=20, reorder=10)

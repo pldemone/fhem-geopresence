@@ -135,9 +135,9 @@ sub fixture {
     device('door','dummy');device('contact','dummy');device('feedback','DOIF');
     device('garage','dummy');device('gate','dummy');device('upper','dummy');device('lower','dummy');
     my $c=gp_define('GP','controller'); $attr{GP}=$options{omit_webhook_port} ? {}:{webhookPort=>8090}; GP_StoreMode($defs{GP},'debug');
-    $attr{GP}{$_}=$options{$_} for grep {exists $options{$_}} qw(action_max_age zone_display_max_age);
+    $attr{GP}{$_}=$options{$_} for grep {exists $options{$_}} qw(action_max_age zone_display_max_age phone_absence_window);
     gp_define('Geo.Test','resident GP rr_Test');
-    $attr{'Geo.Test'}={deviceId=>'DEVICE',webhookUser=>'user',sourceMode=>$options{source_mode}//'geofency_phone',phoneProxies=>'p1,p2,p3',phoneSignalMode=>'measurement',allowDoor=>1,allowGarage=>1}; GP_StoreMode($defs{'Geo.Test'},'active');
+    $attr{'Geo.Test'}={deviceId=>'DEVICE',webhookUser=>'user',sourceMode=>$options{source_mode}//'geofency_phone',phoneProxies=>'p1,p2,p3',phoneSignalMode=>$options{phone_signal_mode}//'measurement',allowDoor=>1,allowGarage=>1}; GP_StoreMode($defs{'Geo.Test'},'active');
     $keys{'GeoPresence_Geo.Test_auth'}='a'x32 . ':'.Digest::SHA::sha256_hex('a'x32 . ':'.'password123456789012345678');
     my @zones=([Home=>'home',0,50],[Drive=>'approach',0,250],[Outer=>'outer',0,4500],
         [Work=>'place',0.1,100],[Work2=>'place',0.1005,100],[Checkpoint=>'place',0.01,100],[Sternensteg=>'place',0.07,500]);
@@ -4115,7 +4115,7 @@ sub saved_trip_fixture {
     actor_fresh(); advance(40);
     if ($scope eq 'local') {
         process($s,$cfg,'Home',0); advance(1);
-        my $first=negative_samples(); phone_tick($s,$cfg,$first); advance(181);
+        my $first=negative_samples(); phone_tick($s,$cfg,$first); advance($cfg->{phone_absence_window}+1);
         phone_tick($s,$cfg,negative_samples());
     } else { process($s,$cfg,'Work',1); }
     GP_Publish($c,'Geo.Test',$cfg,$s);
@@ -4134,6 +4134,163 @@ sub simulate_process_restart {
     GeoPresence_Timer($c);
     return (GP_Config($c,'Geo.Test'),GP_State($c,'Geo.Test',0));
 }
+
+subtest 'earlier held positives preserve a restored phone-qualified trip and its new return' => sub {
+    for my $arrival (qw(home phone)) {
+        my ($c,$cfg,$s)=saved_trip_fixture('local',phone_signal_mode=>'state');
+        my $saved={%{$defs{'Geo.Test'}{READINGS}{gp_trip_checkpoint}}};
+        my $cp=JSON::PP::decode_json($saved->{VAL});
+        my $away=$cp->{trip}{away_time}; my $old=$away-20;
+        for my $name (qw(p1 p2 p3)) {
+            reading($name,$_,$name eq 'p1'?'present':'absent',$old) for qw(state presence);
+        }
+        ($cfg,$s)=simulate_process_restart($c);
+        is($s->{resume}{status},'restored','checkpoint passes the original time and identity checks');
+        is(($s->{trip}//{})->{id},$cp->{trip}{id},"$arrival: first phone poll retains the original trip");
+        is(($s->{trip}//{})->{away_time},$away,'original absence evidence remains unchanged');
+        is_deeply($defs{'Geo.Test'}{READINGS}{gp_trip_checkpoint},$saved,'old source needs no checkpoint rewrite');
+        ok(!@commands && !@messages && !$s->{arrival},'old presence creates no arrival or output');
+        next unless $s->{trip};
+        advance(6);
+        phone_tick($s,$cfg,GP_PhoneSamples($cfg)); GP_Publish($c,'Geo.Test',$cfg,$s);
+        is($s->{trip}{id},$cp->{trip}{id},'unchanged polling still retains the trip');
+        if ($arrival eq 'home') {arrive($s,$cfg,'walking');}
+        else {
+            advance(1); reading('p2',$_,'present',$now) for qw(state presence);
+            phone_tick($s,$cfg,GP_PhoneSamples($cfg));
+        }
+        actor_fresh(); GP_Dispatch($c,'Geo.Test',$cfg,$s,0);
+        is_deeply([grep {/^(?:door|garage) /} @commands],['door lock unlocked'],
+            'only the genuinely new return opens the door using the original local trip');
+    }
+};
+
+subtest 'restored absence keeps later and overlapping counterevidence across mixed phone sources' => sub {
+    for my $case (qw(before boundary after before_range overlap mixed_return mixed_counterevidence)) {
+        my ($c,$cfg,$s)=saved_trip_fixture('local',phone_signal_mode=>'state');
+        my ($id,$away)=@{$s->{trip}}{qw(id away_time)}; my $old=$away-20;
+        reading($_,'state','absent',$away-30) for qw(p1 p2 p3);
+        reading($_,'presence','absent',$away-30) for qw(p1 p2 p3);
+        ($cfg,$s)=simulate_process_restart($c);
+        is(($s->{trip}//{})->{id},$id,'available negative sources allow initial restoration');
+        if ($case eq 'mixed_counterevidence') {
+            advance(1); process($s,$cfg,'Home',0);
+            cmp_ok($s->{trip}{home_exit},'>',$s->{trip}{away_time},'later Home exit does not replace the original absence');
+        }
+        advance(6);
+        my $positive=$case eq 'boundary' ? $away : $case eq 'after' ? $away+1:$old;
+        reading('p1',$_,'present',$positive) for qw(state presence);
+        if ($case eq 'mixed_return' || $case eq 'mixed_counterevidence') {
+            reading('p2',$_,'present',$now) for qw(state presence);
+        }
+        if ($case eq 'mixed_counterevidence') {
+            reading('p3',$_,'present',$away+1) for qw(state presence);
+        }
+        my $samples=GP_PhoneSamples($cfg);
+        if ($case eq 'before_range' || $case eq 'overlap') {
+            @{$samples->{p1}}{qw(time latest_time ambiguous)}=($away-3601,$away+($case eq 'overlap'?1:-1),1);
+        }
+        phone_tick($s,$cfg,$samples);
+        my $keep=$case eq 'before' || $case eq 'before_range';
+        if ($keep) {
+            is(($s->{trip}//{})->{id},$id,"$case: an entirely earlier source preserves the trip");
+        } elsif ($case eq 'mixed_return') {
+            is(($s->{last_trip}//{})->{id},$id,'an earlier source does not hide the valid new return');
+            actor_fresh(); GP_Dispatch($c,'Geo.Test',$cfg,$s,0);
+            is_deeply([grep {/^(?:door|garage) /} @commands],['door lock unlocked'],'new return remains eligible beside an earlier positive');
+        } else {
+            ok(!$s->{trip} && !$s->{arrival},"$case: relevant presence revokes the restored permission");
+            GP_Publish($c,'Geo.Test',$cfg,$s);
+            is(JSON::PP::decode_json(GP_Read('Geo.Test','gp_trip_checkpoint',''))->{status},'none','revocation reaches the checkpoint');
+        }
+        ok(!grep(/^(?:door|garage) /,@commands) && !@messages,'historical evidence alone executes no action') unless $case eq 'mixed_return';
+    }
+};
+
+subtest 'late presence before the interval can still disprove a live held-absence qualification' => sub {
+    my ($c,$cfg)=fixture(phone_signal_mode=>'state'); my $s=GP_State($c,'Geo.Test',0);
+    advance(10); my $negative=$now;
+    for my $name (qw(p1 p2 p3)) {reading($name,$_,'absent',$negative) for qw(state presence);}
+    phone_tick($s,$cfg,GP_PhoneSamples($cfg));
+    advance(30); process($s,$cfg,'Home',0); advance(1);
+    phone_tick($s,$cfg,GP_PhoneSamples($cfg));
+    advance(181); phone_tick($s,$cfg,GP_PhoneSamples($cfg));
+    ok($s->{trip}{armed} && $s->{trip}{phone_qualification},'held negative sources completed a live qualification');
+    cmp_ok($negative+10,'<',$s->{trip}{away_time},'delayed positive predates the interval but follows the held negatives');
+    reading('p1',$_,'present',$negative+10) for qw(state presence);
+    phone_tick($s,$cfg,GP_PhoneSamples($cfg));
+    ok(!$s->{trip} && !$s->{arrival},'live qualification still rejects contradictory held-source continuity');
+};
+
+subtest 'native presence after a small backward clock change still revokes a restored trip' => sub {
+    my ($c,$cfg,$s)=saved_trip_fixture('local',phone_signal_mode=>'state',phone_absence_window=>1);
+    my $away=$s->{trip}{away_time};
+    for my $name (qw(p1 p2 p3)) {reading($name,$_,'absent',$away) for qw(state presence);}
+    GP_ResetController($c,'resume'); $cfg=GP_Config($c,'Geo.Test'); $s=GP_State($c,'Geo.Test',0);
+    is($s->{resume}{status},'restored','short but valid absence is restored before its first phone poll');
+    $now-=5; GP_CheckClock($s,$cfg,$now,$mono);
+    ok($s->{trip},'small correction retains the restored trip until counterevidence arrives');
+    cmp_ok($now,'<',$away,'new native wall time is before the saved departure');
+    reading('p1',$_,'present',$now) for qw(state presence);
+    $defs{p1}{helper}{gp_source_times}{presence}=GP_SourceRecord('present',stamp($now),$now,1);
+    phone_tick($s,$cfg,GP_PhoneSamples($cfg));
+    ok(!$s->{trip} && !$s->{arrival},'later monotonic source evidence cannot be hidden by its corrected wall time');
+};
+
+subtest 'reload retains observed absence ordering across a prior backward clock correction' => sub {
+    for my $reloads (1,2) {
+        for my $timing (qw(earlier later)) {
+            my ($c,$cfg,$s)=saved_trip_fixture('local',phone_signal_mode=>'state',phone_absence_window=>10);
+            my ($id,$away,$origin)=@{$s->{trip}}{qw(id away_time away_mono)};
+            my $saved={%{$defs{'Geo.Test'}{READINGS}{gp_trip_checkpoint}}};
+            for my $name (qw(p1 p2 p3)) {reading($name,$_,'absent',$away) for qw(state presence);}
+            advance(4); phone_tick($s,$cfg,GP_PhoneSamples($cfg));
+            advance(1); $now-=17;
+            my $observed=$timing eq 'earlier' ? $away-21:$now;
+            reading('p1',$_,'present',$observed) for qw(state presence);
+            my $source=GP_SourceRecord('present',stamp($observed),$observed,1);
+            $defs{p1}{helper}{gp_source_times}{presence}=$source;
+            cmp_ok($source->{mono},$timing eq 'earlier' ? '<':'>',$origin,
+                "$timing: native source retains its true order against the live absence");
+            advance(2);
+            for (1..$reloads) {
+                GeoPresence_Initialize({});
+                $cfg=GP_Config($c,'Geo.Test'); $s=GP_State($c,'Geo.Test',0);
+                is($s->{resume}{status},'restored','absolute source time passes the initial checkpoint validation');
+                is(($s->{trip}//{})->{id},$id,'reload retains the saved trip identity');
+            }
+            is(GP_SourceReading('p1','presence'),$source,'reload keeps the native source metadata');
+            cmp_ok($observed,'<',$away,'both source cases have an earlier wall timestamp');
+            cmp_ok($source->{mono},'<',$s->{trip}{away_mono},'reconstructed departure alone cannot distinguish their order');
+            GeoPresence_Timer($c);
+            if ($timing eq 'earlier') {
+                is(($s->{trip}//{})->{id},$id,'genuinely earlier native evidence preserves the restored trip');
+                is_deeply($defs{'Geo.Test'}{READINGS}{gp_trip_checkpoint},$saved,'older source and reload leave the checkpoint unchanged');
+            } else {
+                ok(!$s->{trip} && !$s->{arrival},'later native presence revokes the restored opening permission');
+                is(JSON::PP::decode_json(GP_Read('Geo.Test','gp_trip_checkpoint',''))->{status},'none','revocation invalidates the saved checkpoint');
+            }
+            advance($away+70-$now); arrive($s,$cfg,'walking');
+            actor_fresh(); GP_Dispatch($c,'Geo.Test',$cfg,$s,0);
+            is_deeply([grep {/^(?:door|garage) /} @commands],
+                $timing eq 'earlier' ? ['door lock unlocked']:[],
+                'a later Home return uses only a trip not disproved by the native source');
+        }
+    }
+};
+
+subtest 'native presence without an observed absence origin remains counterevidence' => sub {
+    my ($c,$cfg,$s)=saved_trip_fixture('local',phone_signal_mode=>'state',phone_absence_window=>10);
+    my $away=$s->{trip}{away_time};
+    for my $name (qw(p1 p2 p3)) {reading($name,$_,'absent',$away-30) for qw(state presence);}
+    ($cfg,$s)=simulate_process_restart($c);
+    is($s->{resume}{status},'restored','cold restart validates the saved absence');
+    reading('p1',$_,'present',$away-1) for qw(state presence);
+    $defs{p1}{helper}{gp_source_times}{presence}=GP_SourceRecord('present',stamp($away-1),$away-1,1);
+    phone_tick($s,$cfg,GP_PhoneSamples($cfg)); GP_Publish($c,'Geo.Test',$cfg,$s);
+    ok(!$s->{trip} && !$s->{arrival},'a reconstructed clock cannot prove native presence older than saved absence');
+    is(JSON::PP::decode_json(GP_Read('Geo.Test','gp_trip_checkpoint',''))->{status},'none','uncertain native ordering cannot retain the saved permission');
+};
 
 subtest 'ambiguous saved presence cannot conceal a possible return after departure' => sub {
     my $error;

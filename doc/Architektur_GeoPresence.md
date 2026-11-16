@@ -1,6 +1,6 @@
 # GeoPresence – Architektur
 
-**Version 0.83 · Stand 05.11.2026 · Handbuch 2.45**
+**Version 0.84 · Stand 16.11.2026 · Handbuch 2.46**
 
 Diese Beschreibung spezifiziert den aktuellen Aufbau von `FHEM/98_GeoPresence.pm`. Einrichtung und Bedienung stehen im [Handbuch](GeoPresence_Handbuch.md); Prüfabläufe und Testprogramm sind in der [Testanleitung](GeoPresence_Testanleitung.md) beschrieben. Gerätenamen wie `Geo.PERSON` und `Geo.PERSON.ORT` sind austauschbare Beispiele.
 
@@ -18,7 +18,6 @@ Diese Beschreibung spezifiziert den aktuellen Aufbau von `FHEM/98_GeoPresence.pm
 - [[#10. Simulation, Diagnose und Oberfläche|10. Simulation, Diagnose und Oberfläche]]
 - [[#11. Persistenz und Lebenszyklus|11. Persistenz und Lebenszyklus]]
 - [[#12. Ausführung und Prüfung|12. Ausführung und Prüfung]]
-- [[#13. Änderungen seit der letzten Version|13. Änderungen seit der letzten Version]]
 
 ## 1. Aufgabe und Grenzen
 
@@ -210,7 +209,7 @@ Eine mehrdeutige positive Telefonquelle darf im Zustandsmodus einen gehaltenen S
 
 Telefonereignisse übernehmen den ursprünglichen Empfang ihrer ausgewählten Quelle. Eine verzögerte Abfrage verschiebt daher die monotone Aktionsfrist nicht. Auch bei ausdrücklich mitgegebenem Zeittext bleibt der tatsächliche Empfang getrennt von der Messzeit erhalten. Für eindeutig beobachtete Messungen und deren erste erforderliche Negativerneuerung wird das Alter auf die monotone Uhr bezogen; eine spätere Systemzeitkorrektur berechnet diesen Bezug nicht neu.
 
-Bei der Wiederherstellung widerspricht eine gespeicherte Heim- oder Telefonanwesenheit dem Ausflug, sobald ihr möglicher Zeitbereich bis nach dessen Abwesenheitsbestätigung reicht. Ein vollständig davor liegendes Intervall widerlegt die spätere Reise nicht. Ein aktueller Heimzustand oder gesunder positiver Telefonwert mit unbrauchbarer oder zukünftiger Zeit liefert ebenfalls keinen belastbaren Fortsetzungsnachweis. Die numerischen Quellenmetadaten bleiben flüchtig: Ein Reload im selben Prozess kann beobachtete Quellenzeiten erhalten; ein Prozessneustart muss lokale Zeittexte wieder als solche bewerten. Der Reise-Checkpoint erhält dadurch keine neuen Felder oder Formatversion.
+Bei der Wiederherstellung widerspricht eine gespeicherte Heim- oder Telefonanwesenheit dem Ausflug, sobald ihr möglicher Zeitbereich bis nach dessen Abwesenheitsbestätigung reicht. Ein sicher davor liegender Quellenstand widerlegt die spätere Reise nicht. Ein aktueller Heimzustand oder gesunder positiver Telefonwert mit unbrauchbarer oder zukünftiger Zeit liefert ebenfalls keinen belastbaren Fortsetzungsnachweis. Die numerischen Quellenmetadaten bleiben flüchtig: Ein Reload im selben Prozess kann beobachtete Quellenzeiten erhalten; ein Prozessneustart muss lokale Zeittexte wieder als solche bewerten. Der Reise-Checkpoint erhält dadurch keine neuen Felder oder Formatversion.
 
 ## 5. Anwesenheit und Ausflug
 
@@ -253,6 +252,10 @@ Ein Raumwechsel kann einen Sensor verlieren und einen anderen gewinnen; mehrere 
 `GP_PhoneSamples` liest die tatsächlichen Quellen. Pro Bewohner und Timerlauf teilen sich fällige Produktions- und Live-Debug-Abfragen denselben unveränderlichen Eingangsschnappschuss; simulierte Telefonwerte bleiben davon getrennt. `GP_PhoneEvidence` prüft Gesundheit, Zeitstempel, Quellenvertrag und Reihenfolge in einem Durchlauf und ermittelt die benötigten Zeitgrenzen ohne zusätzliche Wertelisten oder Sortierungen. `GP_Phone` führt daraus die je Kontext unabhängige Anwesenheitskontinuität, Übergangslücke und Abwesenheitsfrist. Nur der geordnete Reisekern in `GP_ProcessPhone` entscheidet über Status, Widerruf und Rückkehr; die Quellenabfrage selbst erteilt keine Reiseberechtigung.
 
 Je Quelle bleibt nur der letzte angenommene Stand aus Wert, frühestem und spätestem Zeitpunkt sowie einer nicht rückläufigen Ordnungsgrenze erhalten. Positive Zeitbereiche werden anhand ihres spätesten möglichen Zeitpunkts mit dieser Grenze verglichen. Eine Überlappung ist dadurch nicht fälschlich sicher älter. Das bisherige Annahmekriterium für Negativwerte und der Wiederanlauf nach Quellenfehlern bleiben bestehen. Eine angenommene Überlappung setzt die bekannte Ordnungsgrenze nicht zurück. Änderungen von Wert oder Zeitbereich kennzeichnen eine neue Beobachtung; unveränderte Polls erzeugen weder erneut ein Ereignis noch einen neuen Quellenstand. Die vier skalaren Angaben ersetzen den bisherigen einzelnen Zeitwert und bilden keine Historie.
+
+Nach validierter Wiederherstellung eines telefonisch bestätigten Ausflugs liefert dessen Abwesenheitszeit im Zustandsmodus eine zusätzliche Grenze für ältere positive Quellenstände. Ein vollständig davor liegender Zeitbereich wird nicht als neue Anwesenheit angenommen. Die absolute Grenze verwendet dieselbe ganze Sekunde wie die ursprüngliche Checkpoint-Prüfung. Für native Quellen muss zusätzlich deren monotone Zeit vor dem tatsächlich beobachteten Beginn der Abwesenheitsfrist liegen. Die aus der aktuellen Wanduhr rekonstruierte Reisezeit ist dafür kein Ordnungsbeweis: Eine kleine Uhrkorrektur vor dem Reload kann diesen Schätzwert verschieben. Fehlt der beobachtete Beginn, bleibt native positive Anwesenheit als möglicher Gegenbeweis erhalten. Werte an oder nach der absoluten Grenze und überlappende Zeitbereiche bleiben ebenfalls mögliche Gegenbeweise.
+
+Diese Auswahl erfolgt vor der Bestimmung von Anwesenheitskontinuität und positiver Ereigniszeit. Ein überholter Startwert erzeugt dadurch weder einen Widerruf noch ein neues Anwesenheitsveto und verdeckt keine gleichzeitig gültige Rückkehr einer anderen Quelle. Beim Reload werden bis zur Checkpoint-Prüfung nur Reise-ID, ursprüngliche Abwesenheitszeit und der beobachtete monotone Fristbeginn gehalten. Der Fristbeginn wird ausschließlich für dieselbe erfolgreich geprüfte Reise übernommen und bleibt auch über wiederholte Reloads erhalten. Die Zuordnung gilt für die wiederhergestellte Reise beziehungsweise ihren behaltenen Abschluss; neue Quellenhistorien, Checkpoint-Felder oder dauerhaft gespeicherte Zeitanker entstehen nicht. Der aktuelle Ausflug bleibt weiterhin allein für die Auswahl einer reisebezogenen Rückkehrzeit maßgeblich. Laufend beobachtete Telefonqualifikationen behalten ihre bisherigen Gegenbeweisprüfungen. Das gilt auch für eine nachgelieferte positive Zeit vor dem Fristbeginn, wenn sie eine gegenüber den verwendeten Negativwerten neuere gehaltene Anwesenheit belegt.
 
 ### 6.2 Messvertrag
 
@@ -599,209 +602,3 @@ Die Prüfungen der Statusübernahme umfassen ohne Reisenachweis die gemischten p
 Weitere Prüfungen umfassen abgeschlossene Geo- und telefonbestätigte Reisen mit einem späteren Abwesenheitszyklus, neuerer naher Ortsposition und gemischten positiven Quellzeiten. Beide Statuswerte müssen anhand der aktuellen Anwesenheit wieder `home` werden und ohne weitere Quellenmeldungen dort bleiben. Eine ältere bereits für Aktionen abgelaufene Meldung darf den reinen Status ebenfalls nicht blockieren. Gegenproben erhalten ursprüngliche Reisegrenzen, unveränderte Quellenzeiten und den Widerruf eines tatsächlich neuen laufenden Ausflugs. Ein aufbewahrter alter Ausgabeplan muss nach dem neuen Statuswechsel weiterhin an seinem eigenen abgelaufenen Budget scheitern. Die echte FHEM-Integration prüft die beiden Arten abgeschlossener Reise; der spätere Statuswechsel darf keine Öffnung wiederholen.
 
 Die Prüfungen der Telefonverarbeitung sichern die fachlichen Abläufe im Zustands- und Messmodus ab. Direkte interne Testereignisse enthalten die Pflichtfelder des regulären Erzeugers. Eine zusätzliche Gegenprobe qualifiziert Abwesenheit im Zustands- und Messmodus, prüft unveränderte Negativwerte und meldet anschließend einen Quellenfehler. Der Fehler muss auch nach bereits bestätigter Abwesenheit erkannt werden; eine bloße Wiederverbindung mit alten Werten genügt nicht, neue Beobachtungen und eine vollständige erneuerte Frist bleiben erforderlich.
-
-## 13. Änderungen seit der letzten Version
-
-Änderungen von Version 0.82 auf 0.83:
-
-- ROOMMATE-Anzeigenamen aus der Bindung neuer Reisecheckpoints gelöst; die fachliche Feldauswahl bleibt gemeinsam für Schreiben und Wiederherstellen definiert.
-- Bisherige Bindungen nach vollständiger Prüfung einmalig übernommen; Reise-ID, Abwesenheitsnachweis, Verbrauch und verbleibende Cooldowns erhalten.
-- Neue Prüfwerte von alten Laufzeitcaches getrennt und reine Aliasänderungen ohne zusätzlichen Checkpoint-Schreibvorgang erhalten.
-
-Änderungen von Version 0.81 auf 0.82:
-
-- Gemeinsame Textnormalisierung für Logs und vollständige Berichtswerte verwendet; die Loglängenbegrenzung bleibt getrennt.
-- Bezeichnungen produktiver Entscheidungen erst bei Bedarf aufbereitet; vorhandene JSON-Encoder wiederverwendet.
-- Spaltenbreiten nur für zweispaltige Textausgaben berechnet; Ausgabeinhalte und Transport-Escaping erhalten.
-- Nachrichtenmeldungen auf den tatsächlichen `pushMsg`-Kanal bezogen und die allgemeine Get-Hilfe an die vollständige Textausgabe angepasst.
-
-Änderungen von Version 0.80 auf 0.81:
-
-- Zusätzliche JSON-Vergleiche bei der ersten Geometrieübernahme und mindestens einer Sekunde neuerer Geometriezeit vermieden; gleiche Zeiten, kurze Bruchteilsabstände und bisherige Metadatenvergleiche erhalten.
-- Ältere Geometriezeiten vor dem wirkungslosen Vergleich der Kreisparameter abgewiesen.
-- Zeitlich unpassende Konfliktkandidaten vor der temporären Kopie ausgeschlossen; zeitgleiche Gegenbeweise einschließlich Austritten weiterhin geprüft.
-- Distanzberechnungen für bereits inaktive Ortsstände übersprungen; aktive Gegenpositionen und ausdrückliche Gruppenmitgliedschaften unverändert behandelt.
-- Bereits geprüfte Kreise wiederverwendet und die Sperrbedingung vereinfacht.
-- Home-Abstand für historische Home-Beobachtungen und Abgangsprüfungen wiederverwendet; Outer-Reichweite nur für anstehende Abgangsprüfungen berechnet.
-- Home-Selbstabstand direkt verwendet und die erneute Prüfung bereits geladener Altgeometrie bei der ausdrücklichen Übernahme vermieden.
-
-Änderungen von Version 0.79 auf 0.80:
-
-- Gemeinsame Zeitbewertung für Telefonquellen, Aktorpositionen, Abschlussrückmeldungen und Wiederherstellung eingeführt.
-- Tatsächliche FHEM-Aktualisierungszeiten vor dem Verlust der numerischen Metadaten erfasst; doppelte lokale Herbstzeiten vertauschen dadurch keine beobachteten Updates.
-- Mehrdeutige gespeicherte Zeiten konservativ bewertet und wiederholte Umrechnung unveränderter Readings vermieden.
-- Nachgelieferte mehrdeutige Anwesenheit für den Widerruf laufender Reisen und wartender Öffnungen berücksichtigt; zukünftige Heimzeitstempel bei der Wiederherstellung abgewiesen.
-- Überlappende positive Quellenbereiche bei Annahme und Neuheit berücksichtigt und gehaltene Statuswechsel gegenüber älteren Positionen zugelassen.
-- Notify-Abonnements auf tatsächlich benötigte Ereignisempfänger begrenzt; die Quellenbeobachtung bleibt davon unabhängig.
-- Quellenverwaltung auf eine Controllerreferenz und eine zentrale Menge vereinfacht; zusätzliche Bewohnerdurchläufe, Zugriffe und unnötige Ergänzungskopien entfernt.
-- Reload-Fehlerhilfe von der Entwertung bei Moduswechseln unterschieden.
-
-Änderungen von Version 0.78 auf 0.79:
-
-- Cooldowns gewöhnlicher Aktionen anhand der monotonen Uhr geprüft; kleine Systemzeitkorrekturen verändern die Sperrdauer nicht.
-- Verstrichene Cooldown-Dauern im Checkpoint-Format Version 3 ergänzt und nach Neustarts konservativ fortgesetzt; gültige ältere Formate bleiben lesbar.
-- Ursprüngliche absolute Planungszeiten sowie Besuchs- und Reiseverbrauch erhalten; unveränderte Timerläufe speichern weiterhin nicht erneut.
-
-Änderungen von Version 0.77 auf 0.78:
-
-- Kontextkennungen beim Uhrwiderruf mit fester Länge neu gebildet; neue Reisen bleiben auch nach wiederholten Uhrkorrekturen innerhalb der bestehenden Checkpoint-Grenze.
-- Gespeicherte gültige Reise-IDs, ursprüngliche Abwesenheitsnachweise und die Entwertung alter Ausgabepläne bleiben erhalten.
-
-Änderungen von Version 0.76 auf 0.77:
-
-- Anzeigeablauf von angenommenen Ortsnachweisen getrennt; kurze Anzeigealter brechen keine gültige Home-Wartezeit mehr ab.
-- Ursprüngliche Ortszeiten und Ein-/Austrittswerte auch im Checkpoint erhalten; echte Gegenbeweise widerrufen Ankünfte weiterhin.
-- Die Anzeigesuche bei unbekannter Position übersprungen und nach dem Verbergen des passenden Labels beendet.
-
-Änderungen von Version 0.75 auf 0.76:
-
-- Eigene ROOMMATE-Echos auf den konkreten Statusauftrag begrenzt; fremde, widersprechende und mehrdeutige Home-Meldungen widerrufen laufende Freigaben.
-- Tatsächliche Home-Schreibzugriffe während der Statusübergabe unmittelbar zuordnen und widerrufen, einschließlich fremder Personen; der gemeinsame Widerruf stoppt auch bereits entnommene Folgepläne.
-- Manuelle Heimkehr auch bei wiederholter Ereignisabbildung sowie gelöschter und neu angelegter Ereignisansicht berücksichtigen, einschließlich `setreading` mit einem Reading-Präfix im Home-Ereignistext; Bündelaufbewahrung und Cache-Feldreferenzen entfallen.
-- Rückmeldungen bereits ausgegebener Aktoren sowie Fehlerbehandlung, Wiederholung und neuere Statuswünsche bleiben erhalten.
-
-Änderungen von Version 0.74 auf 0.75:
-
-- FHEM-Rename-Callback für interne Ressourcen, Elterndefinitionen, Zugangsdaten, begrenzte betroffene Kontexte und laufende Aktorrückmeldungen ergänzt.
-- Kennwortfehler nach Umbenennung bleiben gesperrt und sichtbar, bis die Zugangsdaten erfolgreich neu gesetzt wurden; öffentliche Attributverweise bleiben ausdrücklich zu berichtigen.
-- Regex-sichere Kennwortschlüssel und exakte Altübernahme schützen den migrierten Zugang und ähnlich benannte fremde Einträge beim Lesen, Schreiben und Löschen.
-- Rückgabefehler und Ausnahmen der ROOMMATE-Statusübergabe werden angezeigt; der noch aktuelle gewünschte Status wird ohne zusätzliche Öffnungsrechte wiederholt.
-- Kennwortformate aus einem gelesenen Bestand auswählen, die lokale Zeilenliste bei der Altbereinigung weiterverwenden und die Freigabe für ROOMMATE-Wiederholung und Veröffentlichung gemeinsam prüfen.
-- Auswahllisten bei eindeutig auswahlfremden Definitionen und Umbenennungen sowie nach reiner Änderung einer Ortsfunktion nicht mehr wirkungslos neu aufbauen.
-- Erneute Freigabe auf die tatsächliche ROOMMATE-Statusbearbeitung begrenzen und Bewohnerlisten bei Aktions- und Regelumbenennungen erst nach der Betroffenheitsauswahl aufbereiten.
-
-Änderungen von Version 0.73 auf 0.74:
-
-- Webhook-Kontingente erst nach erfolgreicher Anmeldung und getrennt je Person zählen; Produktion, Debug und Lernen teilen dasselbe Personenfenster.
-- Das feste 60-Sekunden-Fenster mit der monotonen Uhr begrenzen; Vor- und Rückwärtskorrekturen der Systemzeit ändern seine Dauer nicht.
-- Authentifizierte Person vor der Kontingentprüfung an die Diagnose übergeben; HTTP 429 bleibt zuordenbar und wird bei `debugLog auto` für Debug-/Lernpersonen auch unter aktivem Controller protokolliert.
-- Doppelte Webhook-Pfadermittlung, zusätzliche Diagnosehashkopie und Kopie der Benutzerzuordnung entfernt; Pfad-, Anmelde- und Diagnoseverträge bleiben erhalten.
-- Kontingente auf zwei Werte je angemeldeter Person begrenzt und beim Löschen der Person bereinigt; Regressionen prüfen Anmeldung, Personentrennung, Moduswechsel und Zeitkorrekturen auch über den echten HTTP-Listener.
-
-Änderungen von Version 0.72 auf 0.73:
-
-- Vollständige interne Telefonereignisse direkt verwenden; nicht benötigte Ersatzpfade und Abschlusszuweisungen entfernt.
-- Aktuellen Telefonwiderruf nach der Zeitlage vor beziehungsweise ab dem Abgang aufgeteilt.
-- Bereits qualifizierte gesunde Negativlagen vor erneuter Fristrechnung beenden, nach unveränderter Quellen- und Grenzprüfung.
-- Zwei im vorhandenen Lebenszyklus nicht wirksame Markerprüfungen an übernommenen Reisenachweisen entfernt.
-
-Änderungen von Version 0.71 auf 0.72:
-
-- Nur eine laufende Reise bestimmt die ursprüngliche Telefon-Rückkehrzeit; abgeschlossene Reisen blockieren spätere reine Statuswechsel nicht.
-- Abgeschlossene Nachweise und die Zeitgrenzen ihrer Ausgaben bleiben für Widerruf und Freigabe erhalten.
-
-Änderungen von Version 0.70 auf 0.71:
-
-- Ohne Reisenachweis verwendet die Statusübernahme die jüngste gültige positive Quellzeit; ältere gleichzeitig angenommene Meldungen blockieren frische Anwesenheit nicht.
-- Bei vorhandenem Reisenachweis bleiben die ursprüngliche Rückkehrzeit und ihre Grenzen für Widerruf, Mindestabwesenheit und Ausgabe wirksam.
-
-Änderungen von Version 0.69 auf 0.70:
-
-- Die früheste neue positive Beobachtung ab dem maßgeblichen Abgang bestimmt Rückkehralter, Mindestabwesenheit und Ausgabebudget.
-- Vorstart- und laufende Sitzungen verwenden dieselbe Zeitwahl; der zusätzliche Ereigniswert `snapshot_time` entfällt.
-- Die gemeinsame Bestimmung des Abgangs verhindert doppelte Grenzlogik in Quellenprüfung und Reisekern.
-
-Änderungen von Version 0.68 auf 0.69:
-
-- Vorstart-Gegenbeweise bleiben bei gleichzeitig aktuellen positiven Sensoren für den Widerruf wiederhergestellter Geo-Reisen wirksam.
-- Nur die erste erforderliche Erneuerung je Quelle begrenzt den Abschluss; weitere Negativmessungen verschieben eine gültige Rückkehr nicht.
-- Der vorhandene Telefonpuffer übernimmt die Aufbewahrung unverarbeiteter Abschlüsse allein; das zusätzliche Referenzfeld und seine Pflegepfade entfallen.
-
-Änderungen von Version 0.67 auf 0.68:
-
-- Widersprochene gesammelte Telefonabschlüsse werden gezielt entwertet; gültige frühere Abschlüsse bleiben für spätere Rückkehr erhalten.
-- Nachgelieferte Vorstart-Anwesenheit kann ältere wiederhergestellte Berechtigungen widerrufen, ohne historische Aktionen auszuführen.
-- Nahe Zwischenpositionen sperren eine weiterhin gültige Abwesenheitskontinuität nicht.
-- Ein gemeinsamer Abschlussnachweis begrenzt Rückkehr über Bündelgrenzen hinweg; der tatsächliche Abschluss bleibt auch im Messmodus maßgeblich.
-
-Änderungen von Version 0.66 auf 0.67:
-
-- Quellenprüfung, Telefonkontinuität und Reiseentscheidung getrennt; gemeinsame Live-Abfragen und direkte Zeitgrenzen statt zusätzlicher Listen und Sortierungen.
-- Gültige verspätete Anwesenheit widerruft alte Reise- und Ausgabeberechtigungen unabhängig von der Freigabe neuer Aktionen.
-- Gehaltene negative Zustände können nach einem Home-Austritt eine neue vollständige Abwesenheitsfrist erfüllen, ohne erneut gemeldet werden zu müssen.
-- Gemeinsamer Home-Abgang und gemeinsames Anwesenheitsveto; Abwesenheitsabschlüsse werden anhand ihres tatsächlichen Abschlusszeitpunkts eingeordnet.
-
-Änderungen von Version 0.65 auf 0.66:
-
-- Neue Kontextkennungen erhalten einmalig einen zufälligen Sitzungsanteil gegen die erneute Vergabe alter Reise-IDs nach Prozessneustarts.
-- Wiederhergestellte Reisen behalten ihre ID; neue Reisen verwenden die neue Kennung und den lokalen Zähler.
-- Checkpoint-Format und Übernahme gültiger Daten der Versionen 1 und 2 bleiben erhalten.
-
-Änderungen von Version 0.64 auf 0.65:
-
-- Ein beibehaltener unbestätigter Home-Abgang erhält den Verbrauch seiner Reiseaktionen.
-- Zurückgewiesene Entfernungs- und Austrittsnachweise bleiben verworfen; neue Nachweise erlauben keine erneute Ausgabe innerhalb derselben Reise.
-
-Änderungen von Version 0.63 auf 0.64:
-
-- Aktuelle Verbrauchsstände ersetzen die Historie alter Besuche und deren Reihenfolgeliste.
-- Reisegebundener Verbrauch bleibt im Ausflug; gewöhnliche Orts-/Gruppenbesuche und gemeinsame Aktions-Cooldowns bleiben getrennt.
-- Checkpoint-Version 2 mit einmaliger Übernahme gültiger Version-1-Daten und Verdichtung alter Laufzeitzustände beim Reload.
-
-Änderungen von Version 0.62 auf 0.63:
-
-- Checkpoints folgen Änderungen der gespeicherten Fachdaten statt Diagnoseeinträgen.
-- Unveränderte Wiederherstellungen behalten den gespeicherten Stand; Bewegungs- und Anzeigeabläufe werden ausdrücklich erfasst.
-- Reisequalifikation wird vor dem schnellen Rücksprung geprüft; Widerruf und Verbrauch bleiben vor produktiven Ausgaben gespeichert.
-
-Änderungen von Version 0.61 auf 0.62:
-
-- Ein verspäteter Austritt vor Home erhält die bestehende Home-Vormerkung samt unbetroffener Fahrzeugentscheidung.
-- Gemeinsame Bewegungsbewertung für neue Hinweise und Teilentwertung; verbliebene Daten behalten bei Teilentwertung ihren ursprünglichen Bewertungszeitpunkt.
-- Kein vollständiger Neuaufbau der Home-Vormerkung und keine Neubewertung, wenn keine Bewegungsdaten entfallen.
-
-Änderungen von Version 0.60 auf 0.61:
-
-- Verspätete Austritte unterbrechen bereits den Annäherungsabschnitt, auch nach einer neueren Ortsmeldung und vor der Home-Vormerkung.
-- Eine gemeinsame Ursprungszeit begrenzt Austrittsprüfung und Bewegungsergänzung ohne zusätzliche Ereignishistorie.
-- Vor Home liegende Unterbrechungen erhalten eine bereits begonnene gültige Home-Frist, entwerten aber frühere Bewegungsursprünge und deren Fahrzeugentscheidung.
-
-Änderungen von Version 0.59 auf 0.60:
-
-- Die aktuelle Annäherungsbeobachtung wird beim Home-Eintritt derselben wartenden Ankunft zugeordnet; ihr gültiger Bewegungsnachtrag bleibt wirksam.
-- Der vorhandene Annäherungskontext speichert dafür einen Ereignisschlüssel zusätzlich zur Ablaufzeit. Abbrüche löschen ihn auch vor Beginn einer Home-Frist.
-- Ältere Annäherungsnachträge prüfen die Mindestabwesenheit anhand des bereits qualifizierten Home-Eintritts und lösen keine vorzeitige Bestätigung aus.
-
-Änderungen von Version 0.58 auf 0.59:
-
-- Akzeptierte Eintritte bleiben ihrer offenen Ankunft zugeordnet; neuere bewegungslose Meldungen verwerfen ihre Bewegungsnachträge nicht mehr.
-- Gemeinsame Ergänzungsprüfung für Geometrie-Vorfilter und Duplikatverarbeitung; vorhandener begrenzter Duplikatspeicher wird weiterverwendet.
-- Der neueste Home-Nachweis bleibt bei älteren Ergänzungen erhalten, damit verspätete Austritte die Ankunft weiterhin korrekt unterbrechen.
-
-Änderungen von Version 0.57 auf 0.58:
-
-- Die Bündelfrist beginnt mit dem ersten Empfang; neue Meldungen verschieben ältere nicht mehr beliebig.
-- Chronologisch gruppierte Konfliktprüfung ersetzt den Vergleich sämtlicher Paare; nur gleiche Zeitstempel werden miteinander verglichen.
-- Alle bereits vorliegenden Gegenbeobachtungen eines fälligen Bündels bleiben vor der Ankunftsbestätigung berücksichtigt.
-
-Änderungen von Version 0.56 auf 0.57:
-
-- Löschmuster werden vor der Attributklassifikation aufgelöst; Aliaslöschmuster am ROOMMATE erhalten gültige Folgeaufträge.
-- Die globale Cache-Entwertung berücksichtigt auch gemustert gelöschte, vom Validator beanstandete Altattribute.
-- Gemeinsamer Musterabgleich und FHEM-Attributbeschreibungen ersetzen weitere Sonderfälle für einzelne Musterschreibweisen.
-
-Änderungen von Version 0.55 auf 0.56:
-
-- Attributrelevanz vor dem Widerruf; Aliasänderungen erhalten gültige Folgeaufträge.
-- Monotone Fristen bleiben vom ursprünglichen Empfang über Warteschlange und Ankunftsfrist bis zur Ausgabe verankert.
-- Controller-Abhängigkeiten und gemeinsam geprüfte Sammellöschungen schließen den Schutz vor veralteten Konfigurationsparametern.
-
-Änderungen von Version 0.54 auf 0.55:
-
-- [[#9.4 Abschließende Freigabe|Abschnitt 9.4]]: Gemeinsame Freigabe für alle vier Ausgabepfade, Widerruf bereits entnommener Pläne und erneute Prüfung nach synchronen Rückrufen.
-- [[#4.2 Reihenfolge und Frische|Abschnitt 4.2]]: Aktuelle Uhren vor der Ausgabe und eine monotone Ablaufgrenze verhindern die Ausführung inzwischen veralteter Aufträge.
-- Gemeinsame Planerzeugung, feste Öffnungsbefehle und Entfernung noch nicht ausgegebener Reservierungen; passive Rückmeldungen und Checkpoint-Verbrauch bleiben erhalten.
-
-Änderungen von Version 0.53 auf 0.54:
-
-- [[#2.4 Aufbereitete Konfiguration|Abschnitt 2.4]]: Gemeinsamer Katalog, direkte Nachschlagewerke, zwischengespeicherte statische Prüfungen und getrennte Geometrieansichten ersetzen wiederholte Aufbereitung im Timer und in Berichten.
-- Aktorparameter werden einmal je Aktion ausgewählt und gemeinsam verwendet. Oberflächen- und ungenutzte Aktorattribute beeinflussen die Wiederherstellungsbindung nicht mehr.
-- Relevante FHEM-Änderungsereignisse entwerten die aufbereiteten Daten; aktuelle Sensor- und Transportzustände bleiben davon unabhängig.
-- `reorder_window` muss kleiner als `action_max_age` sein. Die Prüfung berücksichtigt auch das Löschen eines Attributs und dessen Standardwert.
-
-Änderungen von Version 0.52 auf 0.53:
-
-- [[#11. Persistenz und Lebenszyklus|Kapitel 11]]: Bestätigte offene Ausflüge werden über einen versionierten FHEM-Checkpoint nach Neustart, Reload und rereadcfg wiederhergestellt. Struktur-, Bindungs-, Konfigurations- und Zeitprüfung, Ablaufgrenze und ausdrückliche Entwertung verbrauchter oder widerrufener Reisen beschrieben.
-- [[#9.2 Aktorvertrag und Reservierung|Abschnitt 9.2]]: `positionSignalMode` ergänzt. Gehaltene Positionen überleben Neustarts im Standardmodus state; measurement verlangt neue Messungen. Auftragsbestätigungen bleiben unabhängig davon an neue Rückmeldungen gebunden.
-- [[#8.3 Vorheriger Austritt als Bedingung|Abschnitt 8.3]]: Explizite Austritte eines wiederhergestellten Ausflugs bleiben für Richtungsregeln erhalten.
-- [[#12. Ausführung und Prüfung|Kapitel 12]]: Reale Prozessneustarts mit gültigem Checkpoint, späterer Tür-/Garagenöffnung und Schutz vor Wiederholung nach weiterem Neustart ergänzt.
