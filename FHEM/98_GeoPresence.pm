@@ -917,17 +917,34 @@ sub GeoPresence_Define {
     return;
 }
 
-# GP_ResetController: Start a new session while retaining actor reservations and observed recovery clocks.
+# GP_ResetController: Start a new session while retaining actor reservations and valid recovery clocks.
 sub GP_ResetController {
     my ($c,$policy) = @_;
     $policy//='invalidate';
     return unless $c;
     my $previous=$c->{helper}{gp}//{};
-    if ($policy eq 'resume' && $init_done) {
-        # Capture a live qualified trip when updating from a version which did
-        # not yet publish checkpoints. Never preserve a queued output adapter.
-        for my $r (keys %{$previous->{prod}//{}}) {
-            GP_Checkpoint($c,$r,undef,$previous->{prod}{$r});
+    if ($policy eq 'resume') {
+        my ($now,$mono)=(GP_Now(),GP_Mono());
+        my ($tolerance,$pending_shift);
+        # Check old clocks before saving travel, including upgrades from versions
+        # without checkpoints. Never preserve a queued output adapter.
+        for my $r (GP_Residents($c)) {
+            my $s=$previous->{prod}{$r};
+            next unless $s || $previous->{resume_pending}{$r};
+            $tolerance//=0+GP_Attr($c->{NAME},'future_tolerance',$GP_DEFAULT{future_tolerance});
+            if ($s) {
+                GP_CheckClock($s,{future_tolerance=>$tolerance,
+                    sourceMode=>GP_Attr($r,'sourceMode','geofency_phone')},$now,$mono);
+                # The writer loads full configuration only when qualification needs it.
+                GP_Checkpoint($c,$r,undef,$s);
+            } else {
+                $pending_shift//=abs(($now-$previous->{start})-($mono-$previous->{mono}));
+                if ($pending_shift>$tolerance) {
+                    # Another reload must not erase a clock fault before first recovery.
+                    GP_ClearCheckpoint($r,'Clock discontinuity before saved trip recovery');
+                    delete $previous->{resume_pending}{$r};
+                }
+            }
         }
     } elsif ($init_done) {
         GP_ClearCheckpoint($_,'Controller configuration changed') for GP_Residents($c);
@@ -948,15 +965,18 @@ sub GP_ResetController {
     # session (including password/configuration changes and module reloads).
     my %learned=map {$_=>$old->{learned}{$_}}
         grep {$old->{learned}{$_}{confirmed}} keys %{$old->{learned}//{}};
-    # Recovery retains only trip identity and an observed clock, never old contexts.
+    # Recovery retains only trip identity and needed clocks, never old contexts.
     $c->{helper}{gp} = { start => GP_Now(), mono => GP_Mono(), epoch => ($old->{epoch} // 0)+1,
         prod => {}, debug => {}, actors => $old->{actors} // {}, queue => [], ready => 0,
         learned => \%learned,
         resume_pending => $policy eq 'resume' ? {map {
             my $t=$old->{prod}{$_}{trip};
             my $proof=$t && $t->{phone_qualification};
-            $_=>$t ? $proof && defined($proof->{negative_since})
-                ? {id=>$t->{id},away_time=>$t->{away_time},negative_since=>$proof->{negative_since}}
+            $_=>$t ? defined($t->{away_mono})
+                ? {id=>$t->{id},away_time=>$t->{away_time},away_mono=>$t->{away_mono},
+                    ($proof && defined($proof->{qualified_at}) && defined($proof->{qualified_mono})
+                        ? (qualified_at=>$proof->{qualified_at},qualified_mono=>$proof->{qualified_mono}):()),
+                    ($proof && defined($proof->{negative_since}) ? (negative_since=>$proof->{negative_since}):())}
                 :1
                 :$old->{resume_pending}{$_}//1;
         } GP_Residents($c)} : {} };
@@ -3295,8 +3315,11 @@ sub GP_ResumeTrip {
         return;
     }
     return unless $checkpoint->{status} eq 'qualified';
-    # Reconstruct elapsed-time origins for recovery; pending timers and queues
-    # never resume. A reload may separately retain an observed source-order clock.
+    # Runtime clocks belong only to the same validated departure in this process.
+    # Pending timers and queues never resume; cold recovery reconstructs durations.
+    my $prior=ref($previous) eq 'HASH' && ($previous->{id}//'') eq $trip->{id}
+        && defined($previous->{away_time}) && $previous->{away_time}==$trip->{away_time}
+        ? $previous:undef;
     my $elapsed=delete $state->{action_elapsed};
     $s->{$_}=$state->{$_} for keys %$state;
     # Resume only elapsed time confirmed at the save. Offline wall-clock changes
@@ -3304,19 +3327,17 @@ sub GP_ResumeTrip {
     GP_RestoreActionClocks($s,$checkpoint->{saved_at},$mono,$elapsed);
     $s->{zones}{$_}{role}=$cfg->{zones}{$_}{role} for keys %{$s->{zones}};
     $s->{trip}=$trip;
-    $trip->{away_mono}=$mono-($now-$trip->{away_time});
+    $trip->{away_mono}=$prior && defined($prior->{away_mono})
+        ? $prior->{away_mono}:$mono-($now-$trip->{away_time});
     $trip->{leave_mono}=$mono-($now-$trip->{home_exit}) if defined $trip->{home_exit};
-    # Saved qualified data supplies a conservative return fence at saved_at.
-    # Original departure/window checks remain; no collection or timer is resumed.
-    $trip->{phone_qualification}={qualified_at=>$checkpoint->{saved_at},
-        qualified_mono=>$mono-($now-$checkpoint->{saved_at})}
-        if ($trip->{away_reason}//'') eq $GP_PHONE_DEPARTURE_REASON;
-    # Only the same validated trip can retain an actually observed clock origin.
-    # Never replace it with the reconstructed elapsed-time origin above.
-    if ($trip->{phone_qualification} && ref($previous) eq 'HASH'
-        && ($previous->{id}//'') eq $trip->{id} && defined($previous->{away_time})
-        && $previous->{away_time}==$trip->{away_time} && defined($previous->{negative_since})) {
-        $trip->{phone_qualification}{negative_since}=$previous->{negative_since};
+    if (($trip->{away_reason}//'') eq $GP_PHONE_DEPARTURE_REASON) {
+        # Keep known completion clocks; cold recovery uses the saved return fence.
+        my $completion=$prior && defined($prior->{qualified_at}) && defined($prior->{qualified_mono});
+        $trip->{phone_qualification}={
+            qualified_at=>$completion ? $prior->{qualified_at}:$checkpoint->{saved_at},
+            qualified_mono=>$completion ? $prior->{qualified_mono}:$mono-($now-$checkpoint->{saved_at}),
+            # Reconstructed elapsed-time clocks never create observed source evidence.
+            ($prior && defined($prior->{negative_since}) ? (negative_since=>$prior->{negative_since}):())};
     }
     $s->{phase}='away';
     $s->{checkpoint_dirty}=$timed && !$legacy_binding ? 0:1;
@@ -5222,6 +5243,7 @@ set Geo.PERSON mode debug</pre>
   <p>Use FHEM's normal save mechanism for definitions, attributes and production readings. A deviceId confirmed with learnConfirm is an ordinary configuration attribute; learnConfirm does not call save. Production geometry is stored in gp_geometry. A qualified unfinished production trip is stored as one versioned gp_trip_checkpoint reading. Version 3 stores current consumption, original absolute plan times and elapsed cooldown durations. Valid version 1 and 2 data is imported once without replaying actions or renewing departure evidence. After restart, rereadcfg or module reload it can resume if identity, configuration, geometry and the trip_resume_max_age limit still match and no later Home or indoor presence contradicts it. A NEW return is required; startup alone never opens, and old arrival timers, queued commands, unconfirmed departures and debug trips never resume. The checkpoint is consumed before dispatching opening commands. gp_resume_status/gp_resume_reason and explain describe restoration or rejection.</p>
   <p>New checkpoint bindings start with <code>2:</code> and exclude the ROOMMATE display alias. Changing or deleting that alias does not invalidate the trip or require an extra checkpoint write; new messages use the current name. An older binding is verified against its original configuration and alias before a one-time migration, including for version 3 data. Unverifiable older bindings and unknown binding contracts are rejected. Migration retains the trip ID, original departure evidence and consumption, and executes no historical actions.</p>
   <p>A restored cooldown resumes the remainder recorded at the last checkpoint. Time since that save, including downtime, is conservatively not credited because intervening clock corrections cannot be verified. A cooldown already expired at the save remains expired. Older formats derive their initial elapsed duration from the saved checkpoint time and the last plan time; earlier clock corrections cannot be reconstructed.</p>
+  <p>A module reload retains known monotonic departure and phone-completion times only for the same fully validated trip and original departure. The old clock is checked before saving or handing over travel, including repeated reloads before recovery starts. A large clock discontinuity revokes the saved permission; a small correction cannot shorten the known minimum absence. Without retained runtime data, recovery reconstructs elapsed-time origins from the checkpoint, using saved_at as the conservative phone-completion fence. An observed phone source origin remains separate and is never created by reconstruction. Pending arrival timers and queued commands do not resume; checkpoint fields and cooldown recovery remain unchanged.</p>
   <p>When restoring a trip, saved Home or indoor presence rejects the departure if its possible time range extends beyond that departure. An unambiguously earlier source does not contradict the trip. A current Home or healthy positive phone reading with an unusable or future timestamp also prevents restoration. A process restart must interpret saved local times again because the earlier numeric source metadata is no longer available.</p>
   <p>After restoring a phone-qualified trip, state sources strictly before its confirmed absence are superseded before selecting presence or return evidence. They do not revoke the trip, refresh its checkpoint or create an arrival. A later valid Home or phone return remains eligible. Overlapping time ranges and later presence remain counterevidence. Native source times are compared only with the original observed absence origin, retained across reloads only for the same validated trip. Without that origin, native presence remains possible counterevidence; an origin reconstructed from the current wall-clock offset does not establish order. Live absence qualifications retain their existing contradiction checks.</p>
   <p>A restored trip keeps its saved ID. Each new runtime context adds a fresh random session component; new trip IDs use that context and a local counter, so restarting the counters alone cannot recreate an old ID. This also applies to new debug contexts. Checkpoint versions 1, 2 and 3 remain readable.</p>

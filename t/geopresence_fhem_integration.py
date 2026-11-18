@@ -2451,11 +2451,16 @@ def run(source, encoding="bytestream", help_only=False):
                                  changed=1700000000, id="r05near", blocked=0)
             command("setstate Z.R05Near 2023-11-14 22:13:20 gp_geometry " + json.dumps(near_geometry, separators=(",", ":")))
 
-            def begin_phone_scenario(signal="state", window=180, reorder=2, poll=5):
-                for text in ("set GP mode debug", f"attr Geo.Test phoneSignalMode {signal}",
-                             f"attr GP phone_absence_window {window}", f"attr GP reorder_window {reorder}",
-                             f"attr GP phone_poll {poll}",
-                             "set GP mode active", "set door untouched", "set garage untouched"):
+            def begin_phone_scenario(signal="state", window=180, reorder=2, poll=5, source_mode=None):
+                setup = ["set GP mode debug"]
+                if source_mode:
+                    setup.append("attr Geo.Test sourceMode " + source_mode)
+                if source_mode != "geofency_only":
+                    setup.append(f"attr Geo.Test phoneSignalMode {signal}")
+                setup.extend((f"attr GP phone_absence_window {window}", f"attr GP reorder_window {reorder}",
+                              f"attr GP phone_poll {poll}",
+                              "set GP mode active", "set door untouched", "set garage untouched"))
+                for text in setup:
                     check(command(text) == "", "prepare the isolated phone-source scenario: " + text)
                 refresh_actor_contacts()
                 baseline = int(float(command("{ GP_Now() }"))) - 1
@@ -2468,6 +2473,59 @@ def run(source, encoding="bytestream", help_only=False):
                 command(f"{{ $main::GP_phone_elapsed={origin + seconds}-$main::GP_phone_wall_base;; return 'review time' }}")
                 if tick:
                     command("{ GeoPresence_Timer($defs{GP});; return 'review tick' }")
+
+            def reload_timed_scenario(reloads=1):
+                # Keep fixture clocks fixed while the real module replaces its functions.
+                result = command(
+                    "{ no warnings 'redefine';; my $wall=GP_Now();; my $mono=GP_Mono();; "
+                    "local *Time::HiRes::time=sub { $wall };; "
+                    "local *Time::HiRes::clock_gettime=sub { $mono };; "
+                    f"for (1..{reloads}) {{ my $error=CommandReload(undef,'98_GeoPresence.pm');; "
+                    "die $error if defined($error) && length($error) };; "
+                    "*GP_Now=sub { $main::GP_phone_wall_base+$main::GP_phone_elapsed+$main::GP_phone_wall_shift };; "
+                    "*GP_Mono=sub { $main::GP_phone_mono_base+$main::GP_phone_elapsed };; return 'module reloaded' }")
+                check(result == "module reloaded", "real reload succeeds with controlled clocks")
+                command("{ GP_State($defs{GP},'Geo.Test',0);; return 'checkpoint validated' }")
+                return json.loads(command("get GP explain Geo.Test prod format=json"))["state"]
+
+            for reloads in (1, 2):
+                for absence in (38, 60):
+                    origin = begin_phone_scenario(source_mode="geofency_only")
+                    phone_scenario_at(origin, 100)
+                    check(request("Work", 1)[0] == 200, "accepts independent departure before the clock correction")
+                    phone_scenario_at(origin, 102, tick=True)
+                    before = json.loads(command("get GP explain Geo.Test prod format=json"))["state"]
+                    check(before.get("trip", {}).get("armed"), "distance evidence qualifies the original departure")
+                    saved = command("{ ReadingsVal('Geo.Test','gp_trip_checkpoint','') }")
+                    saved_timestamp = command("{ ReadingsTimestamp('Geo.Test','gp_trip_checkpoint','') }")
+                    phone_scenario_at(origin, 120)
+                    command("{ $main::GP_phone_wall_shift=20;; return 'wall clock corrected' }")
+                    state = reload_timed_scenario(reloads)
+                    check(state["resume"]["status"] == "restored"
+                          and state["trip"]["id"] == before["trip"]["id"]
+                          and state["trip"]["away_mono"] == before["trip"]["away_mono"],
+                          "real reload retains the original monotonic departure")
+                    phone_scenario_at(origin, 120, tick=True)
+                    check(command("{ ReadingsVal('Geo.Test','gp_trip_checkpoint','') }") == saved
+                          and command("{ ReadingsTimestamp('Geo.Test','gp_trip_checkpoint','') }") == saved_timestamp,
+                          "retaining known clocks leaves the checkpoint content and timestamp unchanged")
+                    returned = 102 + absence
+                    phone_scenario_at(origin, returned)
+                    check(request("Home", 1, motion="automotive")[0] == 200, "accepts a new return after reload")
+                    phone_scenario_at(origin, returned + 3, tick=True)
+                    phone_scenario_at(origin, returned + 11, tick=True)
+                    check(command("{ ReadingsVal('door','state','') }") == ("lock unlocked" if absence >= 60 else "untouched")
+                          and command("{ ReadingsVal('garage','state','') }") == ("on" if absence >= 60 else "untouched"),
+                          f"return after {absence} monotonic seconds retains its original opening eligibility")
+                    if absence >= 60:
+                        actor_reading("feedback", "pulse_state", "confirmed")
+                        actor_reading("gate", "state", "on")
+                        actor_reading("upper", "state", "closed")
+                        actor_reading("lower", "state", "open")
+                        phone_scenario_at(origin, returned + 12, tick=True)
+                    command("{ $main::GP_phone_wall_shift=0;; return 'wall clock restored' }")
+            for text in ("set GP mode debug", "attr Geo.Test sourceMode geofency_phone", "set GP mode active"):
+                check(command(text) == "", "restore the combined source profile")
 
             for case in ("held_home", "held_phone", "mixed_return", "later_presence"):
                 origin = begin_phone_scenario()
@@ -2551,22 +2609,12 @@ def run(source, encoding="bytestream", help_only=False):
                     check(source["mono"] < departure_mono if timing == "earlier" else source["mono"] > departure_mono,
                           "native reading keeps its actual order before reload: " + timing)
                     phone_scenario_at(origin, 103)
-                    # Keep only the fixture clocks fixed while the real module replaces its functions.
-                    result = command(
-                        "{ no warnings 'redefine';; my $wall=GP_Now();; my $mono=GP_Mono();; "
-                        "local *Time::HiRes::time=sub { $wall };; "
-                        "local *Time::HiRes::clock_gettime=sub { $mono };; "
-                        f"for (1..{reloads}) {{ my $error=CommandReload(undef,'98_GeoPresence.pm');; "
-                        "die $error if defined($error) && length($error) };; "
-                        "*GP_Now=sub { $main::GP_phone_wall_base+$main::GP_phone_elapsed+$main::GP_phone_wall_shift };; "
-                        "*GP_Mono=sub { $main::GP_phone_mono_base+$main::GP_phone_elapsed };; return 'module reloaded' }")
-                    check(result == "module reloaded", "real reload succeeds after a small backward correction")
-                    command("{ GP_State($defs{GP},'Geo.Test',0);; return 'checkpoint validated' }")
-                    state = json.loads(command("get GP explain Geo.Test prod format=json"))["state"]
+                    state = reload_timed_scenario(reloads)
                     check(state["resume"]["status"] == "restored" and state["trip"]["id"] == saved_id,
                           "initial checkpoint validation permits the earlier wall timestamp")
-                    check(source["mono"] < state["trip"]["away_mono"],
-                          "reconstructed departure would incorrectly order the native reading")
+                    check(source["mono"] < state["trip"]["away_mono"] if timing == "earlier"
+                          else source["mono"] > state["trip"]["away_mono"],
+                          "reload preserves native source order against the original departure")
                     check(json.loads(command("{ JSON::PP::encode_json(GP_SourceReading('p1','presence')) }")) == source,
                           "real reload retains the original native source metadata")
                     phone_scenario_at(origin, 103, tick=True)

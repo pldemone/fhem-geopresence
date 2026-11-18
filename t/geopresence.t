@@ -4135,6 +4135,112 @@ sub simulate_process_restart {
     return (GP_Config($c,'Geo.Test'),GP_State($c,'Geo.Test',0));
 }
 
+subtest 'reload preserves minimum absence across a forward clock correction' => sub {
+    for my $reloads (1,2) {
+        for my $age (38,60,70) {
+            my ($c,$cfg)=fixture(source_mode=>'geofency_only'); my $s=GP_State($c,'Geo.Test',0);
+            advance(100); my $departure=ev('Work',1,$now);
+            $departure->{received_mono}=$mono;
+            advance(2); GP_Process($s,$cfg,$departure,$now,$mono); GP_Publish($c,'Geo.Test',$cfg,$s);
+            my ($id,$origin)=@{$s->{trip}}{qw(id away_mono)};
+            my $saved={%{$defs{'Geo.Test'}{READINGS}{gp_trip_checkpoint}}};
+            advance(18); $now+=20;
+            GP_ResetController($c,'resume') for 1..$reloads;
+            GeoPresence_Timer($c); $cfg=GP_Config($c,'Geo.Test'); $s=GP_State($c,'Geo.Test',0);
+            is($s->{resume}{status},'restored','small correction allows validation of the saved trip');
+            is(($s->{trip}//{})->{id},$id,'reload preserves the trip identity');
+            is(($s->{trip}//{})->{away_mono},$origin,'reload retains the known monotonic absence origin');
+            is_deeply($defs{'Geo.Test'}{READINGS}{gp_trip_checkpoint},$saved,'reload alone leaves checkpoint content and timestamp unchanged');
+            advance($age-($mono-$origin));
+            process($s,$cfg,'Home',1,'automotive');
+            is($s->{arrival}?1:0,$age>=60?1:0,"return after $age monotonic seconds has the original eligibility");
+            complete_arrival($s,$cfg); actor_fresh(); GP_Dispatch($c,'Geo.Test',$cfg,$s,0);
+            is_deeply([grep {/^(?:door|garage) /} @commands],
+                $age>=60 ? ['door lock unlocked','garage on']:[],
+                'only a return after the full real absence can open');
+        }
+    }
+};
+
+subtest 'reload retains phone completion clocks without promoting reconstructed source evidence' => sub {
+    for my $signal (qw(state measurement)) {
+        my ($c,$cfg,$s)=saved_trip_fixture('local',phone_signal_mode=>$signal,phone_absence_window=>10);
+        my %original=map {$_=>$s->{trip}{phone_qualification}{$_}} qw(qualified_at qualified_mono negative_since);
+        my $origin=$s->{trip}{away_mono};
+        my $saved={%{$defs{'Geo.Test'}{READINGS}{gp_trip_checkpoint}}};
+        advance(4); $now+=10;
+        for (1..2) {
+            GeoPresence_Initialize({}); $cfg=GP_Config($c,'Geo.Test'); $s=GP_State($c,'Geo.Test',0);
+            is($s->{resume}{status},'restored',"$signal qualification passes the checkpoint validation");
+            is($s->{trip}{away_mono},$origin,'the known absence origin survives repeated reloads');
+            is_deeply({map {$_=>$s->{trip}{phone_qualification}{$_}} keys %original},\%original,
+                'absolute completion, monotonic completion and observed source origin remain distinct');
+            is_deeply($defs{'Geo.Test'}{READINGS}{gp_trip_checkpoint},$saved,'retaining runtime clocks does not rewrite the checkpoint');
+        }
+        for my $name (qw(p1 p2 p3)) {reading($name,$_,'absent',$now) for qw(state presence);}
+        ($cfg,$s)=simulate_process_restart($c);
+        is($s->{resume}{status},'restored','a process restart still uses the portable checkpoint');
+        is($s->{trip}{away_mono},$mono-($now-$s->{trip}{away_time}),'cold restart reconstructs elapsed-time origins on the new clock');
+        ok(!defined($s->{trip}{phone_qualification}{negative_since}),'cold reconstruction creates no observed source origin');
+        my %cold=map {$_=>$s->{trip}{phone_qualification}{$_}} qw(qualified_at qualified_mono);
+        my $cold_origin=$s->{trip}{away_mono};
+        advance(2); $now+=10;
+        GP_ResetController($c,'resume'); $cfg=GP_Config($c,'Geo.Test'); $s=GP_State($c,'Geo.Test',0);
+        is($s->{trip}{away_mono},$cold_origin,'a subsequent reload retains the current process elapsed-time origin');
+        is_deeply({map {$_=>$s->{trip}{phone_qualification}{$_}} keys %cold},\%cold,'reconstructed completion clocks are not recalculated on reload');
+        ok(!defined($s->{trip}{phone_qualification}{negative_since}),'retained elapsed-time origins never become observed source evidence');
+    }
+};
+
+subtest 'reload revokes large clock discontinuities before transferring saved travel' => sub {
+    for my $pending (0,1) {
+        for my $shift (-60,60) {
+            my ($c,$cfg,$s)=saved_trip_fixture('remote',source_mode=>'geofency_only');
+            GP_ResetController($c,'resume') if $pending;
+            advance(1); $now+=$shift;
+            GP_ResetController($c,'resume');
+            is(JSON::PP::decode_json(GP_Read('Geo.Test','gp_trip_checkpoint',''))->{status},'none',
+                "clock shift $shift invalidates saved travel before reading it; pending=$pending");
+            GeoPresence_Timer($c); $s=GP_State($c,'Geo.Test',0);
+            ok(!$s->{trip} && !$s->{arrival},'the new session cannot recover revoked travel or an old arrival');
+            ok(!grep(/^(?:door|garage) /,@commands),'reload after a large clock shift produces no opening');
+        }
+    }
+};
+
+subtest 'runtime travel clocks require the same validated departure' => sub {
+    for my $change (qw(id away_time)) {
+        my ($c,$cfg,$s)=saved_trip_fixture('remote',source_mode=>'geofency_only');
+        advance(10); $now+=20; GP_ResetController($c,'resume');
+        my $cp=JSON::PP::decode_json(GP_Read('Geo.Test','gp_trip_checkpoint',''));
+        $change eq 'id' ? ($cp->{trip}{id}='changed-'.$cp->{trip}{id}) : ($cp->{trip}{away_time}+=1);
+        reading('Geo.Test','gp_trip_checkpoint',JSON::PP::encode_json($cp),$now);
+        $cfg=GP_Config($c,'Geo.Test'); $s=GP_State($c,'Geo.Test',0);
+        is($s->{resume}{status},'restored','independently valid checkpoint still passes its own checks');
+        is($s->{trip}{away_mono},$mono-($now-$cp->{trip}{away_time}),
+            "a different $change does not inherit another departure's runtime clock");
+    }
+};
+
+subtest 'configuration recovery checks existing clocks before initialization completes' => sub {
+    for my $shift (20,60) {
+        my ($c,$cfg,$s)=saved_trip_fixture('remote',source_mode=>'geofency_only');
+        my $origin=$s->{trip}{away_mono};
+        advance(1); $now+=$shift;
+        {
+            local $init_done=0;
+            GeoPresence_Notify($c,{NAME=>'global',CHANGED=>['REREADCFG']});
+        }
+        GeoPresence_Timer($c); $s=GP_State($c,'Geo.Test',0);
+        if ($shift==20) {
+            is(($s->{trip}//{})->{away_mono},$origin,'state-file callback retains a known valid process clock');
+        } else {
+            ok(!$s->{trip},'state-file callback cannot conceal a large clock discontinuity');
+            is(JSON::PP::decode_json(GP_Read('Geo.Test','gp_trip_checkpoint',''))->{status},'none','clock revocation reaches the checkpoint during recovery');
+        }
+    }
+};
+
 subtest 'earlier held positives preserve a restored phone-qualified trip and its new return' => sub {
     for my $arrival (qw(home phone)) {
         my ($c,$cfg,$s)=saved_trip_fixture('local',phone_signal_mode=>'state');
@@ -4261,7 +4367,8 @@ subtest 'reload retains observed absence ordering across a prior backward clock 
             }
             is(GP_SourceReading('p1','presence'),$source,'reload keeps the native source metadata');
             cmp_ok($observed,'<',$away,'both source cases have an earlier wall timestamp');
-            cmp_ok($source->{mono},'<',$s->{trip}{away_mono},'reconstructed departure alone cannot distinguish their order');
+            cmp_ok($source->{mono},$timing eq 'earlier' ? '<':'>',$s->{trip}{away_mono},
+                'reload keeps the native source ordered against the original departure');
             GeoPresence_Timer($c);
             if ($timing eq 'earlier') {
                 is(($s->{trip}//{})->{id},$id,'genuinely earlier native evidence preserves the restored trip');
