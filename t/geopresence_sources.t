@@ -436,7 +436,8 @@ subtest 'late ambiguous presence revokes pending arrivals while preserving newer
             if ($mixed) { source_update('p2','presence','present'); source_update('p2','state','present'); }
             my $e=GP_Phone($s,$cfg,GP_PhoneSamples($cfg),$now,$mono);
             is($e->{uncertain_until},$base-900,"$name: possible later time survives source selection");
-            ok(GP_Fresh($cfg,$e,$now) && $e->{ambiguous},'a recent possible time remains explicitly ambiguous')
+            ok(defined(GP_FreshAge($cfg,@$e{qw(time received)},$now)) && $e->{ambiguous},
+                'a recent possible time remains explicitly ambiguous')
                 if $name eq 'fresh_time';
             GP_Process($s,$cfg,$e,$now,$mono);
             is($s->{position_time},$mixed ? $poll:$position,"$name: status does not invent or rewind a position");

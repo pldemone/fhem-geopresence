@@ -24,6 +24,7 @@ use JSON::PP ();
 use Digest::SHA qw(sha256_hex);
 use MIME::Base64 qw(decode_base64);
 use Encode qw(decode encode FB_CROAK);
+use List::Util qw(max);
 use Time::Local qw(timegm);
 use Time::HiRes ();
 use POSIX ();
@@ -481,7 +482,9 @@ sub GP_Log {
     return if ++$rate->{count}>301;
     ($level,$event,$detail)=(2,'log_rate_limit',{reason=>'Further log entries suppressed for this minute'}) if $rate->{count}==301;
     my %safe;
-    for my $key (qw(resident mode route isTest status reason field ignored_multiline phase rule kind target source zone observed received entry result changed motion motion_time wait_seconds deadline confirmation phone_state phone_health phone_latest home_exit departure_armed geometry_changes elapsed_ms cpu_ms start_lag_ms slowest_phase slowest_target slowest_self_ms started_at)) {
+    for my $key (qw(resident mode route isTest status reason field ignored_multiline phase rule kind target source zone observed received
+        entry result changed motion motion_time wait_seconds deadline confirmation phone_state phone_health phone_latest home_exit
+        departure_armed geometry_changes geo_event_floor elapsed_ms cpu_ms start_lag_ms slowest_phase slowest_target slowest_self_ms started_at)) {
         next unless defined(($detail//{})->{$key}) && !ref($detail->{$key});
         $safe{$key}=substr($detail->{$key},0,512);
     }
@@ -922,32 +925,42 @@ sub GP_ResetController {
     my ($c,$policy) = @_;
     $policy//='invalidate';
     return unless $c;
-    my $previous=$c->{helper}{gp}//{};
+    my $old=$c->{helper}{gp}//{};
+    unless (defined $old->{latest_geo_receipt}) {
+        # Import running contexts created before the controller held the boundary.
+        $old->{latest_geo_receipt}=max(0,map {($_->{event}//{})->{received}//0} @{$old->{queue}//[]});
+        my $floor=max($old->{geo_event_floor}//0,map {$_->{geo_event_floor}//0}
+            grep {!$_->{debug_offset}} (values %{$old->{prod}//{}},values %{$old->{debug}//{}}));
+        $old->{geo_event_floor}=$floor if $floor;
+    }
+    my ($now,$mono)=(GP_Now(),GP_Mono());
+    my $tolerance=0+GP_Attr($c->{NAME},'future_tolerance',$GP_DEFAULT{future_tolerance});
     if ($policy eq 'resume') {
-        my ($now,$mono)=(GP_Now(),GP_Mono());
-        my ($tolerance,$pending_shift);
+        GP_CheckDiscardedClocks($old,$now,$mono,$tolerance,values %{$old->{debug}//{}});
+        my $pending_shift;
         # Check old clocks before saving travel, including upgrades from versions
         # without checkpoints. Never preserve a queued output adapter.
         for my $r (GP_Residents($c)) {
-            my $s=$previous->{prod}{$r};
-            next unless $s || $previous->{resume_pending}{$r};
-            $tolerance//=0+GP_Attr($c->{NAME},'future_tolerance',$GP_DEFAULT{future_tolerance});
+            my $s=$old->{prod}{$r};
             if ($s) {
-                GP_CheckClock($s,{future_tolerance=>$tolerance,
-                    sourceMode=>GP_Attr($r,'sourceMode','geofency_phone')},$now,$mono);
+                GP_CheckClock($s,{future_tolerance=>$tolerance},$now,$mono,$old);
                 # The writer loads full configuration only when qualification needs it.
                 GP_Checkpoint($c,$r,undef,$s);
-            } else {
-                $pending_shift//=abs(($now-$previous->{start})-($mono-$previous->{mono}));
+            } elsif ($old->{resume_pending}{$r}) {
+                if (!defined($pending_shift)) {
+                    $pending_shift=GP_ClockShift($now,$mono,@$old{qw(start mono)});
+                    GP_RecordGeoRollback($old,$now,$mono,$now-$pending_shift,$tolerance) if $pending_shift<-$tolerance;
+                }
                 if ($pending_shift>$tolerance) {
                     # Another reload must not erase a clock fault before first recovery.
                     GP_ClearCheckpoint($r,'Clock discontinuity before saved trip recovery');
-                    delete $previous->{resume_pending}{$r};
+                    delete $old->{resume_pending}{$r};
                 }
             }
         }
-    } elsif ($init_done) {
-        GP_ClearCheckpoint($_,'Controller configuration changed') for GP_Residents($c);
+    } else {
+        GP_CheckDiscardedClocks($old,$now,$mono,$tolerance,values %{$old->{prod}//{}},values %{$old->{debug}//{}});
+        if ($init_done) { GP_ClearCheckpoint($_,'Controller configuration changed') for GP_Residents($c); }
     }
     GP_StopHTTP($c);
     # A reload must also remove the old FHEMWEB registration. This cannot make
@@ -956,7 +969,6 @@ sub GP_ResetController {
         delete $data{FWEXT}{$path} if ($data{FWEXT}{$path}{GP_OWNER} // '') eq $c->{NAME};
     }
     RemoveInternalTimer($c, 'GeoPresence_Timer') if defined &RemoveInternalTimer;
-    my $old = $c->{helper}{gp} // {};
     GP_StoreMode($defs{$_},'disabled') for grep {GP_Mode($_) eq 'learning'} GP_Residents($c);
     delete $GP_AUTH{$_} for GP_Residents($c);
     # Retain observation of already dispatched hardware, never pending intentions.
@@ -966,17 +978,21 @@ sub GP_ResetController {
     my %learned=map {$_=>$old->{learned}{$_}}
         grep {$old->{learned}{$_}{confirmed}} keys %{$old->{learned}//{}};
     # Recovery retains only trip identity and needed clocks, never old contexts.
-    $c->{helper}{gp} = { start => GP_Now(), mono => GP_Mono(), epoch => ($old->{epoch} // 0)+1,
+    $c->{helper}{gp} = { start => $now, mono => $mono, epoch => ($old->{epoch} // 0)+1,
         prod => {}, debug => {}, actors => $old->{actors} // {}, queue => [], ready => 0,
+        (map {$_=>$old->{$_}} grep {defined($old->{$_})} qw(geo_event_floor latest_geo_receipt)),
         learned => \%learned,
         resume_pending => $policy eq 'resume' ? {map {
-            my $t=$old->{prod}{$_}{trip};
+            my $s=$old->{prod}{$_};
+            my $t=$s && $s->{trip};
             my $proof=$t && $t->{phone_qualification};
             $_=>$t ? defined($t->{away_mono})
                 ? {id=>$t->{id},away_time=>$t->{away_time},away_mono=>$t->{away_mono},
                     ($proof && defined($proof->{qualified_at}) && defined($proof->{qualified_mono})
                         ? (qualified_at=>$proof->{qualified_at},qualified_mono=>$proof->{qualified_mono}):()),
-                    ($proof && defined($proof->{negative_since}) ? (negative_since=>$proof->{negative_since}):())}
+                    ($proof && defined($proof->{negative_since}) ? (negative_since=>$proof->{negative_since}):()),
+                    (map {$_=>$s->{$_}} grep {defined($s->{$_})}
+                        qw(motion motion_time motion_mono automotive automotive_mono foot))}
                 :1
                 :$old->{resume_pending}{$_}//1;
         } GP_Residents($c)} : {} };
@@ -992,6 +1008,9 @@ sub GP_ResetController {
 sub GP_ResetResident {
     my ($c,$r,$keep)=@_; $keep//='';
     my $rt=$c->{helper}{gp} or return;
+    my ($now,$mono)=(GP_Now(),GP_Mono());
+    GP_CheckDiscardedClocks($rt,$now,$mono,GP_Attr($c->{NAME},'future_tolerance',$GP_DEFAULT{future_tolerance}),
+        $rt->{prod}{$r},$rt->{debug}{$r});
     GP_ClearCheckpoint($r,'Resident mode or configuration changed') if $init_done;
     delete $rt->{resume_pending}{$r};
     delete $rt->{prod}{$r}; delete $rt->{debug}{$r};
@@ -1005,8 +1024,8 @@ sub GP_ResetResident {
     @{$rt->{queue}}=grep {$_->{resident} ne $r} @{$rt->{queue}};
     # An old name must not leave session clocks or counters for a later device to inherit.
     if (exists $defs{$r}) {
-        $rt->{resident_start}{$r}=GP_Now();
-        $rt->{resident_mono}{$r}=GP_Mono();
+        $rt->{resident_start}{$r}=$now;
+        $rt->{resident_mono}{$r}=$mono;
         $rt->{resident_generation}{$r}++;
     } else {
         delete $rt->{$_}{$r} for qw(resident_start resident_mono resident_generation);
@@ -1297,7 +1316,7 @@ sub GP_GeometryErrors {
 # GP_RevokeGeometry: Clear travel permissions and pending outputs after a geometry change.
 sub GP_RevokeGeometry {
     my ($s,$time,$now)=@_;
-    delete @{$s}{qw(trip arrival approach automotive motion motion_time desired_status conflict)};
+    delete @{$s}{qw(trip arrival approach automotive automotive_mono foot motion motion_time motion_mono desired_status conflict)};
     $s->{zones}={}; $s->{members}={}; GP_RevokeOutputs($s); $s->{queued_phones}=[];
     $s->{phase}='unknown'; $s->{location}='unknown';
     $s->{position_time}=$time if $time>($s->{position_time}//0);
@@ -1305,18 +1324,25 @@ sub GP_RevokeGeometry {
     GP_Trace($s,$now,'geometry learned or changed; trip and pending actions revoked');
 }
 
-# GP_UpdateGeometry: Accept fresh geometry and report whether it changed, conflicted, or stayed unchanged.
+# GP_UpdateGeometry: Reject observations outside the time window and update eligible geometry.
 sub GP_UpdateGeometry {
-    my ($c,$r,$debug,$s,$e,$cfg,$now)=@_;
+    my ($c,$r,$debug,$s,$e,$cfg,$now,$mono)=@_;
     return 'same' unless $e->{kind} eq 'geo';
-    return 'stale' unless GP_Fresh($cfg,$e,$now) && GP_AfterStart($s,$cfg,$e)
-        && $e->{time}>=($s->{position_time}//0);
+    my $floor=$c->{helper}{gp}{geo_event_floor};
+    return 'before_clock_floor' if defined($floor) && $e->{time}<=$floor;
+    my $age=GP_FreshAge($cfg,GP_ObservedMono($e),$e->{received_mono},$mono);
+    return 'outside_window' unless defined($age) && GP_AfterStart($s,$cfg,$e);
+    $e->{observation_age}=$age;
+    return 'older_position' if $e->{time}<($s->{position_time}//0);
     my $old=GP_Geometry($c,$r,$e->{zone},$debug);
     my $g=$e->{geometry};
     return 'stale' unless GP_HasGeometry($g);
-    return 'stale' if defined($old->{time}) && $e->{time}<$old->{time};
     # Cached geometry is either validated with a timestamp or empty.
     my $different=!defined($old->{time}) || grep {$g->{$_}!=$old->{$_}} qw(lat lon radius);
+    # The circle timestamp protects the saved geometry. An unchanged circle
+    # can still provide a current position or counter-observation.
+    return $different || $old->{blocked} ? 'stale':'same'
+        if defined($old->{time}) && $e->{time}<$old->{time};
     my $conflict=$different && defined($old->{time}) && $e->{time}==$old->{time};
     return 'stale' if $old->{blocked} && $e->{time}==$old->{time} && !$conflict;
     my $changed=$different || $old->{blocked};
@@ -1342,22 +1368,18 @@ sub GP_UpdateGeometry {
     return $conflict ? 'conflict' : $changed ? 'changed':'same';
 }
 
-# GP_GeometrySync: Synchronize position after geometry changes without planning actions.
+# GP_GeometrySync: Apply a current Geo position without planning actions.
 sub GP_GeometrySync {
-    my ($s,$cfg,$e,$now,$mono)=@_;
-    return unless $e->{kind} eq 'geo';
-    my $zone=$cfg->{zones}{$e->{zone}} or return;
+    my ($s,$cfg,$e,$zone,$now,$mono)=@_;
     local $s->{trace_context}={source=>'geo',zone=>$e->{zone},entry=>$e->{entry},
         observed=>$e->{time},received=>$e->{received},event_key=>$e->{key}};
-    return if $e->{time}<($s->{position_time}//0);
-    $s->{position_time}=$e->{time} if $e->{time}>=($s->{position_time}//0);
+    $s->{position_time}=$e->{time};
     if ($zone->{role} eq 'home' && $e->{entry}) {
         delete $s->{trip};
         $s->{phase}='home'; $s->{location}=$zone->{label}; $s->{desired_status}='home';
         GP_ResetNegative($s,$e->{time});
     } elsif (defined($mono) && $cfg->{geometry_ready} && !$s->{conflict}
-        && $zone->{role} eq 'home' && !$e->{entry} && GP_Fresh($cfg,$e,$now)
-        && GP_AfterStart($s,$cfg,$e) && $e->{time}>$s->{boundary}
+        && $zone->{role} eq 'home' && !$e->{entry} && $e->{time}>$s->{boundary}
         && $e->{key} && !$s->{seen}{$e->{key}}) {
         GP_RememberEvent($s,$e);
         return GP_Trace($s,$now,'Home departure after geometry update contradicted by newer phone presence')
@@ -1365,8 +1387,7 @@ sub GP_GeometrySync {
                 && ($s->{phone}{latest}//0)>=$e->{time};
         # All old permissions and phone qualifications have been revoked. This
         # same fresh exit can start a NEW suspicion, never confirm departure.
-        # Only the changed-geometry batch supplies mono; incomplete geometry
-        # and ordinary status-only synchronization cannot create a trip here.
+        # Only the changed-geometry batch supplies mono after time validation.
         GP_LeaveHome($s,$cfg,$e,$mono);
         $s->{zones}{$e->{zone}}={entry=>0,time=>$e->{time},role=>'home'};
         $s->{location}='underway';
@@ -1884,7 +1905,7 @@ sub GP_Trace {
 sub GP_StartTrip {
     my ($s,$event,$scope)=@_;
     return $s->{trip} if $s->{trip};
-    delete @{$s}{qw(approach automotive motion motion_time)};
+    delete @{$s}{qw(approach automotive automotive_mono foot motion motion_time motion_mono)};
     $s->{trip}={id=>$s->{generation}.':'.++$s->{seq}, start=>$event->{time}, scope=>$scope//'local',
         armed=>0, actions=>{}, home_exit=>undef};
     return $s->{trip};
@@ -1912,23 +1933,51 @@ sub GP_DepartureTime {
     return $time;
 }
 
-# GP_Fresh: Check observation and receipt ages against freshness and future limits.
-sub GP_Fresh {
-    my ($cfg,$e,$now)=@_;
-    return $now-$e->{time}<=$cfg->{action_max_age} && $e->{time}<=$now+$cfg->{future_tolerance}
-        && $now-$e->{received}<=$cfg->{action_max_age};
+# GP_ObservationAge: Calculate the age once and reject observations beyond the future tolerance.
+sub GP_ObservationAge {
+    my ($cfg,$observed,$clock)=@_;
+    my $age=$clock-$observed;
+    return $age>=-$cfg->{future_tolerance} ? $age:undef;
+}
+
+# GP_FreshAge: Return the checked observation age while the observation and receipt are current.
+sub GP_FreshAge {
+    my ($cfg,$observed,$received,$clock)=@_;
+    my $age=GP_ObservationAge($cfg,$observed,$clock);
+    return defined($age) && $age<=$cfg->{action_max_age} && $clock-$received<=$cfg->{action_max_age}
+        ? $age:undef;
 }
 
 # GP_AfterStart: Apply the session-start boundary, including validated restart recovery.
 sub GP_AfterStart {
     my ($s,$cfg,$e)=@_;
+    my $start=$s->{start};
+    return $e->{time}>$start unless $e->{kind} eq 'geo';
     # A validated saved departure already supplies the missing initial context.
     # Its NEW Geo return may arrive immediately after startup, but a pre-start
     # webhook still cannot execute. Other startup states retain their old guard.
-    my $recovered=defined($s->{resume_event_floor}) && $s->{resume_event_floor}==$s->{start};
-    my $margin=$e->{kind} eq 'geo' && !$recovered
-        ? $cfg->{future_tolerance}:0;
-    return $e->{time}>$s->{start}+$margin;
+    $start+=$cfg->{future_tolerance}
+        unless defined($s->{resume_event_floor}) && $s->{resume_event_floor}==$start;
+    return $e->{time}>$start;
+}
+
+# GP_RecordGeoRollback: Fence the old Geo timeline and revoke every context that used it.
+sub GP_RecordGeoRollback {
+    my ($rt,$now,$mono,$previous_wall,$tolerance)=@_;
+    my $production=$rt->{prod}//{};
+    my @contexts=(values %$production,values %{$rt->{debug}//{}});
+    # Both clocks in a debug snapshot carry the same offset, which cancels here.
+    my $floor=max($previous_wall,$rt->{latest_geo_receipt}//0,
+        map {$_->{wall}+($mono-$_->{mono})} @contexts)+$tolerance;
+    $rt->{geo_event_floor}=$floor if $floor>($rt->{geo_event_floor}//0);
+
+    my %checkpoints=map {$_=>'Clock discontinuity before saved trip recovery'} keys %{delete($rt->{resume_pending})//{}};
+    $checkpoints{$_}='No unfinished qualified trip' for grep {($production->{$_}{trip}//{})->{armed}} keys %$production;
+    for my $s (@contexts) {
+        my $offset=$s->{debug_offset}//0;
+        GP_RevokeClockContext($s,$now+$offset,$mono+$offset);
+    }
+    GP_ClearCheckpoint($_,$checkpoints{$_}) for keys %checkpoints;
 }
 
 # GP_AwayLongEnough: Check that a return follows the full absolute and monotonic absence interval.
@@ -1946,13 +1995,17 @@ sub GP_AwayLongEnough {
             && ($e->{received_mono}//$mono)>=$proof->{qualified_mono}));
 }
 
-# GP_RememberEvent: Retain bounded duplicate-detection metadata and the original receipt clocks.
+# GP_RememberEvent: Retain bounded duplicate-detection metadata in processing order.
 sub GP_RememberEvent {
     my ($s,$e)=@_;
     return unless $e->{key};
-    $s->{seen}{$e->{key}}={motion=>$e->{motion}//'unknown',received=>$e->{received},received_mono=>$e->{received_mono}};
+    $s->{seen}{$e->{key}}={motion=>$e->{motion}//'unknown'};
     push @{$s->{seen_order}},$e->{key};
-    delete $s->{seen}{shift @{$s->{seen_order}}} while @{$s->{seen_order}}>2000;
+    if (@{$s->{seen_order}}>2000) {
+        my $oldest=shift @{$s->{seen_order}};
+        delete $s->{seen}{$oldest};
+        delete $s->{arrival}{entries}{$oldest} if $s->{arrival};
+    }
 }
 
 # GP_UsefulMotion: Recognize motion values that affect arrival timing or vehicle eligibility.
@@ -1960,60 +2013,132 @@ sub GP_UsefulMotion {
     return ($_[0]//'') =~ /\A(?:automotive|walking|running|cycling)\z/;
 }
 
-# GP_MotionOrigin: Find an accepted observation allowed to supply motion to this approach or arrival.
+# GP_ObservedMono: Cache the observation's projection onto the monotonic receipt clock.
+sub GP_ObservedMono {
+    my ($e)=@_;
+    return $e->{motion_mono}//=$e->{received_mono}-($e->{received}-$e->{time});
+}
+
+# GP_VehicleMotionFresh: Apply the vehicle limit to a future-checked observation age.
+sub GP_VehicleMotionFresh {
+    my ($cfg,$age)=@_;
+    return defined($age) && $age<=$cfg->{motion_max_age};
+}
+
+# GP_FootEvidence: Retain the clocks needed to age and revoke a foot observation.
+sub GP_FootEvidence {
+    my ($time,$observed_mono,$mono,$approach_mono)=@_;
+    return {time=>$time,observed_mono=>$observed_mono,processed_mono=>$mono,approach_mono=>$approach_mono};
+}
+
+# GP_SameSavedTime: Match runtime timestamps at the checkpoint's numeric precision.
+sub GP_SameSavedTime {
+    my ($saved,$runtime)=@_;
+    return !defined($runtime) unless defined($saved);
+    # JSON::PP may round fractional seconds to Perl's numeric string representation.
+    return defined($runtime) && ($saved==$runtime || $saved eq $runtime);
+}
+
+# GP_RestoreMotionClocks: Reuse matching in-process evidence or project the saved observation times.
+sub GP_RestoreMotionClocks {
+    my ($s,$cfg,$now,$mono,$saved_at,$prior)=@_;
+    my $wall=$now>$saved_at ? $now:$saved_at;
+    for my $fields ([motion_time=>'motion_mono'],[automotive=>'automotive_mono']) {
+        my ($time,$clock)=@$fields;
+        my $observed=$s->{$time};
+        next unless defined($observed);
+        $s->{$clock}=$prior && defined($prior->{$clock}) && GP_SameSavedTime($observed,$prior->{$time})
+            ? $prior->{$clock}:$mono-($wall-$observed);
+    }
+    if ($prior && $prior->{foot} && ($prior->{motion}//'') eq ($s->{motion}//'')
+        && GP_SameSavedTime($s->{motion_time},$prior->{motion_time})) {
+        $s->{foot}=$prior->{foot};
+    } elsif (GP_UsefulMotion($s->{motion}) && $s->{motion} ne 'automotive'
+        && defined($s->{motion_mono}) && GP_VehicleMotionFresh($cfg,GP_ObservationAge($cfg,$s->{motion_mono},$mono))) {
+        $s->{foot}=GP_FootEvidence($s->{motion_time},$s->{motion_mono},$mono);
+    }
+}
+
+# GP_RecordMotion: Keep wait motion and fresh evidence for the vehicle filter.
+sub GP_RecordMotion {
+    my ($s,$cfg,$e,$mono,$approach_mono,$age,$original)=@_;
+    my $p=$s->{arrival};
+    my ($motion,$observed)=@$e{qw(motion time)};
+    # Both direct movement and supplements age from the first receipt.
+    my $observed_mono=GP_ObservedMono($original//$e);
+    # Earlier events may have changed the live origin after geometry admission.
+    $age=GP_ObservationAge($cfg,$observed_mono,$mono)
+        if !defined($age) || ($original && $observed_mono!=$e->{motion_mono});
+    @$s{qw(motion motion_time motion_mono)}=($motion,$observed,$observed_mono);
+    $p->{motion_origin_mono}=$approach_mono if $p;
+    my $vehicle_fresh=GP_VehicleMotionFresh($cfg,$age)?1:0;
+    # A subsequent Home in this batch can use the approach decision directly.
+    $s->{batch_motion}=[$observed,$observed_mono,$vehicle_fresh,$age]
+        if !$p && defined($approach_mono) && exists($s->{batch_motion});
+    return (0,$age) unless $vehicle_fresh;
+    if ($motion eq 'automotive') {
+        @$s{qw(automotive automotive_mono)}=($observed,$observed_mono);
+        @$p{qw(automotive_origin_mono automotive_evaluated_mono)}=($approach_mono,$mono) if $p;
+    } else {
+        $s->{foot}=GP_FootEvidence($observed,$observed_mono,$mono,$approach_mono);
+    }
+    return (1,$age);
+}
+
+# GP_MotionSupplement: Check whether a known entry may supply missing motion.
+sub GP_MotionSupplement {
+    my ($zone,$e,$seen)=@_;
+    return ref($seen) eq 'HASH' && $e->{kind} eq 'geo' && $e->{entry}
+        && ($zone->{role}//'') =~ /\A(?:home|approach)\z/
+        && GP_UsefulMotion($e->{motion}) && !GP_UsefulMotion($seen->{motion});
+}
+
+# GP_ArrivalEntry: Find the original entry under its accepted Home or approach key.
+sub GP_ArrivalEntry {
+    my ($s,$key)=@_;
+    return $s->{arrival}{entries}{$key} if $s->{arrival};
+    my $approach=$s->{approach};
+    return $approach if $approach && defined($approach->{key}) && $approach->{key} eq $key;
+    return;
+}
+
+# GP_MotionOrigin: Find the accepted entry that can supply a supplement.
 sub GP_MotionOrigin {
-    my ($s,$cfg,$e)=@_;
-    my $origin=$s->{arrival}//$s->{approach};
-    my $seen=$s->{seen}{$e->{key}//''};
-    my $zone=$cfg->{zones}{$e->{zone}//''}//{};
+    my ($s,$cfg,$e,$seen)=@_;
+    my $p=$s->{arrival};
+    my $origin=$p//$s->{approach} or return;
+    return unless GP_MotionSupplement($cfg->{zones}{$e->{zone}//''}//{},$e,$seen);
     my $previous=$s->{zones}{$e->{zone}//''}//{};
     # The current approach and accepted entries belong to the pending arrival
     # even after newer empty entries. Cancelled/completed arrivals donate no data.
-    return unless $origin && $e->{time}>=$origin->{origin_time}
-        && ref($seen) eq 'HASH' && !GP_UsefulMotion($seen->{motion}) && GP_UsefulMotion($e->{motion})
-        && $e->{kind} eq 'geo' && $e->{entry} && ($zone->{role}//'') =~ /\A(?:home|approach)\z/
+    return unless $e->{time}>=$origin->{origin_time}
         && $cfg->{geometry_ready} && !$s->{conflict} && $s->{trip} && $s->{trip}{armed} && $s->{phase} eq 'returning'
         && $previous->{entry} && $e->{time}>$s->{boundary} && $e->{time}>=($s->{motion_time}//0)
         && !(($s->{motion_time}//0)==$e->{time} && GP_UsefulMotion($s->{motion}));
-    my $p=$s->{arrival};
-    return unless $p
-        ? defined($seen->{arrival_key}) && $seen->{arrival_key} eq ($p->{event}{key}//'')
-            && $p->{trip} eq $s->{trip}{id} && $p->{generation} eq $s->{generation}
-        : $previous->{time}==$e->{time} && $e->{time}>=($s->{position_time}//0);
-    return $seen;
+    my $entry=GP_ArrivalEntry($s,$e->{key}) or return;
+    return if $p && ($entry->{processed_mono}<$p->{origin_mono}
+        || $p->{trip} ne $s->{trip}{id} || $p->{generation} ne $s->{generation});
+    return $entry;
 }
 
 # GP_EnrichDuplicate: Add missing motion without refreshing the original observation or receipt times.
 sub GP_EnrichDuplicate {
-    my ($s,$cfg,$e,$now,$mono)=@_;
-    my $seen=GP_MotionOrigin($s,$cfg,$e) or return;
+    my ($s,$cfg,$e,$now,$mono,$seen,$admitted_age)=@_;
+    my $entry=GP_MotionOrigin($s,$cfg,$e,$seen) or return;
+    my $p=$s->{arrival};
     $seen->{motion}=$e->{motion};
-    $s->{motion}=$e->{motion}; $s->{motion_time}=$e->{time};
-    $s->{automotive}=$e->{time} if $e->{motion} eq 'automotive';
+    # Approach expiry uses the original entry, even for motion reported later.
+    my $approach_mono=$p ? ($entry->{role} eq 'approach' ? $entry->{processed_mono}:undef) : $entry->{mono};
+    my ($vehicle_changed,$age)=GP_RecordMotion($s,$cfg,$e,$mono,$approach_mono,$admitted_age,$entry);
     $s->{checkpoint_dirty}=1;
-    if (my $p=$s->{arrival}) {
-        # Keep the first receipt and original observation time. A retry cannot
-        # refresh motion freshness or restart the Home wait.
-        my $enriched={%$e,received=>$seen->{received},received_mono=>$seen->{received_mono},role=>$cfg->{zones}{$e->{zone}}{role}};
-        $p->{event}{motion}=$e->{motion} if ($p->{event}{key}//'') eq $e->{key};
-        GP_BeginArrival($s,$cfg,$enriched,$now,$mono);
+    if ($p) {
+        if ($entry->{role} eq 'home') {
+            @$entry{qw(motion motion_evaluated_mono)}=($e->{motion},$mono);
+        }
+        GP_UpdateArrivalMotion($s,$cfg,$p,$now,$mono,$vehicle_changed,$age);
     }
     GP_Trace($s,$now,'duplicate event enriched with motion',{motion=>$e->{motion},motion_time=>$e->{time}});
     return 1;
-}
-
-# GP_MergeBatchMotion: Enrich the first duplicate in a batch before arrival planning can consume it.
-sub GP_MergeBatchMotion {
-    my (@events)=@_;
-    my %first;
-    for my $e (@events) {
-        next unless $e->{kind} eq 'geo' && $e->{key};
-        my $prior=$first{$e->{key}};
-        if (!$prior) { $first{$e->{key}}=$e; next; }
-        # Make a richer duplicate available BEFORE any arrival in this batch
-        # can consume the trip (including a simultaneous phone confirmation).
-        $prior->{motion}=$e->{motion} if !GP_UsefulMotion($prior->{motion}) && GP_UsefulMotion($e->{motion});
-    }
 }
 
 # GP_PhoneVeto: Check whether current phone presence contradicts a proposed Geo departure.
@@ -2039,7 +2164,7 @@ sub GP_Arm {
         my $home=$s->{trip};
         my $retain=$home && !$home->{armed} && ($home->{scope}//'') eq 'local'
             && defined($home->{home_exit}) && $home->{home_exit}>($s->{phone}{latest}//0);
-        delete @{$s}{qw(trip arrival approach automotive motion motion_time)};
+        delete @{$s}{qw(trip arrival approach automotive automotive_mono foot motion motion_time motion_mono)};
         my $detail={phone_state=>$s->{phone}{state},phone_health=>$s->{phone}{health},phone_latest=>$s->{phone}{latest}};
         if ($retain) {
             # Same trip keeps its consumption; rejected departure evidence does not.
@@ -2059,7 +2184,7 @@ sub GP_Arm {
     }
     # A renewed, accepted departure ends the previous arrival section even
     # when the physical trip remains open and no approach exit was delivered.
-    delete @{$s}{qw(automotive motion motion_time)} if $s->{phase} eq 'returning';
+    delete @{$s}{qw(automotive automotive_mono foot motion motion_time motion_mono)} if $s->{phase} eq 'returning';
     GP_CancelArrival($s,$now,'new departure observation');
     my $trip=GP_StartTrip($s,$e,$scope);
     $trip->{scope}='remote' if ($scope//'') eq 'remote';
@@ -2073,9 +2198,12 @@ sub GP_Arm {
 
 # GP_VehicleEligible: Evaluate recent movement and remote-trip evidence for garage eligibility.
 sub GP_VehicleEligible {
-    my ($s,$cfg,$now)=@_;
-    return 1 if defined($s->{automotive}) && $now-$s->{automotive}<=$cfg->{motion_max_age};
-    return 0 if ($s->{motion}//'') =~ /\A(?:walking|running|cycling)\z/ && $now-($s->{motion_time}//0)<=$cfg->{motion_max_age};
+    my ($s,$cfg,$mono,$fresh_motion)=@_;
+    return 1 if ($fresh_motion//'') eq 'automotive';
+    my $automotive=$s->{automotive_mono};
+    my $foot=$s->{foot};
+    return 1 if defined($automotive) && GP_VehicleMotionFresh($cfg,GP_ObservationAge($cfg,$automotive,$mono));
+    return 0 if $fresh_motion || ($foot && GP_VehicleMotionFresh($cfg,GP_ObservationAge($cfg,$foot->{observed_mono},$mono)));
     return $s->{trip} && ($s->{trip}{scope}//'') eq 'remote';
 }
 
@@ -2194,18 +2322,19 @@ sub GP_RestoreActionClocks {
     } keys %{$s->{action_last}//{}}};
 }
 
-# GP_Rules: Plan matching actions after permission, consumption, and cooldown checks.
+# GP_Rules: Plan matching actions and record openings for a collecting batch.
 sub GP_Rules {
-    my ($s,$cfg,$trigger,$e,$now,$mono)=@_;
+    my ($s,$cfg,$trigger,$e,$now,$mono,$batch_opening,$expires_mono)=@_;
     my $selector=$trigger eq 'arrival' ? 'arrival' : length($e->{group}//'')
         ? 'group:'.$e->{group} : 'location:'.($e->{zone}//'');
+    my $simultaneous_exit;
     for my $rule (@{($cfg->{rule_index}{$trigger}//{})->{$selector}//[]}) {
         my $skip=sub {GP_Trace($s,$now,$_[0],{rule=>$rule->{name},decision=>'suppressed'})};
         my $after=$rule->{afterExit}//'';
         my $exit=length($after) ? GP_ExitEvidence($s,$after,$e->{time}):undef;
         if (length($after) && !defined($exit)) { $skip->('required prior exit not observed in this trip'); next; }
         if (($rule->{arrivalFilter}//'any') eq 'vehicle' && !(exists($e->{arrival_vehicle_eligible})
-            ? $e->{arrival_vehicle_eligible} : GP_VehicleEligible($s,$cfg,$now))) {
+            ? $e->{arrival_vehicle_eligible} : GP_VehicleEligible($s,$cfg,$mono))) {
             $skip->('no qualifying car or remote evidence, or current walking/cycling'); next;
         }
         my $type=$rule->{type}; my $opening=GP_IsOpening($type);
@@ -2220,6 +2349,11 @@ sub GP_Rules {
             if (($type eq 'door_open' && !$cfg->{allowDoor}) || ($type eq 'garage_open' && !$cfg->{allowGarage})) {
                 $skip->('resident has no permission for this actor'); next;
             }
+            # The trip records explicit Home exits. Inferred circle membership
+            # is not proof of an exit observed at the same time as the phone.
+            $simultaneous_exit //= $e->{kind} eq 'phone_present'
+                && defined($s->{trip}{home_exit}) && $e->{time}==$s->{trip}{home_exit};
+            if ($simultaneous_exit) { $skip->('opening suppressed by simultaneous Home exit'); next; }
         }
         my ($key,$trip_bound)=GP_ConsumptionSlot($rule,$selector);
         my $consumed=$trip_bound ? ($s->{trip}{actions}//={}) : ($s->{action_visits}//={});
@@ -2241,9 +2375,16 @@ sub GP_Rules {
         $s->{checkpoint_dirty}=1;
         my %history=length($after) ? (after_exit=>$after,exit_time=>$exit):();
         $history{trip}=$s->{trip}{id} if $trip_bound;
-        push @{$s->{intents}}, {kind=>$type,key=>$key,rule=>$rule->{name},trigger=>$trigger,%history,
+        $expires_mono//=GP_ActionMonoExpiry($cfg,$e,$now,$mono);
+        my $intent={kind=>$type,key=>$key,rule=>$rule->{name},trigger=>$trigger,%history,
             params=>$rule->{params},e=>{%$e},generation=>$s->{generation},output_revision=>$s->{output_revision},
-            expires_mono=>GP_ActionMonoExpiry($cfg,$e,$now,$mono)};
+            expires_mono=>$expires_mono};
+        push @{$s->{intents}},$intent;
+        if ($opening && $batch_opening) {
+            # All openings from this observation share the same time and revision.
+            $$batch_opening=$intent;
+            undef $batch_opening;
+        }
     }
 }
 
@@ -2255,40 +2396,237 @@ sub GP_CancelArrival {
     GP_Trace($s,$now,'arrival cancelled',{confirmation=>$reason});
 }
 
-# GP_InterruptsArrival: Check whether a technical-zone exit interrupts the current arrival origin.
-sub GP_InterruptsArrival {
-    my ($s,$cfg,$e)=@_;
-    my $origin=$s->{arrival}//$s->{approach};
-    return $origin && $e->{kind} eq 'geo' && !$e->{entry}
-        && $e->{time}>=$origin->{origin_time}
-        && (($cfg->{zones}{$e->{zone}}//{})->{role}//'') =~ /\A(?:home|approach|outer)\z/;
+# GP_ArrivalAffected: Check whether a counter-observation can revoke an active section or its older motion.
+sub GP_ArrivalAffected {
+    my ($s,$time)=@_;
+    my $origin=$s->{arrival}//$s->{approach} or return 0;
+    my $foot=$s->{foot};
+    return $time>=$origin->{origin_time}
+        || (defined($s->{motion_time}) && $time>=$s->{motion_time})
+        || (defined($s->{automotive}) && $time>=$s->{automotive})
+        || ($foot && $time>=$foot->{time});
+}
+
+# GP_HomeCounterevidence: Identify technical exits and incompatible circles independently of the current wait.
+sub GP_HomeCounterevidence {
+    my ($cfg,$zone,$entry,$home_distance)=@_;
+    return 0 unless $zone;
+    return 1 if !$entry && $zone->{role} =~ /\A(?:home|approach|outer)\z/;
+    return 0 unless $cfg->{geometry_ready} && defined($zone->{radius});
+    my $home=$cfg->{zones}{$cfg->{roles}{home}[0]};
+    $home_distance //= $zone==$home ? 0 : GP_Distance($zone,$home);
+    return $entry ? $home_distance>$zone->{radius}+$home->{radius}
+        : $home_distance+$home->{radius}<=$zone->{radius};
+}
+
+# GP_ArrivalEntriesAfter: Find a surviving Home or approach and the Home motion it can still use.
+sub GP_ArrivalEntriesAfter {
+    my ($s,$cfg,$p,$time,$mono)=@_;
+    my ($home,$qualified,$approach,$approach_key,$motion_before_mono,$home_motion,$home_automotive,$home_foot);
+    my $order=$s->{seen_order};
+    my $trip=$s->{trip};
+    my $timeout=$cfg->{approach_timeout};
+    my $approach_motion=defined $p->{motion_origin_mono};
+    my $approach_automotive=defined $p->{automotive_origin_mono};
+    my $foot=$s->{foot};
+    my $approach_foot=$foot && defined($foot->{approach_mono});
+    my $next_mono=$mono;
+    my $approach_checked=0;
+    for (my $i=$#$order; $i>=0; --$i) {
+        my $key=$order->[$i];
+        my $entry=$p->{entries}{$key} or next;
+        return ($home,$qualified,$approach,$approach_key,$motion_before_mono,$home_motion,$home_automotive,$home_foot)
+            if $entry->{time}<=$time;
+        my $processed=$entry->{processed_mono};
+        if ($entry->{role} eq 'home') {
+            # An accepted Home bounds the preceding approach, even if its
+            # receipt cannot start the replacement wait.
+            $next_mono=$processed;
+            # Resolve a Home entry once even when it supplies both decisions.
+            my $motion=$entry->{motion}//'unknown';
+            my $automotive=$motion eq 'automotive';
+            my $needs_wait=$approach_motion && !$home_motion;
+            my $needs_vehicle=$automotive ? $approach_automotive && !$home_automotive : $approach_foot && !$home_foot;
+            if (($needs_wait || $needs_vehicle) && GP_UsefulMotion($motion)) {
+                my $evaluated_mono=$entry->{motion_evaluated_mono}//$processed;
+                my ($observed,$observed_mono)=@$entry{qw(time motion_mono)};
+                my $age=GP_ObservationAge($cfg,$observed_mono,$evaluated_mono);
+                my $vehicle_fresh=$needs_vehicle && GP_VehicleMotionFresh($cfg,$age);
+                if ($needs_wait && ($needs_vehicle && $motion eq 'walking'
+                    ? $vehicle_fresh : GP_WaitMotionFresh($cfg,$motion,$age))) {
+                    $home_motion=[$motion,$observed,$observed_mono,$evaluated_mono];
+                }
+                if ($vehicle_fresh) {
+                    if ($automotive) { $home_automotive=[$observed,$observed_mono,$evaluated_mono]; }
+                    else { $home_foot=GP_FootEvidence($observed,$observed_mono,$evaluated_mono); }
+                }
+            }
+            my $eligible=GP_AwayLongEnough($cfg,$trip,$entry,$mono);
+            # Keep a status-only Home as a fallback when no entry qualifies.
+            next if $qualified && !$eligible;
+            ($home,$qualified)=($entry,$eligible);
+            ($approach,$approach_key,$motion_before_mono)=(undef,undef,undef);
+            $approach_checked=0;
+            next;
+        }
+        # Expiry before the next accepted entry clears older approach motion.
+        # With no later entry, measure the gap up to this interruption.
+        my $expired=$next_mono-$processed>=$timeout;
+        $motion_before_mono //= $next_mono if $expired;
+        # Only the nearest approach may supply the surviving origin.
+        unless ($approach_checked) {
+            ($approach,$approach_key)=($entry,$key) unless $expired;
+            $approach_checked=1;
+        }
+        $next_mono=$processed;
+    }
+    # A truncated history cannot establish the motion carried into the interval.
+    return;
+}
+
+# GP_SetApproach: Track an approach with its original receipt projection and processing time.
+sub GP_SetApproach {
+    my ($s,$key,$time,$mono,$observed_mono)=@_;
+    $s->{approach}={key=>$key,origin_time=>$time,mono=>$mono,motion_mono=>$observed_mono};
+    $s->{phase}='returning';
+}
+
+# GP_AnchorArrival: Anchor a wait to a Home entry's original receipt clocks.
+sub GP_AnchorArrival {
+    my ($p,$home,$origin_time,$origin_mono)=@_;
+    @$p{qw(event started start_mono)}=($home,@$home{qw(received received_mono)});
+    @$p{qw(origin_time origin_mono)}=($origin_time//$home->{time},$origin_mono//$home->{processed_mono});
+}
+
+# GP_InterruptedMotion: Check the shared spatial and approach boundaries for movement evidence.
+sub GP_InterruptedMotion {
+    my ($observed,$approach_mono,$cutoff,$motion_before_mono,$discard)=@_;
+    return defined($observed) && ($discard || $observed<=$cutoff
+        || (defined($approach_mono) && defined($motion_before_mono) && $approach_mono<$motion_before_mono));
+}
+
+# GP_ApplyArrivalInterruption: Revoke interrupted motion and keep the first surviving Home interval.
+sub GP_ApplyArrivalInterruption {
+    my ($s,$cfg,$e,$now,$mono)=@_;
+    my $p=$s->{arrival};
+    my $cutoff=$e->{time};
+    my $before_home=$p && $cutoff<$p->{event}{time};
+    my $origin=$p//$s->{approach};
+    my $before_origin=$cutoff<$origin->{origin_time};
+    my ($home,$qualified,$approach,$approach_key,$motion_before_mono,$home_motion,$home_automotive,$home_foot);
+    if ($p && !$before_home && $cutoff<$s->{position_time}) {
+        ($home,$qualified,$approach,$approach_key,$motion_before_mono,$home_motion,$home_automotive,$home_foot)
+            =GP_ArrivalEntriesAfter($s,$cfg,$p,$cutoff,$mono);
+    }
+    my $discard_motion=$p && !$before_home && !$home && !$approach;
+    my $motion_revoked=GP_InterruptedMotion($s->{motion_time},$origin->{motion_origin_mono},
+        $cutoff,$motion_before_mono,$discard_motion);
+    if ($motion_revoked) {
+        delete @{$s}{qw(motion motion_time motion_mono)};
+        delete $p->{motion_origin_mono} if $p;
+    }
+    my $automotive_revoked=GP_InterruptedMotion($s->{automotive},$origin->{automotive_origin_mono},
+        $cutoff,$motion_before_mono,$discard_motion);
+    if ($automotive_revoked) {
+        delete @$s{qw(automotive automotive_mono)};
+        delete @$p{qw(automotive_origin_mono automotive_evaluated_mono)} if $p;
+    }
+    my $foot=$s->{foot};
+    my $foot_revoked=$foot && GP_InterruptedMotion($foot->{time},$foot->{approach_mono},
+        $cutoff,$motion_before_mono,$discard_motion);
+    delete $s->{foot} if $foot_revoked;
+    my $saved_motion_revoked=$motion_revoked || $automotive_revoked;
+    $s->{checkpoint_dirty}=1 if $saved_motion_revoked;
+    if ($before_home) {
+        # An interruption before Home keeps its receipt anchor and any newer,
+        # already evaluated motion, even when processing happens much later.
+        @$p{qw(origin_time origin_mono)}=@{$p->{event}}{qw(time processed_mono)} unless $before_origin;
+        GP_UpdateArrivalMotion($s,$cfg,$p,$now,undef,$automotive_revoked || $foot_revoked)
+            if $saved_motion_revoked || $foot_revoked;
+        return;
+    }
+    return if $before_origin;
+    if ($home) {
+        return GP_Arrive($s,$cfg,$home,$now,$mono) unless $qualified;
+        GP_AnchorArrival($p,$home,$approach ? @$approach{qw(time processed_mono)} : ());
+        if ($motion_revoked && $home_motion) {
+            @$s{qw(motion motion_time motion_mono)}=@$home_motion[0,1,2];
+            $p->{motion_evaluated_mono}=$home_motion->[3];
+        }
+        if ($automotive_revoked && $home_automotive) {
+            @$s{qw(automotive automotive_mono)}=@$home_automotive[0,1];
+            $p->{automotive_evaluated_mono}=$home_automotive->[2];
+        }
+        $s->{foot}=$home_foot if $foot_revoked && $home_foot;
+        # A motion update after this Home keeps its own evaluation clocks.
+        # Motion already available at Home must still have been fresh there.
+        my $home_mono=$home->{processed_mono};
+        $p->{motion_evaluated_mono}=$home_mono if $home_mono>$p->{motion_evaluated_mono};
+        my $vehicle_mono=$home_mono;
+        for my $evaluated ($p->{automotive_evaluated_mono},$s->{foot} && $s->{foot}{processed_mono}) {
+            $vehicle_mono=$evaluated if defined($evaluated) && $evaluated>$vehicle_mono;
+        }
+        $p->{vehicle_evaluated_mono}=$vehicle_mono;
+        GP_UpdateArrivalMotion($s,$cfg,$p,$now,undef,1);
+        return;
+    }
+    GP_CancelArrival($s,$now,'position evidence interrupted arrival section');
+    GP_SetApproach($s,$approach_key,@$approach{qw(time processed_mono motion_mono)}) if $approach;
+    # The current Home-exit path starts departure grace in GP_LeaveHome.
+    unless (!$e->{entry} && ($e->{role}//'') eq 'home' && $e->{time}==$s->{position_time}) {
+        $s->{phase}='away' unless $approach;
+        $s->{desired_status}='absent';
+    }
+}
+
+# GP_WaitMotionFresh: Apply the age limit for a movement-based wait.
+sub GP_WaitMotionFresh {
+    my ($cfg,$motion,$age)=@_;
+    return GP_VehicleMotionFresh($cfg,$age) if $motion eq 'walking';
+    return defined($age) && $age<=$cfg->{arrival_motion_max_age};
 }
 
 # GP_ArrivalMotion: Select movement evidence fresh enough to determine the arrival wait.
 sub GP_ArrivalMotion {
-    my ($s,$cfg,$now)=@_;
+    my ($s,$cfg,$mono)=@_;
     my $motion=$s->{motion}//'unknown';
-    my $age=$now-($s->{motion_time}//0);
-    # A useful foot observation survives an empty Home payload. Faster waits
-    # require newer evidence than the independent garage permission does.
-    my $limit=$motion eq 'walking' ? $cfg->{motion_max_age} : $cfg->{arrival_motion_max_age};
-    return 'unknown' unless $motion =~ /\A(?:walking|running|cycling|automotive)\z/
-        && $age>=-$cfg->{future_tolerance} && $age<=$limit;
+    return 'unknown' unless GP_UsefulMotion($motion) && defined($s->{motion_mono})
+        && GP_WaitMotionFresh($cfg,$motion,GP_ObservationAge($cfg,$s->{motion_mono},$mono));
     return $motion;
 }
 
 # GP_UpdateArrivalMotion: Refresh a pending arrival's motion decision while retaining its time anchors.
 sub GP_UpdateArrivalMotion {
-    my ($s,$cfg,$p,$now,$evaluated_at)=@_;
-    # Revoking older evidence must not age an unaffected, latched decision.
-    # New motion uses now; a partial revocation keeps its original evaluation.
-    $p->{vehicle_eligible}=GP_VehicleEligible($s,$cfg,$evaluated_at)?1:0;
-    my $motion=GP_ArrivalMotion($s,$cfg,$evaluated_at);
+    my ($s,$cfg,$p,$now,$mono,$vehicle_changed,$age)=@_;
+    my $evaluate_vehicle=$vehicle_changed || !defined($p->{vehicle_eligible});
+    my ($fresh_motion,$motion);
+    # An observation that is only usable for the wait leaves the vehicle
+    # decision latched. A revocation uses the previous evaluation or new Home.
+    if (defined($mono)) {
+        $p->{motion_evaluated_mono}=$mono;
+        $p->{vehicle_evaluated_mono}=$mono if $evaluate_vehicle;
+        if (defined($vehicle_changed)) {
+            my $reported=$s->{motion};
+            $fresh_motion=$reported if $vehicle_changed;
+            # Walking uses the same age limit for the wait and the vehicle filter.
+            my $fresh=$reported eq 'walking' ? $vehicle_changed : GP_WaitMotionFresh($cfg,$reported,$age);
+            $motion=$fresh ? $reported:'unknown';
+        }
+    }
+    if ($evaluate_vehicle) {
+        my $evaluated=$p->{vehicle_evaluated_mono};
+        if (!defined($mono) && defined($s->{automotive_mono}) && defined($p->{automotive_evaluated_mono})
+            && $p->{automotive_evaluated_mono}==$evaluated) {
+            $fresh_motion='automotive';
+        }
+        $p->{vehicle_eligible}=GP_VehicleEligible($s,$cfg,$evaluated,$fresh_motion)?1:0;
+    }
+    $motion//=GP_ArrivalMotion($s,$cfg,$p->{motion_evaluated_mono});
     my $wait=$cfg->{'arrival_wait_'.$motion};
-    my $changed=!defined($p->{wait}) || $p->{wait}!=$wait || $p->{motion} ne $motion;
-    $p->{motion_evaluated_at}=$evaluated_at;
+    my $due=$p->{start_mono}+$wait;
+    my $changed=!defined($p->{due_mono}) || $p->{due_mono}!=$due || $p->{motion} ne $motion;
     $p->{motion}=$motion; $p->{motion_time}=$s->{motion_time}; $p->{wait}=$wait;
-    $p->{due_mono}=$p->{start_mono}+$wait;
+    $p->{due_mono}=$due;
     $p->{deadline}=$p->{started}+$wait;
     GP_Trace($s,$now,'arrival pending',{motion=>$motion,motion_time=>$p->{motion_time},
         wait_seconds=>$wait,deadline=>$p->{deadline}}) if $changed;
@@ -2296,7 +2634,7 @@ sub GP_UpdateArrivalMotion {
 
 # GP_BeginArrival: Create or update a qualified Home arrival and its motion-based wait.
 sub GP_BeginArrival {
-    my ($s,$cfg,$e,$now,$mono)=@_;
+    my ($s,$cfg,$e,$now,$mono,$vehicle_changed,$age)=@_;
     my $p=$s->{arrival};
     my $home=$p ? $p->{event}:$e;
     # Status-only synchronization and premature returns cannot acquire a new
@@ -2306,53 +2644,46 @@ sub GP_BeginArrival {
         && GP_AwayLongEnough($cfg,$s->{trip},$home,$mono)) {
         return GP_Arrive($s,$cfg,$e,$now,$mono);
     }
-    if (!$p) {
-        # Count from server receipt, never from a phone's possibly delayed date.
-        # The reorder window is part of the wait, not an additional full wait.
-        $p=$s->{arrival}={event=>{%$e},trip=>$s->{trip}{id},generation=>$s->{generation},
-            origin_time=>($s->{approach}//{})->{origin_time}//$e->{time},
-            start_mono=>$e->{received_mono},started=>$e->{received}};
+    my $entry={role=>$e->{role},time=>$e->{time},processed_mono=>$mono,motion_mono=>GP_ObservedMono($e)};
+    if ($e->{role} eq 'home') {
+        my @fields=qw(kind zone entry key received received_mono motion);
+        @$entry{@fields}=@$e{@fields};
     }
-    # Transfer the still-current approach origin without scanning event history.
-    for my $key ($e->{key},($s->{approach}//{})->{key}) {
-        $s->{seen}{$key}{arrival_key}=$p->{event}{key}
-            if $key && $s->{seen}{$key} && $p->{event}{key};
+    unless ($p) {
+        my $approach=delete $s->{approach};
+        if ($approach && !defined($vehicle_changed) && (my $assessment=$s->{batch_motion})) {
+            my ($observed,$observed_mono,$vehicle_fresh,$checked_age)=@$assessment;
+            if (defined($s->{motion_time}) && $s->{motion_time}==$observed && $s->{motion_mono}==$observed_mono) {
+                ($vehicle_changed,$age)=($vehicle_fresh,$checked_age);
+            }
+        }
+        $p=$s->{arrival}={trip=>$s->{trip}{id},generation=>$s->{generation},entries=>{}};
+        GP_AnchorArrival($p,$entry,$approach ? @$approach{qw(origin_time mono)} : ());
+        if ($approach && $s->{seen}{$approach->{key}//''}) {
+            $p->{entries}{$approach->{key}}={role=>'approach',time=>$approach->{origin_time},
+                processed_mono=>$approach->{mono},motion_mono=>$approach->{motion_mono}};
+        }
+        $s->{phase}='returning';
     }
-    $p->{latest_home}={%$e} if ($e->{role}//'') eq 'home'
-        && (!$p->{latest_home} || $e->{time}>=$p->{latest_home}{time});
+    # Keep only decision data, owned by the pending arrival for its lifetime.
+    $p->{entries}{$e->{key}}=$entry if $e->{key};
     if (defined($p->{wait}) && !GP_UsefulMotion($e->{motion})) {
         # Repeated entry webhooks with no new evidence neither restart the wait
         # nor allow a walking veto to expire into a remote garage permission.
         return;
     }
-    $s->{phase}='returning';
-    delete $s->{approach};
-    GP_UpdateArrivalMotion($s,$cfg,$p,$now,$now);
-}
-
-# GP_ActionFresh: Check an action's absolute expiry, including its allowed arrival wait.
-sub GP_ActionFresh {
-    my ($cfg,$e,$now)=@_;
-    # Only the module's confirmation path supplies this allowance. Keep the
-    # original event date/receipt; deliberate waiting does not turn a late retry
-    # into a fresh observation or permit unbounded execution after a timer stall.
-    return $e->{time}<=$now+$cfg->{future_tolerance} && $now<=GP_ActionExpiry($cfg,$e);
-}
-
-# GP_ActionExpiry: Derive absolute expiry from the oldest observation or receipt time.
-sub GP_ActionExpiry {
-    my ($cfg,$e)=@_;
-    my $oldest=$e->{time}<$e->{received} ? $e->{time}:$e->{received};
-    return $oldest+$cfg->{action_max_age}+($e->{arrival_wait_budget}//0);
+    GP_UpdateArrivalMotion($s,$cfg,$p,$now,$mono,$vehicle_changed,$age);
 }
 
 # GP_ActionMonoExpiry: Anchor an action's remaining time budget to its monotonic receipt clock.
 sub GP_ActionMonoExpiry {
     my ($cfg,$e,$now,$mono)=@_;
-    # Convert the observation's age at receipt only once. Later wall-clock
-    # corrections must not refund time spent queued or waiting for arrival.
+    # Reuse the observation clock from Geo admission. Older source timings are
+    # projected at receipt, so later corrections do not change elapsed time.
     my $received=$e->{received_mono}//($mono-($now-$e->{received}));
-    return $received+GP_ActionExpiry($cfg,$e)-$e->{received};
+    my $observed=$e->{motion_mono}//($received-($e->{received}-$e->{time}));
+    my $oldest=$observed<$received ? $observed:$received;
+    return $oldest+$cfg->{action_max_age}+($e->{arrival_wait_budget}//0);
 }
 
 # GP_ConfirmArrival: Complete a due Home wait only while its evidence and time budgets remain valid.
@@ -2368,27 +2699,29 @@ sub GP_ConfirmArrival {
     }
     my $e={%{$p->{event}},arrival_wait_budget=>$p->{wait},
         arrival_vehicle_eligible=>$p->{vehicle_eligible},confirmation=>'timer'};
-    unless (GP_ActionFresh($cfg,$e,$now) && $mono<=GP_ActionMonoExpiry($cfg,$e,$now,$mono)) {
+    my $expires_mono=GP_ActionMonoExpiry($cfg,$e,$now,$mono);
+    if ($mono>$expires_mono) {
         GP_CancelArrival($s,$now,'arrival confirmation expired');
         $s->{phase}='away';
         return;
     }
-    GP_Arrive($s,$cfg,$e,$now,$mono);
+    GP_Arrive($s,$cfg,$e,$now,$mono,undef,$expires_mono);
 }
 
 # GP_Arrive: Finalize an arrival, plan eligible rules, and close its current trip.
 sub GP_Arrive {
-    my ($s,$cfg,$e,$now,$mono)=@_;
+    my ($s,$cfg,$e,$now,$mono,$batch_opening,$expires_mono)=@_;
     local $s->{trace_context}={source=>$e->{kind},zone=>$e->{zone}};
     my $pending=delete $s->{arrival};
     # A new local phone return may finish the same provisional Home arrival.
     # Preserve its motion-based garage decision across the confirmation wait.
-    $e={%$e,arrival_vehicle_eligible=>$pending->{vehicle_eligible}} if $pending && $e->{kind} eq 'phone_present';
+    my $arrival_event=$pending && $e->{kind} eq 'phone_present'
+        ? {%$e,arrival_vehicle_eligible=>$pending->{vehicle_eligible}}:$e;
     GP_Trace($s,$now,'arrival confirmed', {source=>$e->{kind}, time_observed=>$e->{time},changed=>$s->{phase} ne 'home' ? 1:0,
         observed=>$e->{time},received=>$e->{received},event_key=>$e->{key},
         confirmation=>$e->{confirmation}//($e->{kind} eq 'phone_present' ? 'phone':'status only'),
         motion=>$pending ? $pending->{motion}:$s->{motion},wait_seconds=>$pending ? $mono-$pending->{start_mono}:0});
-    GP_Rules($s,$cfg,'arrival',$e,$now,$mono);
+    GP_Rules($s,$cfg,'arrival',$arrival_event,$now,$mono,$batch_opening,$expires_mono);
     $s->{last_trip}=$s->{trip} if $s->{trip};
     delete $s->{trip};
     # Confirmation preserves the Geo display; a fresh phone event can show Home.
@@ -2412,24 +2745,56 @@ sub GP_Home {
     $s->{phase}='home';
     my $boundary=($s->{position_time}//0)>$time ? $s->{position_time}:$time;
     $s->{boundary}=$boundary if $boundary>$s->{boundary};
-    delete @{$s}{qw(approach automotive conflict)};
+    delete @{$s}{qw(approach automotive automotive_mono foot conflict)};
     $s->{desired_status}='home';
     GP_ResetNegative($s,$boundary);
 }
 
+# GP_ClockShift: Return the signed difference between wall and monotonic elapsed times.
+sub GP_ClockShift {
+    my ($now,$mono,$previous_wall,$previous_mono)=@_;
+    return ($now-$previous_wall)-($mono-$previous_mono);
+}
+
+# GP_CheckDiscardedClocks: Preserve evidence of a rollback before replacing live clock snapshots.
+sub GP_CheckDiscardedClocks {
+    my ($rt,$now,$mono,$tolerance,@contexts)=@_;
+    for my $s (@contexts) {
+        next unless $s;
+        # The previous debug offset cancels in the difference of the clocks.
+        my $shift=GP_ClockShift($now,$mono,@$s{qw(wall mono)});
+        return GP_RecordGeoRollback($rt,$now,$mono,$now-$shift,$tolerance) if $shift<-$tolerance;
+    }
+    return;
+}
+
+# GP_RevokeClockContext: Start a fresh resident context without carrying clock-dependent permissions.
+sub GP_RevokeClockContext {
+    my ($s,$now,$mono)=@_;
+    delete @{$s}{qw(trip arrival approach automotive automotive_mono foot motion motion_time motion_mono
+        position_time desired_status resume_event_floor queued_phones phone_poll_at)};
+    $s->{phone}=GP_NewPhone(($s->{phone}{state}//'unknown') ne 'disabled');
+    $s->{zones}={}; $s->{members}={}; $s->{phase}='unknown'; $s->{boundary}=0; $s->{start}=$now;
+    GP_RevokeOutputs($s);
+    # Rehash the namespace so repeated clock resets keep later trip IDs bounded.
+    $s->{generation}=sha256_hex($s->{generation}.':clock');
+    GP_Trace($s,$now,'clock discontinuity; permissions revoked');
+    @$s{qw(wall mono)}=($now,$mono);
+}
+
 # GP_CheckClock: Revoke permissions when wall and monotonic clocks diverge beyond tolerance.
 sub GP_CheckClock {
-    my ($s,$cfg,$now,$mono)=@_;
-    if (abs(($now-$s->{wall})-($mono-$s->{mono}))>$cfg->{future_tolerance}) {
-        delete @{$s}{qw(trip arrival approach automotive motion motion_time position_time desired_status resume_event_floor)};
-        $s->{phone}=GP_NewPhone(GP_UsesSource($cfg->{sourceMode},'phone'));
-        $s->{zones}={}; $s->{members}={}; $s->{phase}='unknown'; $s->{boundary}=0; $s->{start}=$now;
-        GP_RevokeOutputs($s);
-        # Rehash the namespace so repeated clock resets keep later trip IDs bounded.
-        $s->{generation}=sha256_hex($s->{generation}.':clock');
-        GP_Trace($s,$now,'clock discontinuity; permissions revoked');
+    my ($s,$cfg,$now,$mono,$rt)=@_;
+    # An output callback can already have sampled newer clocks in this timer run.
+    return if $mono<$s->{mono};
+    my $tolerance=$cfg->{future_tolerance};
+    my $shift=GP_ClockShift($now,$mono,@$s{qw(wall mono)});
+    if ($shift<-$tolerance) {
+        my $offset=$s->{debug_offset}//0;
+        return GP_RecordGeoRollback($rt,$now-$offset,$mono-$offset,$now-$offset-$shift,$tolerance);
     }
-    $s->{wall}=$now; $s->{mono}=$mono;
+    return GP_RevokeClockContext($s,$now,$mono) if $shift>$tolerance;
+    @$s{qw(wall mono)}=($now,$mono);
 }
 
 # GP_Contradiction: Check whether two simultaneous Geo observations are geometrically incompatible.
@@ -2446,16 +2811,15 @@ sub GP_Contradiction {
     return 0;
 }
 
-# GP_BatchConflict: Detect conflicts among fresh Geo observations with equal timestamps.
-# Geometry has already kept these observations in chronological order. Only
-# equal observation times can contradict each other; freshness is checked once
-# per event rather than again for every pair in the complete batch.
+# GP_BatchConflict: Compare observations at equal times in the validated Geo batch.
 sub GP_BatchConflict {
-    my ($s,$cfg,$events,$now)=@_;
+    my ($s,$cfg,$events)=@_;
+    # Geometry admission already checked the time window. A geometry change
+    # can advance the position, so apply the current position boundary here.
+    my $position=$s->{position_time}//0;
     my @same_time;
     for my $e (@$events) {
-        next unless GP_Fresh($cfg,$e,$now) && GP_AfterStart($s,$cfg,$e)
-            && $e->{time}>=($s->{position_time}//0);
+        next if $e->{time}<$position;
         @same_time=() if @same_time && $same_time[0]{time}!=$e->{time};
         for my $previous (@same_time) {
             return 1 if GP_Contradiction($previous,$e,$cfg);
@@ -2467,7 +2831,7 @@ sub GP_BatchConflict {
 
 # GP_ProcessPhone: Apply phone observations, historical revocations, and status-only returns.
 sub GP_ProcessPhone {
-    my ($s,$cfg,$e,$now,$mono)=@_;
+    my ($s,$cfg,$e,$now,$mono,$batch_opening)=@_;
     # Historical presence cannot authorize a current arrival. It may still
     # disprove an older restored departure or a specific phone qualification.
     return GP_Trace($s,$now,'phone observation belongs to previous session')
@@ -2504,7 +2868,7 @@ sub GP_ProcessPhone {
     }
     return unless $e->{kind} eq 'phone_present' || $e->{kind} eq 'phone_snapshot';
     my $snapshot=$e->{kind} eq 'phone_snapshot';
-    my $fresh=!$snapshot && !$e->{ambiguous} && GP_Fresh($cfg,$e,$now);
+    my $fresh=!$snapshot && !$e->{ambiguous} && defined GP_FreshAge($cfg,@$e{qw(time received)},$now);
     my $current=!$snapshot && GP_AfterStart($s,$cfg,$e);
     my $trip=$s->{trip}//$s->{last_trip};
     my $departure=GP_DepartureTime($trip);
@@ -2526,7 +2890,7 @@ sub GP_ProcessPhone {
             : (!$trip->{armed} || !$fresh || !GP_AwayLongEnough($cfg,$trip,$e,$mono)
                 || (!$e->{arrival} && ($e->{time}>=$position || $veto))))));
     if ($revoke) {
-        delete @{$s}{qw(trip last_trip automotive motion motion_time)};
+        delete @{$s}{qw(trip last_trip automotive automotive_mono foot motion motion_time motion_mono)};
         GP_CancelArrival($s,$now,'local phone presence revoked departure');
         GP_RevokeOutputs($s);
         if ($e->{time}>=$position) {
@@ -2553,77 +2917,75 @@ sub GP_ProcessPhone {
     GP_RememberEvent($s,$e);
     return GP_Trace($s,$now,'observation older than current position') if $e->{time}<$position;
     $s->{position_time}=$e->{time};
-    return GP_Arrive($s,$cfg,$e,$now,$mono);
+    return GP_Arrive($s,$cfg,$e,$now,$mono,$batch_opening);
 }
 
-# GP_Process: Apply one observation to travel, membership, motion, and action-planning state.
+# GP_Process: Apply an observation after the timer's clock check and Geo admission.
 sub GP_Process {
-    my ($s,$cfg,$e,$now,$mono)=@_;
+    my ($s,$cfg,$e,$now,$mono,$batch_opening)=@_;
+    my $geo=$e->{kind} eq 'geo';
     # Keep the cause on every decision made for this observation. Dynamic scope
     # prevents a later timer or actuator result from inheriting an old source.
     local $s->{trace_context}={source=>$e->{kind},zone=>$e->{zone}};
     $s->{intents}=[];
     return GP_Trace($s,$now,'observation source disabled by sourceMode')
-        if ($e->{kind} eq 'geo' && !GP_UsesSource($cfg->{sourceMode},'geo'))
+        if ($geo && !GP_UsesSource($cfg->{sourceMode},'geo'))
             || ($e->{kind} =~ /^phone_/ && !GP_UsesSource($cfg->{sourceMode},'phone'));
     $s->{last_observed}=$e->{time}; $s->{last_received}=$e->{received};
     $s->{last_key}=$e->{key}; $s->{config_revision}=GP_ConfigRevision($cfg);
     $e->{received_mono}//=$mono-($now-$e->{received});
-    GP_CheckClock($s,$cfg,$now,$mono);
     GP_Trace($s,$now,'observation received',{diagnostic_only=>1,source=>$e->{kind},zone=>$e->{zone},entry=>$e->{entry},
         motion=>$e->{motion},zone_position=>$e->{zone_position},current_position=>$e->{current_position}});
-    return GP_ProcessPhone($s,$cfg,$e,$now,$mono) if $e->{kind} =~ /^phone_/;
-    return GP_Trace($s,$now,'event too old or future') unless GP_Fresh($cfg,$e,$now);
-    return GP_Trace($s,$now,'event precedes session boundary') unless GP_AfterStart($s,$cfg,$e);
-    if ($e->{key}) {
-        if ($s->{seen}{$e->{key}}) {
-            return if GP_EnrichDuplicate($s,$cfg,$e,$now,$mono);
-            return GP_Trace($s,$now,'duplicate event');
+    return GP_ProcessPhone($s,$cfg,$e,$now,$mono,$batch_opening) if $e->{kind} =~ /^phone_/;
+    my $admitted_age=delete $e->{observation_age};
+    my $time=$e->{time};
+    my $opening=$batch_opening && $$batch_opening;
+    # Opening plans retain their own observation time through later status
+    # updates and do not need the counter-observation to update the position.
+    my $opening_affected=$geo && $opening && $opening->{output_revision}==$s->{output_revision}
+        && $time>=$opening->{e}{time};
+    my $duplicate=$e->{key} && $s->{seen}{$e->{key}};
+    GP_RememberEvent($s,$e) if $e->{key} && !$duplicate;
+    if ($duplicate || $time<($s->{position_time}//0)) {
+        my $arrival_affected=!$duplicate && $geo && GP_ArrivalAffected($s,$time);
+        if (($opening_affected || $arrival_affected)
+            && ($e->{home_counterevidence} || GP_HomeCounterevidence($cfg,$cfg->{zones}{$e->{zone}},$e->{entry}))) {
+            $e->{opening_counterevidence}=1 if $opening_affected;
+            GP_ApplyArrivalInterruption($s,$cfg,$e,$now,$mono) if $arrival_affected;
         }
-        GP_RememberEvent($s,$e);
+        return GP_Trace($s,$now,'observation older than current position') unless $duplicate;
+        return if GP_EnrichDuplicate($s,$cfg,$e,$now,$mono,$duplicate,$admitted_age);
+        return GP_Trace($s,$now,'duplicate event');
     }
-    if ($e->{time}<($s->{position_time}//0)) {
-        my $p=$s->{arrival};
-        # An older exit can revoke approach evidence without rewinding position.
-        # An exit before the first Home keeps that Home's receipt anchor; an
-        # exit during its wait requires a new wait from a later Home entry.
-        if (GP_InterruptsArrival($s,$cfg,$e)) {
-            my $revoked=defined($s->{motion_time}) && $s->{motion_time}<=$e->{time};
-            delete @{$s}{qw(motion motion_time)} if $revoked;
-            if (defined($s->{automotive}) && $s->{automotive}<=$e->{time}) {
-                delete $s->{automotive}; $revoked=1;
-            }
-            $s->{checkpoint_dirty}=1 if $revoked;
-            if ($p && $e->{time}<$p->{event}{time}) {
-                $p->{origin_time}=$p->{event}{time};
-                GP_UpdateArrivalMotion($s,$cfg,$p,$now,$p->{motion_evaluated_at}) if $revoked;
-            } else {
-                my $latest=$p ? $p->{latest_home}:undef;
-                GP_CancelArrival($s,$now,'delayed exit interrupted arrival section');
-                if ($latest && $latest->{time}>$e->{time}) {
-                    GP_BeginArrival($s,$cfg,$latest,$now,$mono);
-                } else {
-                    $s->{phase}='away'; $s->{desired_status}='absent';
-                }
-            }
-        }
-        return GP_Trace($s,$now,'observation older than current position');
-    }
-    return unless $e->{kind} eq 'geo';
+    return unless $geo;
     my $zone=$cfg->{zones}{$e->{zone}} or return;
-    return GP_GeometrySync($s,$cfg,$e,$now) unless $cfg->{geometry_ready} && GP_HasGeometry($zone);
+    return GP_GeometrySync($s,$cfg,$e,$zone,$now) unless $cfg->{geometry_ready} && GP_HasGeometry($zone);
     my $previous=$s->{zones}{$e->{zone}};
     return GP_Trace($s,$now,'older zone observation') if $previous && $e->{time}<$previous->{time};
     for my $name (keys %{$s->{zones}}) {
         my $v=$s->{zones}{$name};
         next unless $v->{time}==$e->{time};
         if (GP_Contradiction($e,{%$v,zone=>$name},$cfg)) {
+            $e->{opening_counterevidence}=1 if $opening_affected;
             $s->{conflict}=1; delete $s->{trip}; GP_CancelArrival($s,$now,'contradictory locations');
             GP_RevokeOutputs($s);
             return GP_Trace($s,$now,'contradictory locations at same time');
         }
     }
-    return GP_Trace($s,$now,'event before completed arrival') if $e->{time}<=$s->{boundary};
+    my $completed=$time<=$s->{boundary};
+    my $arrival_affected=!$completed && GP_ArrivalAffected($s,$time);
+    my ($home,$home_distance);
+    unless ($completed) {
+        # geometry_ready guarantees exactly one valid Home and outer circle.
+        $home=$cfg->{zones}{$cfg->{roles}{home}[0]};
+        $home_distance=$zone==$home ? 0 : GP_Distance($zone,$home);
+    }
+    my $counterevidence;
+    if ($opening_affected || $arrival_affected) {
+        $counterevidence=$e->{home_counterevidence} || GP_HomeCounterevidence($cfg,$zone,$e->{entry},$home_distance);
+    }
+    $e->{opening_counterevidence}=1 if $opening_affected && $counterevidence;
+    return GP_Trace($s,$now,'event before completed arrival') if $completed;
     # Accepted Geo observations update the saved position, memberships and trip.
     # Rejected events and unchanged duplicates never reach this mutation path.
     $s->{checkpoint_dirty}=1;
@@ -2631,25 +2993,31 @@ sub GP_Process {
     my $previous_position=$s->{position_time};
     $s->{position_time}=$e->{time};
     my $role=$zone->{role}; $e->{role}=$role;
-    # geometry_ready guarantees exactly one valid Home and outer circle.
-    my $home=$cfg->{zones}{$cfg->{roles}{home}[0]};
-    my $home_distance=$zone==$home ? 0 : GP_Distance($zone,$home);
+    GP_ApplyArrivalInterruption($s,$cfg,$e,$now,$mono) if $arrival_affected && $counterevidence;
     # Geometrically disjoint or nested contradictory older observations are stale.
     for my $other (keys %{$s->{zones}}) {
         next if $other eq $e->{zone};
         my $v=$s->{zones}{$other};
         next if !$v->{entry} || $v->{time}>=$e->{time};
         my $oz=$cfg->{zones}{$other} or next;
-        next unless GP_HasGeometry($oz);
-        my $dist=$oz==$home ? $home_distance : GP_Distance($zone,$oz);
+        my $dist;
+        if ($oz==$home) {
+            # Technical exits can counter an arrival independently of the circle relation.
+            if (defined($counterevidence) && ($e->{entry} || $role eq 'place')) {
+                $v->{entry}=0 if $counterevidence;
+                next;
+            }
+            $dist=$home_distance;
+        } else {
+            next unless GP_HasGeometry($oz);
+            $dist=GP_Distance($zone,$oz);
+        }
         if (($e->{entry} && $dist>$zone->{radius}+$oz->{radius})
             || (!$e->{entry} && $dist+$oz->{radius}<=$zone->{radius})) { $v->{entry}=0; }
     }
     $s->{zones}{$e->{zone}}={entry=>$e->{entry},time=>$e->{time},role=>$role};
     $s->{location}=$e->{entry} ? $zone->{label} : 'underway';
     my $far=$home_distance>$zone->{radius}+$home->{radius}+$cfg->{departure_margin};
-    GP_CancelArrival($s,$now,'Home or surrounding area exited')
-        if !$e->{entry} && $role =~ /\A(?:home|approach|outer)\z/;
     if (!$e->{entry} && $role eq 'home') {
         GP_LeaveHome($s,$cfg,$e,$mono);
     }
@@ -2669,25 +3037,24 @@ sub GP_Process {
         $s->{desired_status}='absent' if $s->{phase} eq 'away';
     }
     if (!$e->{entry} && ($role eq 'approach' || $role eq 'home')) {
-        delete @{$s}{qw(automotive motion motion_time)};
+        delete @{$s}{qw(automotive automotive_mono foot motion motion_time motion_mono)};
     }
+    my ($vehicle_changed,$motion_age);
     if ($e->{entry} && ($role eq 'home' || $role eq 'approach')) {
         GP_ResetNegative($s,$e->{time});
         # Missing/unknown motion and stationary supply no new transport evidence.
         # Keep the last useful observation and its ORIGINAL time in this section;
         # an empty Home payload must neither erase walking nor refresh its TTL.
-        if (($e->{motion}//'') =~ /\A(?:automotive|walking|running|cycling)\z/) {
-            $s->{motion}=$e->{motion}; $s->{motion_time}=$e->{time};
-            $s->{automotive}=$e->{time} if $e->{motion} eq 'automotive';
-        }
+        ($vehicle_changed,$motion_age)=GP_RecordMotion($s,$cfg,$e,$mono,$role eq 'approach' ? $mono:undef,$admitted_age)
+            if GP_UsefulMotion($e->{motion});
     }
     for my $event (GP_LocationEvents($s,$cfg,$e)) {
         GP_Rules($s,$cfg,$e->{entry}?'enter':'exit',$event,$now,$mono);
     }
     if ($e->{entry} && ($role eq 'home' || $role eq 'approach')) {
-        if ($role eq 'home' || $s->{arrival}) { GP_BeginArrival($s,$cfg,$e,$now,$mono); }
+        if ($role eq 'home' || $s->{arrival}) { GP_BeginArrival($s,$cfg,$e,$now,$mono,$vehicle_changed,$motion_age); }
         elsif ($s->{trip} && $s->{trip}{armed}) {
-            $s->{phase}='returning'; $s->{approach}={key=>$e->{key},origin_time=>$e->{time},mono=>$mono};
+            GP_SetApproach($s,$e->{key},$e->{time},$mono,GP_ObservedMono($e));
         }
     }
     GP_Trace($s,$now,'zone observation processed',{diagnostic_only=>1,zone=>$e->{zone},entry=>$e->{entry},
@@ -2898,7 +3265,7 @@ sub GP_TickState {
     }
     if ($s->{approach} && $mono-$s->{approach}{mono}>=$cfg->{approach_timeout}) {
         $s->{checkpoint_dirty}=1 if grep {exists $s->{$_}} qw(automotive motion motion_time);
-        delete @{$s}{qw(approach automotive motion motion_time)};
+        delete @{$s}{qw(approach automotive automotive_mono foot motion motion_time motion_mono)};
         $s->{phase}='away' if $s->{trip};
     }
     # Display expiry hides the label without changing accepted zone evidence.
@@ -3318,10 +3685,11 @@ sub GP_ResumeTrip {
     # Runtime clocks belong only to the same validated departure in this process.
     # Pending timers and queues never resume; cold recovery reconstructs durations.
     my $prior=ref($previous) eq 'HASH' && ($previous->{id}//'') eq $trip->{id}
-        && defined($previous->{away_time}) && $previous->{away_time}==$trip->{away_time}
+        && GP_SameSavedTime($trip->{away_time},$previous->{away_time})
         ? $previous:undef;
     my $elapsed=delete $state->{action_elapsed};
     $s->{$_}=$state->{$_} for keys %$state;
+    GP_RestoreMotionClocks($s,$cfg,$now,$mono,$checkpoint->{saved_at},$prior);
     # Resume only elapsed time confirmed at the save. Offline wall-clock changes
     # cannot shorten a cooldown; older formats can supply only the saved wall age.
     GP_RestoreActionClocks($s,$checkpoint->{saved_at},$mono,$elapsed);
@@ -3442,7 +3810,8 @@ sub GP_CaptureLocation {
     my $learned=GP_Learned($c,$r) or return (503,'Learning expired; start again');
     return (503,'Learning expired; start again') unless $c->{helper}{gp}{learning}{$r}
         && GP_Mono()<=$learned->{until};
-    return (422,'Learning requires a fresh test event') unless GP_Fresh($cfg,$e,$now) && $e->{time}>=$learned->{start}-1;
+    return (422,'Learning requires a fresh test event')
+        unless defined(GP_FreshAge($cfg,@$e{qw(time received)},$now)) && $e->{time}>=$learned->{start}-1;
     my $conflict=GP_LearningDeviceConflict($c,$r,$e->{device});
     return (422,$conflict) if $conflict;
     my $old=$learned->{zones}{$e->{zone_id}};
@@ -3656,9 +4025,11 @@ sub GP_HandleHTTP {
         GP_Trace($s,$now,$invalid);
         return (422,$invalid);
     }
+    # Keep real receipt times for valid requests, including those that must retry.
+    $rt->{latest_geo_receipt}=$now if $now>($rt->{latest_geo_receipt}//0);
     return (503,'Queue full') if @{$rt->{queue}}>=128;
     push @{$rt->{queue}}, {resident=>$r,debug=>$mode eq 'debug'?1:0,event=>$e,
-        due=>$mono+$cfg->{reorder_window},epoch=>$rt->{epoch}};
+        due=>$mono+$cfg->{reorder_window},generation=>$s->{generation}};
     return (200,$mode eq 'debug' ? 'OK debug accepted; no actions' : 'OK accepted in current FHEM session');
 }
 
@@ -3813,7 +4184,7 @@ sub GP_OutputReady {
     } else {
         # Caller-supplied timer times never authorize I/O. Static validation
         # belongs to planning; only live permissions are checked here.
-        GP_CheckClock($s,$cfg,$now,$mono);
+        GP_CheckClock($s,$cfg,$now,$mono,$c->{helper}{gp});
         if (($intent->{generation}//'') ne $s->{generation}
             || !defined($intent->{output_revision}) || $intent->{output_revision}!=$s->{output_revision}) {
             $reason='output permission revoked';
@@ -3832,8 +4203,11 @@ sub GP_OutputReady {
                 && (($intent->{kind} eq 'door_open' && !$cfg->{allowDoor})
                     || ($intent->{kind} eq 'garage_open' && !$cfg->{allowGarage}));
         }
-        $reason='intent expired' if !$reason && (!GP_ActionFresh($cfg,$intent->{e},$now)
-            || !defined($intent->{expires_mono}) || $mono>$intent->{expires_mono});
+        # Geo plans use their receipt-based deadline. Phone sources still
+        # require a fresh absolute Reading time as well.
+        my $event=$intent->{e};
+        $reason='intent expired' if !$reason && (!defined($intent->{expires_mono}) || $mono>$intent->{expires_mono}
+            || (($event->{kind}//'') ne 'geo' && !defined(GP_FreshAge($cfg,@$event{qw(time received)},$now))));
     }
     return ($now,$mono) unless $reason;
     GP_Trace($s,$now,$reason,{rule=>$intent->{rule},kind=>$intent->{kind},decision=>'suppressed'});
@@ -4167,7 +4541,7 @@ sub GP_TimerStep {
             my $s=GP_State($c,$r,$debug,$cfg);
             my $wall=$now+($s->{debug_offset}//0);
             my $clock=$mono+($s->{debug_offset}//0);
-            GP_CheckClock($s,$cfg,$wall,$clock);
+            GP_CheckClock($s,$cfg,$wall,$clock,$rt);
             if (GP_UsesSource($cfg->{sourceMode},'phone')
                 && (!defined($s->{phone_poll_at}) || $clock-$s->{phone_poll_at}>=$cfg->{phone_poll})) {
                 my $samples;
@@ -4190,53 +4564,97 @@ sub GP_TimerStep {
             # The first received observation fixes the window. When it is due,
             # process ALL already received observations in this context so that
             # newer counterevidence is considered before arrival confirmation.
-            my @batch=grep {$_->{resident} eq $r && $_->{debug}==$debug} @{$rt->{queue}};
-            my $batch_ready=!@batch || grep {$_->{due}<=$mono} @batch;
+            my $generation=$s->{generation};
+            my (@batch,$discarded,$due);
+            for my $item (@{$rt->{queue}}) {
+                next unless $item->{resident} eq $r && $item->{debug}==$debug;
+                if ($item->{generation} ne $generation) { $discarded=1; next; }
+                push @batch,$item;
+                $due||=$item->{due}<=$mono;
+            }
+            my $batch_ready=$due || !@batch;
+            if ($discarded || $due) {
+                @{$rt->{queue}}=grep {$_->{resident} ne $r || $_->{debug}!=$debug
+                    || (!$batch_ready && $_->{generation} eq $generation)} @{$rt->{queue}};
+            }
             if ($batch_ready) {
-                @{$rt->{queue}}=grep {!($_->{resident} eq $r && $_->{debug}==$debug)} @{$rt->{queue}};
                 my ($geometry_changed,$geometry_conflict)=(0,0);
-                my @events;
+                my (@events,%first);
+                my $home_zone=@batch>1 ? ($cfg->{roles}{home}//[])->[0] : undef;
+                my $has_home_entry;
                 # Dequeued events belong to this batch; arrivals and plans keep
                 # their own snapshots. Iterate sorted input, collecting output.
-                for my $e (sort {$a->{time}<=>$b->{time}} map {$_->{event}}
-                    grep {$_->{epoch}==$rt->{epoch}} @batch) {
-                    my $result=GP_Profile($c,'geometry',$target,sub {GP_UpdateGeometry($c,$r,$debug,$s,$e,$cfg,$wall)});
-                    if ($result eq 'stale') {
-                        GP_Trace($s,$wall,'stale geometry observation ignored',{zone=>$e->{zone}});
-                        # Do not restore older geometry. An otherwise current
-                        # exit with UNCHANGED geometry can still interrupt the
-                        # approach or Home wait. A registered motion supplement
-                        # may enrich that arrival without rewinding its position.
-                        my $z=$cfg->{zones}{$e->{zone}}//{};
-                        push @events,$e if (GP_InterruptsArrival($s,$cfg,$e) || GP_MotionOrigin($s,$cfg,$e))
-                            && GP_HasGeometry($e->{geometry}) && GP_HasGeometry($z)
-                            && !grep {$e->{geometry}{$_}!=$z->{$_}} qw(lat lon radius);
-                        next;
+                for my $e (sort {$a->{time}<=>$b->{time}} map {$_->{event}} @batch) {
+                    my $key=$e->{key};
+                    my $first=$first{$key};
+                    # Retries with a known entry keep its original observation age.
+                    # Receipt freshness still uses this webhook's receipt clock.
+                    if ($e->{entry} && (my $original=GP_ArrivalEntry($s,$key)//$first)) {
+                        $e->{motion_mono}=$original->{motion_mono};
                     }
-                    $geometry_changed=1 if $result eq 'changed' || $result eq 'conflict';
-                    $geometry_conflict=1 if $result eq 'conflict';
+                    my $result=GP_Profile($c,'geometry',$target,sub {GP_UpdateGeometry($c,$r,$debug,$s,$e,$cfg,$wall,$clock)});
+                    my $clock_blocked=$result eq 'before_clock_floor';
+                    if ($clock_blocked || $result eq 'stale' || $result eq 'outside_window' || $result eq 'older_position') {
+                        my $reason=$clock_blocked ? 'Geo observation blocked by clock rollback' : 'stale geometry observation ignored';
+                        GP_Trace($s,$wall,$reason,{source=>$e->{kind},zone=>$e->{zone},entry=>$e->{entry},
+                            observed=>$e->{time},received=>$e->{received},event_key=>$e->{key},
+                            ($clock_blocked ? (geo_event_floor=>$rt->{geo_event_floor}):())});
+                        next unless $result eq 'older_position' && GP_ArrivalAffected($s,$e->{time});
+                        # Incoming circles were validated at intake and stored
+                        # circles when loaded. Only unchanged geometry can supply
+                        # historical counterevidence or a motion supplement.
+                        my $z=$cfg->{zones}{$e->{zone}};
+                        next unless $z && defined($z->{radius}) && $e->{geometry};
+                        next if grep {$e->{geometry}{$_}!=$z->{$_}} qw(lat lon radius);
+                        # Reuse the circle result while checking the live origin
+                        # again during processing. Changed geometry discards this batch's plans.
+                        $e->{home_counterevidence}=1 if GP_HomeCounterevidence($cfg,$z,$e->{entry});
+                        # Earlier observations in the batch can revoke motion
+                        # that currently competes with a possible supplement.
+                        next unless $e->{home_counterevidence} || GP_MotionSupplement($z,$e,$s->{seen}{$key});
+                    } else {
+                        $geometry_changed=1 if $result eq 'changed' || $result eq 'conflict';
+                        $geometry_conflict=1 if $result eq 'conflict';
+                    }
                     push @events,$e;
+                    $has_home_entry||=defined($home_zone) && $e->{entry} && $e->{zone} eq $home_zone;
+                    # Make merged motion available before any phone confirmation.
+                    if (!$first) { $first{$key}=$e; }
+                    elsif (!GP_UsefulMotion($first->{motion}) && GP_UsefulMotion($e->{motion})) {
+                        $first->{motion}=$e->{motion};
+                    }
                 }
-                GP_MergeBatchMotion(@events);
                 $cfg=GP_Config($c,$r,$debug) if $geometry_changed;
-                my $conflict=$geometry_conflict || GP_BatchConflict($s,$cfg,\@events,$wall);
+                my $conflict=$geometry_conflict || GP_BatchConflict($s,$cfg,\@events);
+                local $s->{batch_motion} if $has_home_entry && @events>1 && !$geometry_changed && !$conflict;
                 my $phones=delete($s->{queued_phones})//[];
                 push @events,@$phones unless $geometry_changed;
                 my @pending;
+                my $opening_plan;
                 # Absence becomes a usable fact only after its complete window.
                 # An earlier Home return must revoke it before it can arm a trip.
                 for my $e (sort {($a->{qualified_at}//$a->{time})<=>($b->{qualified_at}//$b->{time})
                     || ($a->{zone}//'') cmp ($b->{zone}//'')} @events) {
                     last if $conflict;
                     if ($geometry_changed) {
-                        GP_GeometrySync($s,$cfg,$e,$wall,$clock) if $e->{time}>=($s->{position_time}//0);
+                        next if $e->{time}<($s->{position_time}//0);
+                        my $zone=$cfg->{zones}{$e->{zone}} or next;
+                        GP_GeometrySync($s,$cfg,$e,$zone,$wall,$clock);
                         next;
                     }
-                    GP_Profile($c,'observation',$target,sub {GP_Process($s,$cfg,$e,$wall,$clock)});
-                    @pending=grep {!GP_IsOpening($_->{kind})} @pending if $s->{conflict};
-                    # No command runs until all accepted observations in this batch agree.
-                    if ($e->{kind} eq 'geo' && !$e->{entry} && ($e->{role}//'') =~ /\A(?:home|approach|outer)\z/) {
-                        @pending=grep {!GP_IsOpening($_->{kind}) || $_->{e}{time}>$e->{time}} @pending;
+                    GP_Profile($c,'observation',$target,sub {GP_Process($s,$cfg,$e,$wall,$clock,\$opening_plan)});
+                    if ($opening_plan && ($e->{opening_counterevidence} || $s->{conflict})) {
+                        # Earlier plans were collected in observation order.
+                        @pending=grep {
+                            my $opening=GP_IsOpening($_->{kind});
+                            GP_Trace($s,$wall,'opening revoked by location observation',
+                                {decision=>'suppressed',rule=>$_->{rule},trip=>$_->{trip},kind=>$_->{kind},source=>$e->{kind},
+                                    zone=>$e->{zone},entry=>$e->{entry},event_key=>$e->{key},
+                                    observed=>$e->{time},received=>$e->{received}})
+                                if $opening && $e->{opening_counterevidence};
+                            !$opening;
+                        } @pending;
+                        undef $opening_plan;
                     }
                     push @pending, @{$s->{intents}};
                 }
@@ -4519,6 +4937,8 @@ sub GeoPresence_Set {
         my $keep_geometry=defined($value) && $value eq 'keepGeometry';
         return 'keepGeometry requires a real-time debug session; use debugReset without keepGeometry after debugAdvance'
             if $keep_geometry && (($rt->{debug}{$r}//{})->{debug_offset}//0)!=0;
+        my ($now,$mono)=(GP_Now(),GP_Mono());
+        GP_CheckDiscardedClocks($rt,$now,$mono,GP_Attr($hash->{NAME},'future_tolerance',$GP_DEFAULT{future_tolerance}),$rt->{debug}{$r});
         delete $rt->{learning}{$r};
         delete $rt->{learned}{$r} if ($rt->{learned}{$r}//{})->{unbound};
         # Coordinates are reusable setup data, not evidence of a trip. Keep
@@ -4526,7 +4946,7 @@ sub GeoPresence_Set {
         # queued observations are discarded even when geometry is retained.
         delete $rt->{geometry}{debug}{$r} unless $keep_geometry;
         GP_InvalidateConfig($hash,$r,1) unless $keep_geometry;
-        $rt->{debug}{$r}=GP_NewState(GP_Now()-31,GP_Mono()-31,$rt->{epoch}.':debug:'.$r.':'.GP_Now(),GP_Attr($r,'sourceMode','geofency_phone'));
+        $rt->{debug}{$r}=GP_NewState($now-31,$mono-31,$rt->{epoch}.':debug:'.$r.':'.$now,GP_Attr($r,'sourceMode','geofency_phone'));
         @{$rt->{queue}}=grep {!($_->{debug} && $_->{resident} eq $r)} @{$rt->{queue}};
         return $keep_geometry ? 'Debug session reset; geometry retained; no productive changes' : 'Debug session reset; no productive changes';
     }
@@ -4553,9 +4973,15 @@ sub GeoPresence_Set {
 # Presentation reads snapshots only. Never call GP_State, GP_Rules, GP_Phone,
 # GP_ConfirmArrival or a dispatcher from these helpers: a get is not an event.
 sub GP_ReportTime {
-    my ($time)=@_;
+    my ($time,$with_fraction)=@_;
     return 'Not observed' unless defined($time) && GP_Number($time) && $time>0;
-    return POSIX::strftime('%Y-%m-%d %H:%M:%S %Z',localtime($time));
+    my $format='%Y-%m-%d %H:%M:%S';
+    if ($with_fraction && $time!=int($time)) {
+        my $fraction=substr(sprintf('%.9f',$time-int($time)),1);
+        $fraction=~s/0+\z//;
+        $format.=$fraction;
+    }
+    return POSIX::strftime($format.' %Z',localtime($time));
 }
 
 # GP_ReportDuration: Format an elapsed duration for human-readable reports.
@@ -4694,6 +5120,7 @@ sub GP_ReportTrace {
         my $reason=$row->{reason}//'Unknown';
         $reason.='; return permission '.($row->{departure_armed}?'granted':'not granted') if exists $row->{departure_armed};
         $reason.='; '.$row->{confirmation} if length($row->{confirmation}//'');
+        $reason.='. Observations must be newer than '.GP_ReportTime($row->{geo_event_floor},1) if defined $row->{geo_event_floor};
         my $cause='Not recorded';
         for my $key (qw(rule zone source target)) {
             next unless defined($row->{$key}) && length($row->{$key});
@@ -4750,7 +5177,7 @@ sub GP_ReportResident {
         ['Trip',keys(%$trip) ? ucfirst($trip->{scope}//'unknown') : 'No active trip'],
         ['Phone',GP_UsesSource($cfg->{sourceMode},'phone')
             ? ucfirst($phone->{state}//'unknown').' ('.($debug && ($s->{phone_mode}//'live') eq 'simulated' ? 'simulated' : $phone->{health}//'unknown').')' : 'Disabled by source profile; no phone fallback'],
-        ['Motion',$arrival ? ucfirst($arrival->{motion}) : ucfirst(GP_ArrivalMotion($s,$cfg,$now))]);
+        ['Motion',$arrival ? ucfirst($arrival->{motion}) : ucfirst(GP_ArrivalMotion($s,$cfg,$mono))]);
     push @summary,['ROOMMATE update error',$s->{roommate_error}] if $s->{roommate_error};
     if ($arrival) {
         push @summary,['Home entry received',GP_ReportTime($arrival->{started})],
@@ -4771,7 +5198,7 @@ sub GP_ReportResident {
     for my $rule (@{$cfg->{rules}}) {
         next unless $rule->{trigger} eq 'arrival' && GP_IsOpening($rule->{type});
         my $garage=$rule->{type} eq 'garage_open';
-        my $eligible=$arrival ? $arrival->{vehicle_eligible}:GP_VehicleEligible($s,$cfg,$now);
+        my $eligible=$arrival ? $arrival->{vehicle_eligible}:GP_VehicleEligible($s,$cfg,$mono);
         my $assessment= $mode eq 'disabled' ? 'Disabled'
             : $paused ? 'Production evaluation paused'
             : @{$errors//[]} ? 'Blocked by invalid configuration'
@@ -5200,8 +5627,13 @@ get System.GeoPresence logStatus
 set System.GeoPresence applyGeometry Geo.PERSON
 set Geo.PERSON mode debug</pre>
   <p>Test in debug before activation. New or changed geometry cancels the previous trip, pending actions and phone absence qualification; no rules execute in that event batch. A fresh, consistent Home exit may start a new unconfirmed local trip after geometry validation. It needs new departure confirmation: a full new phone absence window after the exit or independent Geo distance evidence under the source profile's normal rules. A changed-geometry Home entry alone never grants opening permission. Diagnostics identify the location, original event time and changed values in <code>geometry_changes</code>.</p>
-  <p>A duplicate Home or approach entry may fill missing motion while that arrival section is still current. The current approach entry is linked to the pending arrival when Home is accepted, including when both share the same observation time. Accepted entries remain linked even after newer Home entries without motion have advanced the position. A fresh delayed Home, approach or outer exit with unchanged geometry interrupts the approach even before Home is pending. A newer nearby place observation cannot hide that interruption. Motion from before the interruption cannot qualify the garage; a later valid Home entry retains its original receipt and wait even if the exit arrives after Home. A pre-Home exit preserves an unaffected latched Home walking veto even after motion_max_age expires. If older motion is revoked, surviving evidence keeps its original evaluation time; new motion is evaluated at the current time. A valid late walking supplement still vetoes the garage, including before phone confirmation. It does not replay visits or rules, replace newer known motion, rewind the latest Home evidence, refresh original timestamps or restart the Home wait. The original Home entry still qualifies minimum absence and anchors the wait. Completed or interrupted arrivals are not reopened. Debug plans appear as <code>would execute; debug suppressed</code>. The light, door, garage, notifications and ROOMMATE are not changed by the simulation. Start with the German handbook <code>doc/GeoPresence_Handbuch.md</code> for a complete resident setup and examples of locations, actions and rules. The separate <code>doc/GeoPresence_Testanleitung.md</code> describes automated everyday tests and guided phone tests for custom actions and groups.</p>
-  <p>Every output is checked immediately before the adapter call against the current mode, configuration, revocations and clocks. Manual ROOMMATE home also cancels plans already taken from the pending list: a door callback cannot leave the following garage command authorized. Slow callbacks do not extend the remaining time of later commands. The monotonic deadline is anchored to the original receipt, including time spent queued or awaiting arrival confirmation, so a backward wall-clock correction cannot extend it. Display aliases do not revoke pending commands, including alias deletion patterns such as <code>^alias$</code>. Deleting obsolete attributes also refreshes validation when a deletion pattern is used. Configuration guards apply to attribute deletion patterns and deletion of all attributes; controller changes affect every resident. Already issued actuator requests continue to receive feedback after a revocation.</p>
+  <p>A duplicate Home or approach entry may fill missing motion while that arrival section is still current. The current approach entry is linked to the pending arrival when Home is accepted, including when both share the same observation time. Accepted entries remain linked even after newer Home entries without motion have advanced the position. A surviving approach keeps its own event key through newer compatible positions. Closely spaced entries keep distinct keys even if their numeric observation times round to the same value. Earlier counterevidence in the same batch is processed before the supplement is assessed. A valid late walking supplement still vetoes the garage, including before phone confirmation. It preserves the original timestamps, visits and waiting period. The original Home entry still qualifies minimum absence and anchors the wait.</p>
+  <p>An open approach or Home wait is interrupted by Home, approach or outer exits, entry into a circle disjoint from Home, or exit from a circle fully containing Home. Fresh delayed evidence with unchanged geometry remains effective after a newer position has been accepted. The latest position, memberships and visits remain in effect. The first Home entry after the interruption that meets the minimum absence at observation and receipt starts its full wait from its original receipt. A valid approach between the interruption and that Home can still supply a fresh motion supplement. With no verified Home entry after the interruption, the pending arrival ends. A surviving approach keeps its original expiry. Motion from an already expired approach is removed before the next Home assessment. A current Home exit cancels the wait immediately and applies the normal departure grace before publishing provisional absence.</p>
+  <p>A valid conflicting location observation cancels pending door and garage plans in the same batch if it was observed at or after the phone event that produced the plans. A current observation with matching geometry can provide that evidence even when the stored circle has a newer timestamp. This also applies to duplicate location observations and after a later phone status update. A Home exit already recorded for the trip blocks openings when the phone observation has the same timestamp, including across separate batches. The trace records each cancelled opening as <code>opening revoked by location observation</code> with its rule, trip ID and the conflicting observation. This includes conflicts with a stored location.</p>
+  <p>Motion from before the interruption loses its effect. Each accepted Home entry bounds the preceding approach, including an entry whose receipt was too early to start the new wait. An approach gap that reaches <code>approach_timeout</code> invalidates motion and supplements from the expired approach. When the wait is rebuilt, surviving Home movement can determine the wait. Movement age starts with the observation age at the first Home or approach receipt and advances on the monotonic clock through sorting and any later supplement. A supplement that meets only the wait age limit preserves the recorded vehicle decision, including a walking veto. The filter keeps the monotonic age of car and foot observations that qualified at processing. Motion already known when the selected Home was processed is assessed at that Home. Later supplements retain their actual processing times. A further counter-observation may revoke older motion while a more recent approach remains valid for supplements. Repeated Home entries without motion keep the selected receipt and any valid walking veto. An interruption observed before the first Home entry preserves its receipt and any unaffected motion decision.</p>
+  <p>Only fresh observations from this session can enter the historical geometry check. The pending arrival holds the timing and movement data needed for the decision and releases them at confirmation or cancellation. Duplicate detection stores event keys and motion values.</p>
+  <p>Debug plans appear as <code>would execute; debug suppressed</code>. The light, door, garage, notifications and ROOMMATE are not changed by the simulation. Start with the German handbook <code>doc/GeoPresence_Handbuch.md</code> for a complete resident setup and examples of locations, actions and rules. The separate <code>doc/GeoPresence_Testanleitung.md</code> describes automated everyday tests and guided phone tests for custom actions and groups.</p>
+  <p>Every output is checked immediately before the adapter call against the current mode, configuration, revocations and clocks. Manual ROOMMATE home also cancels plans already taken from the pending list: a door callback cannot leave the following garage command authorized. Geo arrival confirmation and dispatch use the same monotonic deadline anchored to the original receipt. Sorting and slow callbacks use up the remaining time. Small wall-clock corrections leave that budget intact. Phone-triggered outputs also require a fresh absolute Reading time. Display aliases do not revoke pending commands, including alias deletion patterns such as <code>^alias$</code>. Deleting obsolete attributes also refreshes validation when a deletion pattern is used. Configuration guards apply to attribute deletion patterns and deletion of all attributes; controller changes affect every resident. Already issued actuator requests continue to receive feedback after a revocation.</p>
 
   <a id="GeoPresence-operation"></a>
   <h4>Operation, transport and persistence</h4>
@@ -5243,7 +5675,7 @@ set Geo.PERSON mode debug</pre>
   <p>Use FHEM's normal save mechanism for definitions, attributes and production readings. A deviceId confirmed with learnConfirm is an ordinary configuration attribute; learnConfirm does not call save. Production geometry is stored in gp_geometry. A qualified unfinished production trip is stored as one versioned gp_trip_checkpoint reading. Version 3 stores current consumption, original absolute plan times and elapsed cooldown durations. Valid version 1 and 2 data is imported once without replaying actions or renewing departure evidence. After restart, rereadcfg or module reload it can resume if identity, configuration, geometry and the trip_resume_max_age limit still match and no later Home or indoor presence contradicts it. A NEW return is required; startup alone never opens, and old arrival timers, queued commands, unconfirmed departures and debug trips never resume. The checkpoint is consumed before dispatching opening commands. gp_resume_status/gp_resume_reason and explain describe restoration or rejection.</p>
   <p>New checkpoint bindings start with <code>2:</code> and exclude the ROOMMATE display alias. Changing or deleting that alias does not invalidate the trip or require an extra checkpoint write; new messages use the current name. An older binding is verified against its original configuration and alias before a one-time migration, including for version 3 data. Unverifiable older bindings and unknown binding contracts are rejected. Migration retains the trip ID, original departure evidence and consumption, and executes no historical actions.</p>
   <p>A restored cooldown resumes the remainder recorded at the last checkpoint. Time since that save, including downtime, is conservatively not credited because intervening clock corrections cannot be verified. A cooldown already expired at the save remains expired. Older formats derive their initial elapsed duration from the saved checkpoint time and the last plan time; earlier clock corrections cannot be reconstructed.</p>
-  <p>A module reload retains known monotonic departure and phone-completion times only for the same fully validated trip and original departure. The old clock is checked before saving or handing over travel, including repeated reloads before recovery starts. A large clock discontinuity revokes the saved permission; a small correction cannot shorten the known minimum absence. Without retained runtime data, recovery reconstructs elapsed-time origins from the checkpoint, using saved_at as the conservative phone-completion fence. An observed phone source origin remains separate and is never created by reconstruction. Pending arrival timers and queued commands do not resume; checkpoint fields and cooldown recovery remain unchanged.</p>
+  <p>A module reload retains known monotonic departure and phone-completion times only for the same fully validated trip and original departure. Matching movement observations keep their monotonic ages in the same process. The old clock is checked before saving or handing over travel, including repeated reloads before recovery starts. A large clock discontinuity revokes the saved permission; a small correction cannot shorten the known minimum absence. Without retained runtime data, recovery reconstructs elapsed-time origins from the checkpoint, using saved_at as the conservative phone-completion fence. An observed phone source origin remains separate and is never created by reconstruction. Pending arrival timers and queued commands do not resume; checkpoint fields and cooldown recovery remain unchanged.</p>
   <p>When restoring a trip, saved Home or indoor presence rejects the departure if its possible time range extends beyond that departure. An unambiguously earlier source does not contradict the trip. A current Home or healthy positive phone reading with an unusable or future timestamp also prevents restoration. A process restart must interpret saved local times again because the earlier numeric source metadata is no longer available.</p>
   <p>After restoring a phone-qualified trip, state sources strictly before its confirmed absence are superseded before selecting presence or return evidence. They do not revoke the trip, refresh its checkpoint or create an arrival. A later valid Home or phone return remains eligible. Overlapping time ranges and later presence remain counterevidence. Native source times are compared only with the original observed absence origin, retained across reloads only for the same validated trip. Without that origin, native presence remains possible counterevidence; an origin reconstructed from the current wall-clock offset does not establish order. Live absence qualifications retain their existing contradiction checks.</p>
   <p>A restored trip keeps its saved ID. Each new runtime context adds a fresh random session component; new trip IDs use that context and a local counter, so restarting the counters alone cannot recreate an old ID. This also applies to new debug contexts. Checkpoint versions 1, 2 and 3 remain readable.</p>
@@ -5457,6 +5889,7 @@ get Geo.PERSON explain debug</pre>
       <b>Default:</b> <code>90</code> seconds<br>
       <b>Range:</b> greater than 0 through 172800</p>
       <p>Maximum age of an observation for current decisions and action dispatch. Delayed retries cannot perform an old opening.</p>
+      <p>For queued Geo observations, elapsed time is added to the observation age at receipt. A motion supplement to a known entry keeps that entry's observation clock.</p>
       <p>This limits observations, not the lifetime of an otherwise valid remote trip. It must be greater than reorder_window.</p>
       <p><b>Example:</b></p>
       <pre style="white-space: pre-wrap; overflow-wrap: anywhere;">attr System.GeoPresence action_max_age 90</pre>
@@ -5465,7 +5898,8 @@ get Geo.PERSON explain debug</pre>
       <p><b>Applies to:</b> Controller<br>
       <b>Default:</b> <code>30</code> seconds<br>
       <b>Range:</b> greater than 0 through 172800</p>
-      <p>Allowed event-time lead over the server clock and tolerance for clock discontinuities. Also defines the start boundary before new Geo evidence can qualify after session reset; old observations must not reactivate a saved trip.</p>
+      <p>Allowed event-time lead over the server clock and tolerance for clock discontinuities. A large backward jump revokes pending openings for all residents and sets a shared observation limit. The limit uses the previous clocks and the latest valid webhook receipt, including a request that needs retry because the queue is full. Mode changes check departing contexts before discarding them. The limit survives module reload and appears with fractional seconds in the decision history for blocked observations. The new phone session can still update presence.</p>
+      <p>The same future tolerance applies to motion used for the arrival wait and for the vehicle filter.</p>
       <p><b>Example:</b></p>
       <pre style="white-space: pre-wrap; overflow-wrap: anywhere;">attr System.GeoPresence future_tolerance 30</pre>
     </li>

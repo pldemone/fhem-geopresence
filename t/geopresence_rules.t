@@ -466,8 +466,8 @@ subtest 'missing place geometry is reported without blocking a configured Home' 
     like($explain,qr/locations still lack geometry: Z.Helper, Z.Work/,'default production view also names its missing geometry');
     for my $z (qw(Helper Work)) {
         my $s=GP_State($c,'Geo.Test',1);
-        is(GP_UpdateGeometry($c,'Geo.Test',1,$s,{kind=>'geo',zone=>"Z.$z",time=>$now,received=>$now,
-            geometry=>{lat=>0.1,lon=>0,radius=>100}},$cfg,$now),'changed','a new test webhook supplies missing geometry');
+        is(GP_UpdateGeometry($c,'Geo.Test',1,$s,{kind=>'geo',zone=>"Z.$z",time=>$now,received=>$now,received_mono=>$mono,
+            geometry=>{lat=>0.1,lon=>0,radius=>100}},$cfg,$now,$mono),'changed','a new test webhook supplies missing geometry');
         advance(8);
     }
     my ($ready)=GP_GetData($c,'GP','validate','Geo.Test');
@@ -482,8 +482,8 @@ subtest 'journey reset can retain geometry without retaining an arrival or touch
     my ($c,$cfg,$s)=fixture('geofency_phone');
     delete $defs{'Z.Work'}{READINGS}{gp_geometry};
     delete $c->{helper}{gp}{geometry}{debug}{'Geo.Test'}{'Z.Work'};
-    is(GP_UpdateGeometry($c,'Geo.Test',1,$s,{kind=>'geo',zone=>'Z.Work',time=>$now,received=>$now,
-        geometry=>{lat=>0.1,lon=>0,radius=>150}},$cfg,$now),'changed','unsaved geometry received in simulation');
+    is(GP_UpdateGeometry($c,'Geo.Test',1,$s,{kind=>'geo',zone=>'Z.Work',time=>$now,received=>$now,received_mono=>$mono,
+        geometry=>{lat=>0.1,lon=>0,radius=>150}},$cfg,$now,$mono),'changed','unsaved geometry received in simulation');
     $cfg=GP_Config($c,'Geo.Test',1);
     event($s,$cfg,'Outer',0);advance(61);event($s,$cfg,'Home',1,'walking');
     ok($s->{trip}{armed} && $s->{arrival},'qualified trip has a pending arrival before cleanup');
@@ -492,7 +492,9 @@ subtest 'journey reset can retain geometry without retaining an arrival or touch
     my $geometry=JSON::PP::decode_json($encode->($rt->{geometry}{debug}{'Geo.Test'}));
     my $production=GP_State($c,'Geo.Test',0);
     my $production_before=$encode->($production);
-    $rt->{debug}{'Geo.Other'}={trip=>{armed=>1}};
+    my $other=GP_NewState($now,$mono,'other-debug','geofency_only');
+    $other->{trip}={armed=>1};
+    $rt->{debug}{'Geo.Other'}=$other;
     $rt->{queue}=[{debug=>1,resident=>'Geo.Test',kind=>'geo'},
         {debug=>1,resident=>'Geo.Other',kind=>'geo'},{debug=>0,resident=>'Geo.Test',kind=>'geo'}];
     $rt->{learning}{'Geo.Test'}=1;
@@ -547,13 +549,15 @@ subtest 'explicit geometry confirmation survives activation without promoting a 
     $defs{GP}{READINGS}{mode}{VAL}='active'; # One resident can prepare geometry while others operate.
     delete $defs{'Z.Work'}{READINGS}{gp_geometry};
     delete $c->{helper}{gp}{geometry}{debug}{'Geo.Test'}{'Z.Work'};
-    GP_UpdateGeometry($c,'Geo.Test',1,$s,{kind=>'geo',zone=>'Z.Work',time=>$now,received=>$now,
-        geometry=>{lat=>0.1,lon=>0,radius=>150}},$cfg,$now);
+    GP_UpdateGeometry($c,'Geo.Test',1,$s,{kind=>'geo',zone=>'Z.Work',time=>$now,received=>$now,received_mono=>$mono,
+        geometry=>{lat=>0.1,lon=>0,radius=>150}},$cfg,$now,$mono);
     $cfg=GP_Config($c,'Geo.Test',1);
     event($s,$cfg,'Outer',0);advance(61);event($s,$cfg,'Home',1,'walking');
     ok($s->{trip}{armed} && $s->{arrival},'simulation has a qualified trip and a pending arrival');
     my $rt=$c->{helper}{gp};
-    $rt->{prod}{'Geo.Other'}={trip=>{armed=>1}};
+    my $other=GP_NewState($now,$mono,'other-production','geofency_only');
+    $other->{trip}={armed=>1};
+    $rt->{prod}{'Geo.Other'}=$other;
     $rt->{actors}{door}={waiters=>{'Geo.Other'=>1},start=>$now};
     $rt->{queue}=[{resident=>'Geo.Test',debug=>1},{resident=>'Geo.Other',debug=>0}];
     my $before=$defs{'Z.Home'}{READINGS}{gp_geometry}{VAL};

@@ -2216,6 +2216,80 @@ def run(source, encoding="bytestream", help_only=False):
             check(command("{ ReadingsVal('door','state','unknown') }") == "untouched",
                   "expired timer cannot issue a second pulse after phone confirmation")
             command("set GP mode debug")
+            spatial_source = command("{ AttrVal('Geo.Test','sourceMode','') }")
+            for text in ("attr Geo.Test sourceMode geofency_only",
+                         "define Z.HomeCheck GeoPresence location Geo.Test place", "attr Z.HomeCheck zoneId HomeCheck",
+                         "define Z.Drive GeoPresence location Geo.Test approach", "attr Z.Drive zoneId Drive",
+                         "set GP mode active"):
+                check(command(text) == "", "prepares spatial arrival evidence: " + text)
+            advance(40)
+            check(request("Drive", 1)[0] == 200, "initializes geometry for the surviving approach")
+            advance(3)
+            for entry, latitude, radius in ((1, 0.1, 100), (1, 0.0009, 20), (0, 0, 100)):
+                zones["HomeCheck"] = ("place", latitude, radius)
+                advance(40)
+                check(request("HomeCheck", entry)[0] == 200, "initializes the ordinary circle geometry")
+                advance(3)
+                command("{ GP_ResetController($defs{GP});; return 'reset' }")
+                advance(40)
+                check(request("Outer", 0)[0] == 200, "arms a fresh outing without phone evidence")
+                advance(3)
+                advance(90)
+                refresh_actor_contacts()
+                command("set door untouched")
+                command("set garage untouched")
+                check(request("Home", 1, motion="walking")[0] == 200, "starts the first Home wait")
+                advance(3)
+                first = json.loads(command("get GP explain Geo.Test prod format=json"))["state"]["arrival"]
+                advance(12)
+                approach = event_body("Drive", 1)
+                check(http_request("POST", "/fhem/geopresence", approach, auth_headers())[0] == 200,
+                      "records an approach after the observation time of the interruption")
+                advance(5)
+                check(request("Home", 1)[0] == 200, "records the first later Home")
+                advance(3)
+                state = json.loads(command("get GP explain Geo.Test prod format=json"))["state"]
+                later_home = state["arrival"]["entries"][state["last_key"]]
+                advance(12)
+                check(request("Home", 1)[0] == 200, "records a repeated Home without refreshing motion")
+                advance(3)
+                before = json.loads(command("get GP explain Geo.Test prod format=json"))["state"]
+                advance(7)
+                check(request("HomeCheck", entry, observed=first["event"]["time"] + 10)[0] == 200,
+                      "accepts the delayed spatial counterexample through native HTTP")
+                advance(3)
+                state = json.loads(command("get GP explain Geo.Test prod format=json"))["state"]
+                pending = state["arrival"]
+                check(pending["event"] == later_home and pending["started"] == later_home["received"]
+                      and abs(pending["due_mono"] - later_home["received_mono"] - pending["wait"]) < 0.000001,
+                      "spatial interruption restarts the full wait from the first later Home receipt")
+                check(state["trip"]["id"] == before["trip"]["id"]
+                      and all(state.get(key) == before.get(key) for key in
+                              ("position_time", "location", "zones", "members", "zone_visits", "group_visits")),
+                      "historical evidence preserves the trip and never replays position or visits")
+                check(http_request("POST", "/fhem/geopresence", approach + "&motion=walking", auth_headers())[0] == 200,
+                      "receives a walking supplement to the surviving approach")
+                advance(3)
+                supplemented = json.loads(command("get GP explain Geo.Test prod format=json"))["state"]["arrival"]
+                check(supplemented["motion"] == "walking" and not supplemented["vehicle_eligible"]
+                      and supplemented["due_mono"] == pending["due_mono"],
+                      "the surviving approach vetoes the garage and preserves the selected deadline")
+                advance(max(0, first["due_mono"] - float(command("{ GP_Mono() }"))) + 0.1)
+                check(command("{ ReadingsVal('door','state','') }") == "untouched",
+                      "the interrupted Home deadline cannot open the door")
+                refresh_actor_contacts()
+                advance(max(0, pending["due_mono"] - float(command("{ GP_Mono() }"))) + 0.1)
+                check(command("{ ReadingsVal('door','state','') }") == "lock unlocked"
+                      and command("{ ReadingsVal('garage','state','') }") == "untouched",
+                      "the later uninterrupted Home wait opens only the dummy door")
+                actor_reading("feedback", "pulse_state", "confirmed")
+                advance(1)
+            command("set GP mode debug")
+            check(command("delete Z.HomeCheck") == "", "removes the spatial evidence fixture")
+            check(command("delete Z.Drive") == "", "removes the supplementary approach fixture")
+            check(command("attr Geo.Test sourceMode " + spatial_source if spatial_source else "deleteattr Geo.Test sourceMode") == "",
+                  "restores the source profile after spatial arrival checks")
+            del zones["HomeCheck"]
             command("set GP mode active")
             advance(40)
             phone_state("p1", "absent")
@@ -3275,7 +3349,8 @@ def run(source, encoding="bytestream", help_only=False):
                 advance(2)
                 check(request("Home", 1)[0] == 200, "newer empty Home entry accepted")
                 advance(3)
-                latest = json.loads(command("get GP explain Geo.Test prod format=json"))["state"]["arrival"]["latest_home"]
+                state = json.loads(command("get GP explain Geo.Test prod format=json"))["state"]
+                latest = state["arrival"]["entries"][state["last_key"]]
                 check(latest["time"] > first["event"]["time"], "position advanced during the same arrival")
                 advance(1)
                 check(http_request("POST", "/fhem/geopresence", home + "&motion=walking", auth_headers())[0] == 200,
@@ -3288,7 +3363,7 @@ def run(source, encoding="bytestream", help_only=False):
                       "walking keeps the original observation time")
                 if not phone_return:
                     pending = state["arrival"]
-                    check(pending["latest_home"] == latest and state["position_time"] == latest["time"],
+                    check(pending["entries"].get(latest["key"]) == latest and state["position_time"] == latest["time"],
                           "supplement does not rewind the newer Home evidence")
                     check(pending["started"] == first["started"] and pending["start_mono"] == first["start_mono"]
                           and pending["due_mono"] == first["due_mono"] and not pending["vehicle_eligible"],
@@ -3375,7 +3450,7 @@ def run(source, encoding="bytestream", help_only=False):
             # a nearby place advances position without ending the
             # approach. A delayed exit between that approach and Home must
             # revoke its automotive origin, whether received before or after Home.
-            zones["Near"] = ("place", 0.0009, 20)
+            zones["Near"] = ("place", 0.0004, 20)
             for text in ("set GP mode debug", "define Z.Near GeoPresence location Geo.Test place",
                          "attr Z.Near zoneId Near", "set GP mode active"):
                 check(command(text) == "", "prepares a nearby place: " + text)
@@ -3425,12 +3500,13 @@ def run(source, encoding="bytestream", help_only=False):
                     advance(2)
                     check(request("Home", 1)[0] == 200, "newer Home entry accepted")
                     advance(3)
-                    latest = json.loads(command("get GP explain Geo.Test prod format=json"))["state"]["arrival"]["latest_home"]
+                    state = json.loads(command("get GP explain Geo.Test prod format=json"))["state"]
+                    latest = state["arrival"]["entries"][state["last_key"]]
                     check(http_request("POST", "/fhem/geopresence", delayed_exit, auth_headers())[0] == 200,
                           "delayed exit accepted after Home")
                     advance(3)
                     pending = json.loads(command("get GP explain Geo.Test prod format=json"))["state"]["arrival"]
-                    check(pending["event"] == first["event"] and pending["latest_home"] == latest
+                    check(pending["event"] == first["event"] and pending["entries"].get(latest["key"]) == latest
                           and pending["start_mono"] == first["start_mono"] and pending["due_mono"] == first["due_mono"],
                           "exit before Home preserves its original wait and newest evidence")
                 advance(1 if after_home else 7)
